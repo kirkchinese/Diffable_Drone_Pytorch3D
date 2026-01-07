@@ -1,0 +1,2 @@
+# Diffable_Drone_Pytorch3D
+一个基于Pytorch3D与Pytorch搭建的无人机可微分物理仿真平台。
