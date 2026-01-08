@@ -77,7 +77,7 @@ class DroneRenderer:
         """更换渲染的模型"""
         self.mesh = self._load_mesh(mesh_path)
 
-    def render(self, R, T, return_tensor=False):
+    def render(self, R, T, return_tensor=False, return_rgb=True, return_depth=True):
         """
         [核心渲染接口] 渲染给定视角的图像和深度图。
         
@@ -85,19 +85,15 @@ class DroneRenderer:
         通常建议先调用 `compute_view_matrix` 从 ROS 状态获取这里的 R 和 T。
         
         Args:
-            R (torch.Tensor): 旋转矩阵 (World -> View)。
-                              Shape: (3, 3) 或 (B, 3, 3)。
-                              注意: 这是 PyTorch3D 的 View Transform，不是 ROS 的 Body->World。
-            T (torch.Tensor): 平移向量 (World -> View Translation)。
-                              Shape: (3,) 或 (B, 3)。
-                              T = -R @ Camera_Location_World
-            return_tensor (bool): 
-                              True: 返回 PyTorch Tensor (带梯度)。
-                              False: 返回 detached CPU numpy array/Tensor (便于可视化)。
+            R (torch.Tensor): 旋转矩阵 (World -> View)。Shape: (3, 3) 或 (B, 3, 3)。
+            T (torch.Tensor): 平移向量 (World -> View Translation)。Shape: (3,) 或 (B, 3)。
+            return_tensor (bool): True 返回 Tensor(带梯度)，False 返回 detached numpy。
+            return_rgb (bool): 是否计算并返回 RGB 图像。
+            return_depth (bool): 是否计算并返回深度图。
             
         Returns:
-            rgb_image: (H, W, 3) 或 (B, H, W, 3)。范围 [0, 1]。
-            depth_map: (H, W) 或 (B, H, W)。单位与 Mesh 顶点单位一致 (通常是米)。
+            rgb_image, depth_map 的元组。
+            如果没有请求某项，对应返回值为 None。
         """
         # 转换为 Tensor
         if not torch.is_tensor(R):
@@ -129,24 +125,36 @@ class DroneRenderer:
         meshes = self.mesh.extend(len(cameras))
         fragments = self.rasterizer(meshes, cameras=cameras)
         
-        # 着色
-        images = self.shader(fragments, meshes, cameras=cameras)
-        
-        # 提取 RGB 和 Depth
-        rgb_images = images[..., :3]
-        depth_maps = fragments.zbuf[..., 0]
+        rgb_images = None
+        depth_maps = None
+
+        # 仅在需要 RGB 时执行 Shader
+        if return_rgb:
+            # 着色
+            images = self.shader(fragments, meshes, cameras=cameras)
+            # 提取 RGB 
+            rgb_images = images[..., :3]
+
+        if return_depth:
+            depth_maps = fragments.zbuf[..., 0]
 
         if not is_batch:
             # 如果输入是单个，输出也降维为单个
-            rgb_images = rgb_images[0]
-            depth_maps = depth_maps[0]
+            if rgb_images is not None:
+                rgb_images = rgb_images[0]
+            if depth_maps is not None:
+                depth_maps = depth_maps[0]
 
         if return_tensor:
             return rgb_images, depth_maps
 
         # 转为 numpy (detach)
-        rgb_out = rgb_images.detach()
-        depth_out = depth_maps.detach()
+        rgb_out = None
+        depth_out = None
+        if rgb_images is not None:
+             rgb_out = rgb_images.detach()
+        if depth_maps is not None:
+             depth_out = depth_maps.detach()
         
         return rgb_out, depth_out
 
@@ -229,6 +237,7 @@ class DroneRenderer:
         
         return R_view, T_view
 
+    @staticmethod
     def clean_depth_map(depth, min_dist=0.2, max_dist=10.0):
         """
         清洗深度图，处理背景和无效值。
