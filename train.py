@@ -23,7 +23,7 @@ def parse_args():
     # Training Parameters
     parser.add_argument('--resume', default=None)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--num_iters', type=int, default=50000)
+    parser.add_argument('--num_iters', type=int, default=9000)
     parser.add_argument('--lr', type=float, default=1e-3)
     
     # Loss Coefficients (Reference: main_cuda.py & single_agent.args)
