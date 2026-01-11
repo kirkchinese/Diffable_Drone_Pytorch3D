@@ -1,6 +1,30 @@
+"""
+无人机渲染器模块
+
+本模块提供了一个基于 PyTorch3D 的可微分 3D 渲染器类 `DroneRenderer`，
+用于加载无人机网格模型并生成 RGB 图像和深度图，支持批量渲染和坐标系转换。
+
+主要功能：
+- 加载和渲染 .obj 格式的 3D 网格模型。
+- 计算相机视图矩阵，支持 ROS 坐标系到 PyTorch3D 坐标系的转换。
+- 生成 RGB 和深度图像，支持梯度传播。
+- 提供障碍物距离计算和深度图清洗功能。
+
+依赖库：
+- torch: PyTorch 张量计算和自动微分。
+- pytorch3d: 3D 渲染和几何操作库。
+- numpy: 数值计算和数组操作。
+- math: 数学函数和常量。
+
+作者: KirkChinese
+版本: 你记了吗？
+日期: 2026-01-10
+"""
+
 import torch
 import numpy as np
 import math
+from pytorch3d.ops import sample_points_from_meshes, knn_points
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
     RasterizationSettings,
@@ -13,39 +37,87 @@ from pytorch3d.renderer import (
 )
 
 class DroneRenderer:
-    def __init__(self, mesh_path, device=None, image_size=(480, 640), focal_length=500.0):
+    """
+    可微分无人机 3D 渲染器类。
+
+    该类使用 PyTorch3D 加载无人机网格模型并进行光栅化渲染，支持生成 RGB 图像和深度图。
+    提供坐标系转换功能，将 ROS 坐标系下的无人机状态转换为渲染所需的相机参数。
+    支持批量渲染，可用于训练可微分无人机控制系统。
+
+    Attributes:
+        device (torch.device): 计算设备（CPU 或 GPU）。
+        image_size (tuple): 输出图像尺寸 (H, W)。
+        H (int): 图像高度。
+        W (int): 图像宽度。
+        focal_length (tuple): 相机焦距 ((fx, fy),)。
+        principal_point (tuple): 相机主点 ((cx, cy),)。
+        mesh (Meshes): 加载的 3D 网格模型。
+        raster_settings (RasterizationSettings): 光栅化设置。
+        lights (PointLights): 场景光照。
+        rasterizer (MeshRasterizer): 网格光栅化器。
+        shader (SoftPhongShader): Phong 着色器。
+        obstacle_pcd (torch.Tensor): 从网格采样的障碍物点云，形状 (1, N, 3)。
+
+    Args:
+        mesh_path (str): .obj 模型文件的路径。
+        device (torch.device, optional): 计算设备，默认自动检测 CUDA。
+        image_size (tuple, optional): 输出图像尺寸 (H, W)，默认 (480, 640)。
+        focal_length (float or tuple, optional): 相机焦距，默认 500.0。
+        num_samples (int, optional): 点云采样点数，默认 20000。
+
+    Raises:
+        FileNotFoundError: 如果 mesh_path 指定的文件不存在。
+        ValueError: 如果 image_size 或 focal_length 参数无效。
+    """
+    def __init__(self,
+                 mesh_path, 
+                 device=None, 
+                 image_size=(480, 640), 
+                 focal_length=500.0,
+                 principal_point=None,
+                 lights_location=[[0.0, 0.0, -3.0]],
+                 num_samples=20000):
         """
-        [渲染器类] 负责加载无人机网格模型并生成 RGB 和深度图。
-        使用 PyTorch3D 的光栅化渲染管线。
-        
+        初始化无人机渲染器。
+
+        加载指定的网格模型，设置渲染参数和组件，包括光栅化器、着色器和障碍物点云。
+
         Args:
-            mesh_path (str): .obj 模型文件的绝对路径或相对路径。
-            device (torch.device, optional): 计算设备 (cuda/cpu)。如果为 None，自动检测。
-            image_size (tuple): 输出图像大小 (Height, Width)。默认 (480, 640)。
-            focal_length (float or tuple): 相机焦距 (像素单位)。
-                                           如果为 float，假设 fx=fy。
-                                           默认 500.0。
+            mesh_path (str): .obj 模型文件的路径。
+            device (torch.device, optional): 计算设备，默认自动检测 CUDA。
+            image_size (tuple, optional): 输出图像尺寸 (H, W)，默认 (480, 640)。
+            focal_length (float or tuple, optional): 相机焦距，默认 500.0。
+            principal_point (tuple, optional): 相机主点 (cx, cy)。默认图像中心。
+            lights_location (list, optional): 光源位置，默认 [[0, 0, -3.0]]。
+            num_samples (int, optional): 点云采样点数，默认 20000。
+
+        Raises:
+            FileNotFoundError: 如果 mesh_path 指定的文件不存在。
         """
+        # 设置计算设备
         if device is None:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
             
-        self.image_size = image_size # (H, W)
+        self.image_size = image_size  # (H, W)
         self.H, self.W = image_size
         
-        # 处理焦距
+        # 处理焦距参数
         if isinstance(focal_length, (float, int)):
             self.focal_length = ((focal_length, focal_length),)
         else:
             self.focal_length = (focal_length,)
             
-        self.principal_point = ((self.W/2, self.H/2),)
+        if principal_point is None:
+            self.principal_point = ((self.W/2, self.H/2),)
+        else:
+            self.principal_point = (principal_point,)
         
-        # 加载网格
+        # 加载网格模型
         self.mesh = self._load_mesh(mesh_path)
         
-        # 光栅化设置
+        # 配置光栅化设置
         self.raster_settings = RasterizationSettings(
             image_size=self.image_size, 
             blur_radius=0.0, 
@@ -53,55 +125,92 @@ class DroneRenderer:
             perspective_correct=True 
         )
         
-        # 初始化光照 (暂时设定为点光源)
-        self.lights = PointLights(device=self.device, location=[[0.0, 0.0, -3.0]])
+        # 初始化光照
+        self.lights = PointLights(device=self.device, location=lights_location)
         
-        # 初始化组件 (不绑定相机，渲染时动态传入)
+        # 初始化渲染组件
         self.rasterizer = MeshRasterizer(raster_settings=self.raster_settings)
-        # SoftPhongShader 需要在 forward 中接收 cameras
         self.shader = SoftPhongShader(device=self.device, lights=self.lights)
+        
+        # 从网格采样障碍物点云
+        self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)
 
     def _load_mesh(self, mesh_path):
+        """
+        加载 .obj 格式的 3D 网格模型。
+
+        如果模型无纹理，则创建默认白色纹理以确保渲染正常进行。
+
+        Args:
+            mesh_path (str): 模型文件路径。
+
+        Returns:
+            Meshes: 加载的网格对象，包含顶点、法线和纹理信息。
+
+        Raises:
+            FileNotFoundError: 如果文件不存在。
+            RuntimeError: 如果文件格式不支持或加载失败。
+        """
         mesh = load_objs_as_meshes([mesh_path], device=self.device)
         
-        # 检查并修复纹理
+        # 检查并修复纹理：如果无纹理，创建默认白色纹理
         if mesh.textures is None:
-            # print("模型无纹理，创建默认白色纹理...")
             verts = mesh.verts_list()[0]
-            verts_rgb = torch.ones_like(verts)[None] 
+            verts_rgb = torch.ones_like(verts)[None]  # 默认白色
             mesh.textures = TexturesVertex(verts_features=verts_rgb)
             
         return mesh
 
-    def update_mesh(self, mesh_path):
-        """更换渲染的模型"""
-        self.mesh = self._load_mesh(mesh_path)
-
-    def render(self, R, T, return_tensor=False, return_rgb=True, return_depth=True):
+    def update_mesh(self, mesh_path, num_samples=20000):
         """
-        [核心渲染接口] 渲染给定视角的图像和深度图。
-        
+        更换渲染的网格模型。
+
+        加载新的 .obj 文件并更新内部网格数据，同时重新采样障碍物点云。
+
+        Args:
+            mesh_path (str): 新的网格文件路径。
+            num_samples (int, optional): 重新采样的点数，默认 20000。
+
+        Raises:
+            FileNotFoundError: 如果文件不存在。
+        """
+        self.mesh = self._load_mesh(mesh_path)
+        # 重新采样障碍物点云
+        self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)
+
+    def render(self, R, T, return_tensor=False, return_rgb=True, return_depth=True,clean_depth=False, dt=None):
+        """
+        渲染给定视角的 RGB 图像和深度图。
+
+        使用 PyTorch3D 进行光栅化渲染，支持批量处理。
         注意：此函数直接接收 PyTorch3D 标准的相机外参 (World-to-View)。
         通常建议先调用 `compute_view_matrix` 从 ROS 状态获取这里的 R 和 T。
-        
+
         Args:
-            R (torch.Tensor): 旋转矩阵 (World -> View)。Shape: (3, 3) 或 (B, 3, 3)。
-            T (torch.Tensor): 平移向量 (World -> View Translation)。Shape: (3,) 或 (B, 3)。
-            return_tensor (bool): True 返回 Tensor(带梯度)，False 返回 detached numpy。
-            return_rgb (bool): 是否计算并返回 RGB 图像。
-            return_depth (bool): 是否计算并返回深度图。
+            R (torch.Tensor): 旋转矩阵 (World -> View)，形状 (3, 3) 或 (B, 3, 3)。
+            T (torch.Tensor): 平移向量 (World -> View)，形状 (3,) 或 (B, 3)。
+            return_tensor (bool, optional): 是否返回 PyTorch 张量（带梯度），默认 False，返回 NumPy 数组。
+            return_rgb (bool, optional): 是否计算并返回 RGB 图像，默认 True。
+            return_depth (bool, optional): 是否计算并返回深度图，默认 True。
+            clean_depth (bool, optional): 是否清洗深度图，默认 False。
+            dt (float, optional): 时间步长，可选，用于后续扩展（如光流计算）。
             
         Returns:
-            rgb_image, depth_map 的元组。
-            如果没有请求某项，对应返回值为 None。
+            tuple: (rgb_image, depth_map)
+                - rgb_image (torch.Tensor or numpy.ndarray or None): RGB 图像，形状 (B, H, W, 3) 或 (H, W, 3)。
+                - depth_map (torch.Tensor or numpy.ndarray or None): 深度图，形状 (B, H, W) 或 (H, W)。
+                如果对应标志为 False，则返回 None。
+
+        Raises:
+            ValueError: 如果 R 或 T 的形状无效。
         """
-        # 转换为 Tensor
+        # 确保输入为张量
         if not torch.is_tensor(R):
             R = torch.tensor(R, device=self.device, dtype=torch.float32)
         if not torch.is_tensor(T):
             T = torch.tensor(T, device=self.device, dtype=torch.float32)
 
-        # 确保输入维度
+        # 处理批量维度
         is_batch = True
         if R.dim() == 2: 
             R = R.unsqueeze(0)
@@ -110,85 +219,93 @@ class DroneRenderer:
             T = T.unsqueeze(0)
         
         # 创建当前帧的相机
-        # 注意: R, T 这里应该是 World-to-View 的变换 (PyTorch3D 约定)
         cameras = PerspectiveCameras(
             focal_length=self.focal_length,
             principal_point=self.principal_point,
             image_size=((self.H, self.W),),
-            in_ndc=False, # 使用屏幕像素坐标
+            in_ndc=False,  # 使用屏幕像素坐标
             R=R,
             T=T,
             device=self.device
         )
         
-        # 扩展 mesh 以匹配 batch size
+        # 扩展网格以匹配批量大小
         meshes = self.mesh.extend(len(cameras))
         fragments = self.rasterizer(meshes, cameras=cameras)
         
         rgb_images = None
         depth_maps = None
 
-        # 仅在需要 RGB 时执行 Shader
+        # 仅在需要 RGB 时执行着色
         if return_rgb:
-            # 着色
             images = self.shader(fragments, meshes, cameras=cameras)
-            # 提取 RGB 
-            rgb_images = images[..., :3]
+            rgb_images = images[..., :3]  # 提取 RGB 通道
 
+        # 提取深度图
         if return_depth:
             depth_maps = fragments.zbuf[..., 0]
 
+        # 如果输入非批量，输出也降维
         if not is_batch:
-            # 如果输入是单个，输出也降维为单个
             if rgb_images is not None:
                 rgb_images = rgb_images[0]
             if depth_maps is not None:
                 depth_maps = depth_maps[0]
 
+        # 根据 return_tensor 决定输出格式
         if return_tensor:
+            if clean_depth: # 清洗深度图
+                depth_maps = self.clean_depth_map(depth_maps)
             return rgb_images, depth_maps
 
-        # 转为 numpy (detach)
+        # 转换为 NumPy 数组（detach）
         rgb_out = None
         depth_out = None
         if rgb_images is not None:
-             rgb_out = rgb_images.detach()
+            rgb_out = rgb_images.detach().cpu().numpy()
         if depth_maps is not None:
-             depth_out = depth_maps.detach()
+            depth_out = depth_maps.detach().cpu().numpy()
         
         return rgb_out, depth_out
 
-    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=-10.0):
+    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=-10.0, cam_offset_body=None):
         """
-        [跨模块接口] 将无人机在 ROS 坐标系下的状态，转换为 PyTorch3D 渲染器所需的外参 (R, T)。
-        
-        此函数自动处理了：
-        1. 坐标系手性转换 (ROS ENU -> PyTorch3D World)。
-        2. 相机相对于机身的安装位置 (Offset) 和安装角度 (Mount Rotation)。
-        3. LookAt 变换计算。
-        
+        将无人机在 ROS 坐标系下的状态转换为 PyTorch3D 渲染器所需的外参 (R, T)。
+
+        该函数自动处理坐标系转换、相机安装偏移和 LookAt 变换计算。
+
         Args:
-            p_ros (torch.Tensor): 无人机位置 (ROS World Frame Enu)。
-                                  Shape: [B, 3]
-            R_ros (torch.Tensor): 无人机姿态旋转矩阵 (Body -> ROS World Frame)。
-                                  Shape: [B, 3, 3]
-            camera_pitch_deg (float): 相机安装俯仰角 (度)。
-                                      正值表示相机向下倾斜 (俯视, Pitch Down)。
-                                      注意: 参考项目 DiffPhysDrone 通常使用正值表示仰视 (Pitch Up)。
-                                      如果要完全复现参考项目行为，请设置 camera_pitch_deg = -10.0。
-                                      默认 10.0 度 (俯视)。
+            p_ros (torch.Tensor): 无人机位置 (ROS World Frame ENU)，形状 (B, 3)。
+            R_ros (torch.Tensor): 无人机姿态旋转矩阵 (Body -> ROS World)，形状 (B, 3, 3)。
+            camera_pitch_deg (float, optional): 相机安装俯仰角 (度)，默认 -10.0。
+                正值表示相机向下倾斜 (俯视)，负值表示仰视。
+            cam_offset_body (list or torch.Tensor, optional): 相机在机体坐标系下的偏移 [x, y, z]，默认 [0.1, 0, 0]。
             
         Returns:
             tuple: (R_view, T_view)
-                - R_view: World-to-View 旋转矩阵 [B, 3, 3]。可直接传给 `render()`。
-                - T_view: World-to-View 平移向量 [B, 3]。可直接传给 `render()`。
+                - R_view (torch.Tensor): World-to-View 旋转矩阵，形状 (B, 3, 3)。
+                - T_view (torch.Tensor): World-to-View 平移向量，形状 (B, 3)。
+
+        Raises:
+            ValueError: 如果输入张量的形状不符合要求。
         """
         B = p_ros.shape[0]
         device = p_ros.device
         
         # 计算相机在 ROS World 下的位置
-        # Camera Offset in Body Frame: [0.1, 0, 0]
-        cam_offset_body = torch.tensor([0.1, 0.0, 0.0], device=device).view(1, 3, 1).repeat(B, 1, 1)
+        # Camera Offset in Body Frame: Default [0.1, 0, 0]
+        if cam_offset_body is None:
+            cam_offset_body = [0.1, 0.0, 0.0]
+        
+        if not torch.is_tensor(cam_offset_body):
+            cam_offset_body = torch.tensor(cam_offset_body, device=device, dtype=torch.float32)
+        
+        # Ensure shape (B, 3, 1)
+        if cam_offset_body.dim() == 1:
+            cam_offset_body = cam_offset_body.view(1, 3, 1).repeat(B, 1, 1)
+        elif cam_offset_body.dim() == 2:
+            cam_offset_body = cam_offset_body.unsqueeze(2)
+            
         p_cam_ros = p_ros + torch.bmm(R_ros, cam_offset_body).squeeze(2)
         
         # 定义相机相对于机体的旋转矩阵 (R_mount)
@@ -205,7 +322,6 @@ class DroneRenderer:
         ], device=device).view(1, 3, 3).repeat(B, 1, 1)
         
         # 计算 Look At 指向向量和 Up 向量 (在机体坐标系下)
-        # 原始 Camera Frame 定义: Forward=+X, Up=+Z (与 Body Frame 一致)
         forward_canonical = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 3, 1).repeat(B, 1, 1)
         up_canonical = torch.tensor([0.0, 0.0, 1.0], device=device).view(1, 3, 1).repeat(B, 1, 1)
         
@@ -214,12 +330,7 @@ class DroneRenderer:
         up_dir_body = torch.bmm(R_mount, up_canonical)
         
         # 转换到世界坐标系
-        # Target Point = Camera Pos + R_drone @ look_dir_body
-        # 注意: 这里 look_dir_body 长度为 1，直接作为方向向量
-        # 我们让 look_at 点距离相机 1.0 米
-        p_target_ros = p_cam_ros + torch.bmm(R_ros, look_dir_body).squeeze(2)
-        
-        # Up Vector World = R_drone @ up_dir_body
+        p_target_ros = p_cam_ros + torch.bmm(R_ros, look_dir_body).squeeze(2)  # 目标点距离相机 1.0 米
         up_vec_ros = torch.bmm(R_ros, up_dir_body).squeeze(2)
         
         # 转换所有向量到 PyTorch3D World 坐标系
@@ -227,7 +338,7 @@ class DroneRenderer:
         p_at_pt3d = transform_pos_ros2pt3d(p_target_ros)
         up_vec_pt3d = transform_pos_ros2pt3d(up_vec_ros)
         
-        # 使用 look_at_view_transform 计算 E (World-to-View)
+        # 使用 look_at_view_transform 计算 World-to-View 变换
         R_view, T_view = look_at_view_transform(
             eye=p_cam_pt3d,
             at=p_at_pt3d,
@@ -240,7 +351,20 @@ class DroneRenderer:
     @staticmethod
     def clean_depth_map(depth, min_dist=0.2, max_dist=10.0):
         """
-        清洗深度图，处理背景和无效值。
+        清洗深度图，移除无效或超出范围的深度值。
+
+        将背景像素（通常为 -1）和超出距离范围的像素设置为 NaN，便于后续处理。
+
+        Args:
+            depth (torch.Tensor or numpy.ndarray): 输入深度图。
+            min_dist (float, optional): 最小有效距离，默认 0.2。
+            max_dist (float, optional): 最大有效距离，默认 10.0。
+
+        Returns:
+            torch.Tensor or numpy.ndarray: 清洗后的深度图，形状与输入相同。
+
+        Raises:
+            TypeError: 如果 depth 不是张量或数组。
         """
         if torch.is_tensor(depth):
             depth = depth.clone()
@@ -254,28 +378,19 @@ class DroneRenderer:
 def transform_pos_ros2pt3d(pos):
     """
     将位置向量从 ROS (ENU) 坐标系转换到 PyTorch3D 渲染坐标系。
-    
-    ROS (ENU): 
-        +X: East
-        +Y: North
-        +Z: Up
-    PyTorch3D World (用于渲染): 
-        +X: West (Left if looking North) - 注意这里实际上是反向的 East
-        +Y: Up
-        +Z: North (Into Screen)
-        
-    Mapping:
-        (x, y, z) -> (-x, z, y)
-    
-    解释:
-    这种映射构建了一个 PyTorch3D 世界坐标系，其中：
-    - 原点与 ROS 重合。
-    - 世界的 +Y 轴朝上 (与 ROS +Z 一致)。
-    - 世界的 +Z 轴指向北方 (与 ROS +Y 一致)。
-    - 世界的 +X 轴指向西方 (与 ROS -X 一致)。
-      (根据右手定则: Y(Up) x Z(North) = X(East/Right). 但 PyTorch3D View 习惯 +X is Left. 
-       如果我们看向北 (+Z), East 是右侧. PyTorch3D View +X 是左侧.
-       所以 ROS +X (East/Right) 映射为 Pt3D -X (Right in View Frame 意义下).)
+
+    ROS (ENU): +X: East, +Y: North, +Z: Up
+    PyTorch3D World: +X: West, +Y: Up, +Z: North
+    映射: (x, y, z) -> (-x, z, y)
+
+    Args:
+        pos (torch.Tensor): ROS 坐标系下的位置，形状 (..., 3)。
+
+    Returns:
+        torch.Tensor: PyTorch3D 坐标系下的位置，形状 (..., 3)。
+
+    Raises:
+        ValueError: 如果 pos 的最后一个维度不是 3。
     """
     x = pos[..., 0]
     y = pos[..., 1]
@@ -285,19 +400,26 @@ def transform_pos_ros2pt3d(pos):
 def transform_rot_ros2pt3d(R):
     """
     将旋转矩阵 (Body -> World) 从 ROS 坐标系转换到 PyTorch3D 坐标系。
-    假设 Body Frame 在两种定义下相对网格是一致的 (Mesh is static).
-    
-    R_pt3d = T_coord @ R_ros
+
+    假设 Body Frame 在两种定义下相对网格一致。通过变换每个基向量来实现转换。
+
+    Args:
+        R (torch.Tensor): ROS 坐标系下的旋转矩阵，形状 (..., 3, 3)。
+
+    Returns:
+        torch.Tensor: PyTorch3D 坐标系下的旋转矩阵，形状 (..., 3, 3)。
+
+    Raises:
+        ValueError: 如果 R 的最后两个维度不是 (3, 3)。
     """
-    # R: [..., 3, 3]
     # 变换基向量 (R 的列向量)
-    r0 = transform_pos_ros2pt3d(R[..., 0]) # Body X axis in Pt3D World
-    r1 = transform_pos_ros2pt3d(R[..., 1]) # Body Y axis in Pt3D World
-    r2 = transform_pos_ros2pt3d(R[..., 2]) # Body Z axis in Pt3D World
+    r0 = transform_pos_ros2pt3d(R[..., 0])  # Body X 轴
+    r1 = transform_pos_ros2pt3d(R[..., 1])  # Body Y 轴
+    r2 = transform_pos_ros2pt3d(R[..., 2])  # Body Z 轴
     return torch.stack([r0, r1, r2], dim=-1)
 
 if __name__ == "__main__":
-    # 简单的测试代码
+    # 简单的测试代码：加载模型、渲染并可视化
     import os
     import matplotlib.pyplot as plt
     
@@ -306,11 +428,13 @@ if __name__ == "__main__":
     obj_filename = os.path.join(DATA_DIR, "sample/sample.obj")
     
     if os.path.exists(obj_filename):
+        # 初始化渲染器
         renderer = DroneRenderer(obj_filename)
         
-        # 设置视角
+        # 设置固定视角进行测试
         R, T = look_at_view_transform(dist=2.7, elev=0, azim=180, device=renderer.device)
         
+        # 渲染图像
         rgb, depth = renderer.render(R, T)
         clean_depth = renderer.clean_depth_map(depth)
         
