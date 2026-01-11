@@ -4,4 +4,6 @@ data/
 坐标系定义与相机位置记录.md
 git_token.txt
 runs/
+__pycache__/
+logs/
 
