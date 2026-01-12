@@ -168,7 +168,10 @@ class DroneLoss:
         jerk_history = act_history.diff(1, 0) / self.ctl_dt
         loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
 
-        thrust_dir = F.normalize(act_history - env_g_std, dim=-1)
+        # 推力方向归一化（添加数值稳定性）
+        thrust_vec = act_history - env_g_std
+        thrust_norm = torch.norm(thrust_vec, dim=-1, keepdim=True).clamp(min=1e-6)
+        thrust_dir = thrust_vec / thrust_norm
         snap_history = thrust_dir.diff(1, 0).diff(1, 0) / (self.ctl_dt ** 2)
         loss_d_snap = snap_history.pow(2).sum(-1).mean()
 
@@ -180,7 +183,10 @@ class DroneLoss:
         distance = torch.norm(vec_to_obj_history, 2, -1)
         distance = distance - env_margin
 
-        v_to_pt = (-torch.diff(distance, 1, 0) / self.ctl_dt * 9.0).clamp_min(1)
+        # 参考项目使用 * 135 (即 9 / ctl_dt，ctl_dt=1/15 时为 135)
+        # 计算接近障碍物的速度，用于加权损失
+        with torch.no_grad():
+            v_to_pt = (-torch.diff(distance, 1, 0) * (1.0 / self.ctl_dt) * 9.0).clamp_min(1)
 
         dist_slice = distance[1:]
 

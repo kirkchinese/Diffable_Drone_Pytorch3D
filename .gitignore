@@ -6,4 +6,6 @@ git_token.txt
 runs/
 __pycache__/
 logs/
-
+checkpoints/
+docs/
+__pycache__/
