@@ -114,8 +114,9 @@ def solve_attitude_from_thrust_and_goal_vec(
         
     # 确定机体 Z 轴 (Body Up)
     # Z 轴方向即为推力方向
-    # normalize dim=1 (across x,y,z)
-    z_new = torch.nn.functional.normalize(thrust_vector, dim=1)
+    # normalize dim=1 (across x,y,z) - 添加数值稳定性
+    thrust_norm = torch.norm(thrust_vector, dim=1, keepdim=True).clamp(min=1e-6)
+    z_new = thrust_vector / thrust_norm
     
     # 确定机体 X 轴 (Body Forward)
     # 逻辑：混合“旧的机头朝向”与“当前速度方向”，并强制与 Z 轴垂直
@@ -130,8 +131,9 @@ def solve_attitude_from_thrust_and_goal_vec(
     # 不进行归一化，自然处理低速/悬停情况
     f_mixed_raw = x_old * yaw_inertia + velocity
     
-    # 计算目标朝向 (Heading)
-    target_heading = torch.nn.functional.normalize(f_mixed_raw, dim=1)
+    # 计算目标朝向 (Heading) - 添加数值稳定性
+    f_mixed_norm = torch.norm(f_mixed_raw, dim=1, keepdim=True).clamp(min=1e-6)
+    target_heading = f_mixed_raw / f_mixed_norm
     
     # [二级平滑] Exponential Smoothing (参考项目逻辑)
     # alpha = exp(-delay * dt). delay 越大 (响应越快), alpha 越小, 结果越接近 target.
@@ -149,27 +151,30 @@ def solve_attitude_from_thrust_and_goal_vec(
     fz_new = torch.zeros_like(fx)
     
     # 避免除以零 (当机体 Z 轴完全水平时，uz=0)
-    mask_stable = torch.abs(uz) > 1e-6
+    # 使用软阈值避免梯度问题
+    uz_safe = uz.clone()
+    uz_safe = torch.where(torch.abs(uz) < 1e-6, torch.sign(uz + 1e-8) * 1e-6, uz)
     
-    # 正常情况计算
-    if mask_stable.any():
-        fz_new[mask_stable] = -(fx[mask_stable] * ux[mask_stable] + fy[mask_stable] * uy[mask_stable]) / uz[mask_stable]
+    fz_new = -(fx * ux + fy * uy) / uz_safe
         
     x_new_unnormalized = torch.stack([fx, fy, fz_new], dim=1)
     
-    # 备选方案：如果 Z 轴水平 (uz 接近 0)，使用旧的 Y 轴与 Z 轴叉乘得到 X 轴
-    if not mask_stable.all():
+    # 如果 Z 轴接近水平，混合使用备选方案
+    mask_unstable = torch.abs(uz) < 1e-4
+    if mask_unstable.any():
         y_old = R_old[:, :, 1]
-        # cross product
-        x_fallback = torch.cross(y_old, z_new, dim=1)
-        x_new_unnormalized[~mask_stable] = x_fallback[~mask_stable]
+        x_fallback = torch.linalg.cross(y_old, z_new)
+        # 软混合而不是硬切换
+        blend_weight = (1e-4 - torch.abs(uz)).clamp(0, 1e-4) / 1e-4
+        x_new_unnormalized = x_new_unnormalized * (1 - blend_weight.unsqueeze(1)) + x_fallback * blend_weight.unsqueeze(1)
         
-    # 归一化得到新的 X 轴
-    x_new = torch.nn.functional.normalize(x_new_unnormalized, dim=1)
+    # 归一化得到新的 X 轴 - 添加数值稳定性
+    x_new_norm = torch.norm(x_new_unnormalized, dim=1, keepdim=True).clamp(min=1e-6)
+    x_new = x_new_unnormalized / x_new_norm
     
     # 确定机体 Y 轴 (Body Left)
     # 右手定则: y = z cross x
-    y_new = torch.cross(z_new, x_new, dim=1)
+    y_new = torch.linalg.cross(z_new, x_new)
     
     # 组合旋转矩阵
     # 列向量分别为 X, Y, Z -> stack dim=2
@@ -367,14 +372,15 @@ def simulate_position_step(
         # 范数计算 (避免除零)
         n1 = torch.norm(thrust_vec_curr, dim=1, keepdim=True)
         n2 = torch.norm(thrust_vec_next, dim=1, keepdim=True)
-        n1 = torch.clamp(n1, min=1e-8)
-        n2 = torch.clamp(n2, min=1e-8)
+        n1 = torch.clamp(n1, min=1e-6)
+        n2 = torch.clamp(n2, min=1e-6)
         
         # 点积
         dot = torch.sum(thrust_vec_curr * thrust_vec_next, dim=1, keepdim=True)
         
-        # 夹角
-        cos_theta = torch.clamp(dot / (n1 * n2), min=-1.0, max=1.0)
+        # 夹角计算 - 关键修复：避免 acos 在边界处梯度爆炸
+        # clamp 到 [-1+eps, 1-eps] 范围，确保梯度有界
+        cos_theta = torch.clamp(dot / (n1 * n2), min=-1.0 + 1e-6, max=1.0 - 1e-6)
         angle = torch.acos(cos_theta) # [B, 1]
         
         # 角速度近似
@@ -384,7 +390,6 @@ def simulate_position_step(
         # 参考项目: airmode_a axes = ax/thrust * av * airmode_av2a
         # 方向：沿纯推力方向 (Thrust)，需从 act_curr (含重力) 中还原
         # src/dynamics_kernel.cu 中: az = act[i][2] + 9.80665;
-        g_correction = torch.tensor([0.0, 0.0, 9.80665], device=act_curr.device)
         thrust_vec = act_curr + g_correction
         thrust_norm = torch.norm(thrust_vec, dim=1, keepdim=True).clamp(min=1e-6)
         
