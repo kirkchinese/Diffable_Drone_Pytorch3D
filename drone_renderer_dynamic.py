@@ -213,12 +213,14 @@ class DynamicSceneRenderer(DroneRenderer):
                  focal_length: float = 500.0,
                  principal_point: Tuple[float, float] = None,
                  lights_location: List[List[float]] = [[0.0, 0.0, -3.0]],
-                 num_samples: int = 20000):
+                 num_samples: int = 20000,
+                 subdivide_times: int = 3):
         """
         初始化动态场景渲染器
         
         Args:
             static_mesh_path: 静态背景网格路径
+            subdivide_times: 网格细分次数，默认 3。用于解决大面片渲染问题。
             其他参数同 DroneRenderer
         """
         # 调用父类初始化
@@ -229,7 +231,8 @@ class DynamicSceneRenderer(DroneRenderer):
             focal_length=focal_length,
             principal_point=principal_point,
             lights_location=lights_location,
-            num_samples=num_samples
+            num_samples=num_samples,
+            subdivide_times=subdivide_times
         )
         
         # 保存静态网格
