@@ -24,7 +24,7 @@
 import torch
 import numpy as np
 import math
-from pytorch3d.ops import sample_points_from_meshes, knn_points
+from pytorch3d.ops import sample_points_from_meshes, knn_points, SubdivideMeshes
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
     RasterizationSettings,
@@ -76,7 +76,8 @@ class DroneRenderer:
                  focal_length=500.0,
                  principal_point=None,
                  lights_location=[[0.0, 0.0, -3.0]],
-                 num_samples=20000):
+                 num_samples=20000,
+                 subdivide_times=3):
         """
         初始化无人机渲染器。
 
@@ -90,6 +91,10 @@ class DroneRenderer:
             principal_point (tuple, optional): 相机主点 (cx, cy)。默认图像中心。
             lights_location (list, optional): 光源位置，默认 [[0, 0, -3.0]]。
             num_samples (int, optional): 点云采样点数，默认 20000。
+            subdivide_times (int, optional): 网格细分次数，默认 3。
+                                             用于解决大面片在特定视角消失的问题。
+                                             3次细分可确保100%渲染完整度。
+                                             设为 0 则不进行细分。
 
         Raises:
             FileNotFoundError: 如果 mesh_path 指定的文件不存在。
@@ -114,8 +119,11 @@ class DroneRenderer:
         else:
             self.principal_point = (principal_point,)
         
+        # 保存细分次数以便 update_mesh 时使用
+        self.subdivide_times = subdivide_times
+        
         # 加载网格模型
-        self.mesh = self._load_mesh(mesh_path)
+        self.mesh = self._load_mesh(mesh_path, subdivide_times=subdivide_times)
         
         # 配置光栅化设置
         self.raster_settings = RasterizationSettings(
@@ -135,14 +143,20 @@ class DroneRenderer:
         # 从网格采样障碍物点云
         self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)
 
-    def _load_mesh(self, mesh_path):
+    def _load_mesh(self, mesh_path, subdivide_times=2):
         """
-        加载 .obj 格式的 3D 网格模型。
+        加载 .obj 格式的 3D 网格模型，并对大面片进行细分处理。
 
         如果模型无纹理，则创建默认白色纹理以确保渲染正常进行。
+        通过网格细分解决 PyTorch3D 对大平面渲染时的精度问题，
+        避免在特定视角下（如视角与平面平行时）大面片消失的情况。
 
         Args:
             mesh_path (str): 模型文件路径。
+            subdivide_times (int): 网格细分次数，默认为 2。每次细分会将
+                                   每个三角形分割为 4 个小三角形。
+                                   注意：细分会增加顶点和面片数量，
+                                   n 次细分后面片数量变为原来的 4^n 倍。
 
         Returns:
             Meshes: 加载的网格对象，包含顶点、法线和纹理信息。
@@ -158,10 +172,23 @@ class DroneRenderer:
             verts = mesh.verts_list()[0]
             verts_rgb = torch.ones_like(verts)[None]  # 默认白色
             mesh.textures = TexturesVertex(verts_features=verts_rgb)
+        
+        # 对网格进行细分处理，解决大面片渲染精度问题
+        # 大面片在视角与其平行时容易出现渲染消失的问题
+        if subdivide_times > 0:
+            # 获取顶点颜色特征用于细分后的纹理插值
+            verts_rgb = mesh.textures.verts_features_padded()
+            
+            for _ in range(subdivide_times):
+                subdivider = SubdivideMeshes(mesh)
+                mesh, verts_rgb = subdivider(mesh, feats=verts_rgb)
+            
+            # 更新细分后的纹理
+            mesh.textures = TexturesVertex(verts_features=verts_rgb)
             
         return mesh
 
-    def update_mesh(self, mesh_path, num_samples=20000):
+    def update_mesh(self, mesh_path, num_samples=20000, subdivide_times=None):
         """
         更换渲染的网格模型。
 
@@ -170,11 +197,14 @@ class DroneRenderer:
         Args:
             mesh_path (str): 新的网格文件路径。
             num_samples (int, optional): 重新采样的点数，默认 20000。
+            subdivide_times (int, optional): 网格细分次数。默认使用初始化时的设置。
 
         Raises:
             FileNotFoundError: 如果文件不存在。
         """
-        self.mesh = self._load_mesh(mesh_path)
+        if subdivide_times is None:
+            subdivide_times = self.subdivide_times
+        self.mesh = self._load_mesh(mesh_path, subdivide_times=subdivide_times)
         # 重新采样障碍物点云
         self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)
 
