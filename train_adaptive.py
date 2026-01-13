@@ -20,7 +20,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger
+from model import Model, Model_bigger,Model_adaptive
 from loss import DroneLoss
 
 
@@ -52,8 +52,8 @@ def parse_args():
     
     # 环境参数 - 渲染
     parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
-    parser.add_argument('--image_height', type=int, default=48, help='图像高度')
-    parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
+    parser.add_argument('--image_height', type=int, default=240, help='图像高度')
+    parser.add_argument('--image_width', type=int, default=320, help='图像宽度')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
     parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
     
@@ -136,9 +136,9 @@ class DroneTrainer:
         
         # 初始化模型
         if args.no_odom:
-            self.model = Model_bigger(dim_obs=7, dim_action=6).to(self.device) # 这里换了个大一点的模型，如果换回去就用 Model
+            self.model = Model_adaptive(dim_obs=7, dim_action=6).to(self.device) # 这里换了个大一点的模型，如果换回去就用 Model
         else:
-            self.model = Model_bigger(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
+            self.model = Model_adaptive(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
         
         # 加载预训练模型
         if args.resume:
