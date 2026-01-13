@@ -123,11 +123,11 @@ class DynamicObstacle:
         self.original_mesh = mesh
         self.scale = scale
         
-        # 状态初始化
-        self.position = position if position is not None else torch.zeros(3, device=self.device)
-        self.velocity = velocity if velocity is not None else torch.zeros(3, device=self.device)
-        self.rotation = rotation if rotation is not None else torch.eye(3, device=self.device)
-        self.angular_velocity = angular_velocity if angular_velocity is not None else torch.zeros(3, device=self.device)
+        # 状态初始化 - 确保所有 tensor 都在正确的设备上
+        self.position = position.to(self.device) if position is not None else torch.zeros(3, device=self.device)
+        self.velocity = velocity.to(self.device) if velocity is not None else torch.zeros(3, device=self.device)
+        self.rotation = rotation.to(self.device) if rotation is not None else torch.eye(3, device=self.device)
+        self.angular_velocity = angular_velocity.to(self.device) if angular_velocity is not None else torch.zeros(3, device=self.device)
         
         # 缓存变换后的网格
         self._transformed_mesh = None
@@ -250,7 +250,8 @@ class DynamicSceneRenderer(DroneRenderer):
                      position: torch.Tensor = None,
                      velocity: torch.Tensor = None,
                      scale: float = 1.0,
-                     num_samples: int = 1000) -> int:
+                     num_samples: int = 1000,
+                     subdivide_times: int = 0) -> int:
         """
         添加动态障碍物
         
@@ -260,13 +261,14 @@ class DynamicSceneRenderer(DroneRenderer):
             velocity: 初始速度
             scale: 缩放比例
             num_samples: 点云采样数
+            subdivide_times: 网格细分次数，默认为 0（动态障碍物通常较小，不需要细分）
             
         Returns:
             障碍物索引
         """
         # 加载网格
         if isinstance(mesh_or_path, str):
-            mesh = self._load_mesh(mesh_or_path)
+            mesh = self._load_mesh(mesh_or_path, subdivide_times=subdivide_times)
         else:
             mesh = mesh_or_path
             
