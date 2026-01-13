@@ -143,7 +143,7 @@ class DroneRenderer:
         # 从网格采样障碍物点云
         self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)
 
-    def _load_mesh(self, mesh_path, subdivide_times=2):
+    def _load_mesh(self, mesh_path, subdivide_times=3):
         """
         加载 .obj 格式的 3D 网格模型，并对大面片进行细分处理。
 
@@ -153,7 +153,7 @@ class DroneRenderer:
 
         Args:
             mesh_path (str): 模型文件路径。
-            subdivide_times (int): 网格细分次数，默认为 2。每次细分会将
+            subdivide_times (int): 网格细分次数，默认为 3。每次细分会将
                                    每个三角形分割为 4 个小三角形。
                                    注意：细分会增加顶点和面片数量，
                                    n 次细分后面片数量变为原来的 4^n 倍。

@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
     parser.add_argument('--batch_size', type=int, default=16, help='批量大小')
     parser.add_argument('--num_iters', type=int, default=50000, help='训练迭代次数')
-    parser.add_argument('--timesteps', type=int, default=200, help='每次迭代的模拟步数')
+    parser.add_argument('--timesteps', type=int, default=150, help='每次迭代的模拟步数')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
