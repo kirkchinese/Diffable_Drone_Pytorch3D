@@ -267,7 +267,8 @@ class DroneTrainer:
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
-        max_speed = 0.75 + 5 * torch.rand((B, 1), device=self.device)
+        max_speed = 0.75 + 8 * torch.rand((B, 1), device=self.device)  # 随机范围 [0.75, 8.75) m/s
+        # max_speed = torch.full((B, 1), 6.0, device=self.device)  # 固定最大速度 6.0 m/s
         
         # 推力估计误差 (模拟真实无人机的推力不确定性)
         thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
