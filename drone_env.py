@@ -104,7 +104,14 @@ class DroneSimulator:
     def reset(self):
         """重置无人机状态"""
         # 运动学状态
-        self.p = torch.rand(self.B, 3, device=self.device) * self.init_p_range  # 位置
+        # 位置随机化：X/Y 使用 randn 分布在 0 附近，Z 使用 rand 分布在 [0.5, 2.5] 之间 (假设 init_p_range=2.0)
+        # 原逻辑: torch.rand * range -> [0, range] (X,Y,Z 都是正的，且 Z 可能为 0)
+        # 新逻辑: 
+        #   X, Y: uniform(-range, range)
+        #   Z: uniform(0.5, range + 0.5)
+        self.p = (torch.rand(self.B, 3, device=self.device) - 0.5) * 2 * self.init_p_range
+        self.p[:, 2] = torch.rand(self.B, device=self.device) * self.init_p_range + 0.5
+        
         self.v = torch.randn(self.B, 3, device=self.device) * self.init_v_range  # 速度
         self.a = torch.zeros(self.B, 3, device=self.device)       # 加速度
         self.act_curr = torch.zeros(self.B, 3, device=self.device)     # 实际推力状态 (Internal actuation state)
@@ -176,8 +183,12 @@ class DroneSimulator:
             airmode_coef=self.airmode_coef
         )
         
-        # 计算纯推力向量（去除重力分量，指向机体Z轴）
-        thrust_net = self.act_curr - self.gravity_vec 
+        # 计算纯推力向量（用于姿态解算）
+        # 参考项目 env_cuda.py update_state_vec: a_thr = a_thr - g_std，其中 g_std = [0,0,-9.80665]
+        # act_curr 是净加速度（包含重力），纯推力 = act_curr - gravity = act_curr - [0,0,-g] = act_curr + [0,0,g]
+        # 关键修复：gravity_vec 是 [0,0,-9.8]，所以 thrust_net = act_curr - gravity_vec 
+        # 等价于 act_curr - [0,0,-9.8] = act_curr + [0,0,9.8]
+        thrust_net = self.act_curr - self.gravity_vec  # 这里 gravity_vec = [0,0,-9.8]
         
         # 确定期望的机头/速度朝向
         if target_pos_vector is None:

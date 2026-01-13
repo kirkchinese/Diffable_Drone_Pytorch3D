@@ -163,16 +163,19 @@ class DroneLoss:
         metrics['loss_bias'] = loss_bias
 
         # 控制正则化：加速度、jerk、snap
+        # 参考项目：jerk_history = act_buffer.diff(1, 0).mul(15) 
+        # 其中 15 = 1/ctl_dt，ctl_dt = 1/15
         loss_d_acc = act_history.pow(2).sum(-1).mean()
 
-        jerk_history = act_history.diff(1, 0) / self.ctl_dt
+        # jerk = d(acc)/dt，乘以 1/ctl_dt 得到正确的物理量
+        jerk_history = act_history.diff(1, 0).mul(1.0 / self.ctl_dt)
         loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
 
-        # 推力方向归一化（添加数值稳定性）
+        # snap 计算：参考项目用 F.normalize 而不是手动归一化
+        # snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)
         thrust_vec = act_history - env_g_std
-        thrust_norm = torch.norm(thrust_vec, dim=-1, keepdim=True).clamp(min=1e-6)
-        thrust_dir = thrust_vec / thrust_norm
-        snap_history = thrust_dir.diff(1, 0).diff(1, 0) / (self.ctl_dt ** 2)
+        thrust_dir = F.normalize(thrust_vec, dim=-1)  # 使用 F.normalize 更稳定
+        snap_history = thrust_dir.diff(1, 0).diff(1, 0).mul((1.0 / self.ctl_dt) ** 2)
         loss_d_snap = snap_history.pow(2).sum(-1).mean()
 
         metrics['loss_d_acc'] = loss_d_acc
@@ -180,14 +183,23 @@ class DroneLoss:
         metrics['loss_d_snap'] = loss_d_snap
 
         # 障碍物回避计算
+        # vec_to_obj_history: (T, B, 3)
+        # distance: (T, B) - 无人机到最近障碍物的距离
         distance = torch.norm(vec_to_obj_history, 2, -1)
+        # env_margin: (B,) 需要正确 broadcast
+        # distance - margin -> (T, B) - (B,) 自动 broadcast
         distance = distance - env_margin
 
-        # 参考项目使用 * 135 (即 9 / ctl_dt，ctl_dt=1/15 时为 135)
         # 计算接近障碍物的速度，用于加权损失
+        # 在时间轴 (dim=0) 上差分
+        # 负的差分值（距离变小）表示在接近障碍物
+        # 参考项目使用 * 135 (即 9 / ctl_dt，ctl_dt=1/15 时为 135)
         with torch.no_grad():
+            # diff 在 dim=0 上差分：distance[t+1] - distance[t]
+            # 如果距离变小（接近障碍物），diff 为负，取负后为正
             v_to_pt = (-torch.diff(distance, 1, 0) * (1.0 / self.ctl_dt) * 9.0).clamp_min(1)
 
+        # distance[1:] 和 v_to_pt 形状都是 (T-1, B)
         dist_slice = distance[1:]
 
         loss_obj_avoidance = self.barrier(dist_slice, v_to_pt)
