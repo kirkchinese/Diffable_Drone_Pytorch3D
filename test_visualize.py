@@ -321,8 +321,8 @@ class DroneVisualizer:
         self.p_target[:, 2] += torch.randn(B, device=self.device) * 2.0
         self.p_target[:, 2] = self.p_target[:, 2].clamp(0.5, 6.0)
         
-        # 随机化参数
-        self.max_speed = 0.75 + 3 * torch.rand((B, 1), device=self.device)
+        # 固定参数
+        self.max_speed = torch.full((B, 1), 5.0, device=self.device)  # 固定最大速度为 2.0 m/s
         self.thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
         
         # 动作缓冲
