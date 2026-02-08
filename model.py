@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 
-def g_decay(x, alpha):
-    return x * alpha + x.detach() * (1 - alpha)
 
 class Model(nn.Module):
     def __init__(self, dim_obs=9, dim_action=4) -> None:

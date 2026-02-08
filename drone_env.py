@@ -1,18 +1,20 @@
 import torch
 import os
 import sys
-from pytorch3d.ops import knn_points
+from pytorch3d.ops import knn_points, sample_points_from_meshes
 
 # 尝试导入同目录下的模块
 # 如果在 notebooks 中运行，确保父目录在 sys.path 中
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
+    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets
 except ImportError:
     # 简单的 Fallback，防止直接运行此文件时找不到模块
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
+    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets
 
 class DroneSimulator:
     def __init__(self, 
@@ -25,6 +27,7 @@ class DroneSimulator:
                  principal_point=None,           # New
                  lights_location=[[0.0, 0.0, -3.0]], # New
                  num_samples=20000,
+                 subdivide_times=0,              # 网格细分次数 (0=不细分, 降低可大幅提升批量渲染性能)
                  # 动力学参数
                  enable_airmode=True,
                  enable_induced_drag=False,
@@ -48,7 +51,11 @@ class DroneSimulator:
                  wind_std=0.1,
                  act_queue_len=2,
                  # 相机参数
-                 cam_offset_body=[0.1, 0.0, 0.0]
+                 cam_offset_body=[0.1, 0.0, 0.0],
+                 # 场景随机化参数
+                 enable_random_scene=False,
+                 scene_generator=None,
+                 safe_spawn_clearance=1.0,
                  ):
         
         self.B = batch_size
@@ -81,6 +88,11 @@ class DroneSimulator:
         self.cam_offset_body = cam_offset_body
         self.num_samples = num_samples
         
+        # 场景随机化配置
+        self.enable_random_scene = enable_random_scene
+        self.scene_generator = scene_generator
+        self.safe_spawn_clearance = safe_spawn_clearance
+        
         # 渲染器初始化
         if not os.path.exists(mesh_path) and not mesh_path.startswith("/"):
              potential_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), mesh_path)
@@ -95,7 +107,8 @@ class DroneSimulator:
             focal_length=focal_length,
             principal_point=principal_point,
             lights_location=lights_location,
-            num_samples=num_samples
+            num_samples=num_samples,
+            subdivide_times=subdivide_times
         )
         
         # 内部状态初始化
@@ -128,6 +141,99 @@ class DroneSimulator:
         self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
 
         return self._get_state()
+
+    @torch.no_grad()
+    def randomize_scene(self, num_obstacles=None):
+        """
+        随机生成新场景并更新渲染器和点云。
+        
+        使用 SceneGenerator 生成随机场景网格，替换当前渲染器中的网格。
+        只影响渲染和碰撞检测用的点云，不影响无人机状态。
+        
+        Args:
+            num_obstacles (int, optional): 障碍物数量，None 则由 SceneGenerator 随机决定。
+            
+        Returns:
+            obstacle_info (list): 障碍物信息列表
+        """
+        if self.scene_generator is None:
+            raise RuntimeError("randomize_scene() requires a SceneGenerator. "
+                               "Pass scene_generator to DroneSimulator or set enable_random_scene=True.")
+        
+        scene_mesh, obstacle_info = self.scene_generator.generate(num_obstacles=num_obstacles)
+        
+        # 直接替换渲染器的 mesh 和点云，而非通过 update_mesh (它需要文件路径)
+        self.renderer.mesh = scene_mesh
+        self.renderer.obstacle_pcd = sample_points_from_meshes(
+            scene_mesh, num_samples=self.num_samples
+        ).to(self.device)
+        # 使 extend 缓存失效
+        self.renderer._extended_mesh_cache = None
+        self.renderer._extended_mesh_bs = 0
+        
+        return obstacle_info
+
+    @torch.no_grad()
+    def safe_reset(self, arena_range=None, z_range=(1.0, 6.0)):
+        """
+        碰撞安全的环境重置：先重置动力学状态，然后用拒绝采样确保出生点不在障碍物内部。
+        
+        Args:
+            arena_range (float, optional): 出生点 X/Y 范围，默认使用 self.init_p_range
+            z_range (tuple): 出生点 Z 范围
+            
+        Returns:
+            state (Tensor): 重置后的状态
+        """
+        # 先执行常规 reset（初始化所有动力学状态）
+        self.reset()
+        
+        if arena_range is None:
+            arena_range = self.init_p_range
+        
+        # 用拒绝采样获取安全出生点
+        safe_p = sample_safe_points(
+            obstacle_pcd=self.renderer.obstacle_pcd,
+            num_points=self.B,
+            arena_range=arena_range,
+            z_range=z_range,
+            min_clearance=self.safe_spawn_clearance,
+            device=self.device,
+        )
+        
+        # 覆盖位置
+        self.p = safe_p
+        
+        return self._get_state()
+
+    @torch.no_grad()
+    def sample_safe_target(self, arena_range=None, z_range=(1.5, 6.0),
+                           min_distance=3.0, max_distance=8.0):
+        """
+        为当前出生点采样碰撞安全的目标点。
+        
+        Args:
+            arena_range: X/Y 范围
+            z_range: Z 范围
+            min_distance: 到出生点最小距离
+            max_distance: 到出生点最大距离
+            
+        Returns:
+            targets (Tensor): (B, 3) 安全目标点
+        """
+        if arena_range is None:
+            arena_range = self.init_p_range
+            
+        return sample_safe_targets(
+            obstacle_pcd=self.renderer.obstacle_pcd,
+            spawn_points=self.p,
+            arena_range=arena_range,
+            z_range=z_range,
+            min_clearance=self.safe_spawn_clearance,
+            min_distance=min_distance,
+            max_distance=max_distance,
+            device=self.device,
+        )
 
     def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None):
         """
@@ -236,6 +342,38 @@ class DroneSimulator:
         )
         return rgb, depth
 
+    def _knn_query(self, p=None):
+        """
+        共享的 KNN 查询，返回到最近障碍物的距离和向量。
+        避免 calc_min_distance 和 vec_to_obj 各自独立调用 knn_points。
+
+        Args:
+            p (Tensor, optional): 无人机位置 (B, 3)。如果为 None，使用当前状态 self.p。
+
+        Returns:
+            dists (B,): 到最近障碍物的欧氏距离
+            vecs (B, 3): 从无人机到最近障碍物点的向量
+        """
+        pos = p if p is not None else self.p
+        p1 = pos.unsqueeze(1)
+        B_size = p1.shape[0]
+
+        obstacle_pcd = self.renderer.obstacle_pcd
+        if obstacle_pcd.shape[0] != B_size:
+            obstacle_pcd_expanded = obstacle_pcd.expand(B_size, -1, -1)
+        else:
+            obstacle_pcd_expanded = obstacle_pcd
+
+        # return_nn=True 直接返回最近邻坐标，避免手动索引
+        result = knn_points(p1, obstacle_pcd_expanded, K=1, return_nn=True)
+        sq_dists = result.dists.squeeze(-1).squeeze(-1)  # (B,)
+        dists = torch.sqrt(sq_dists + 1e-6)
+
+        nearest_points = result.knn.squeeze(1).squeeze(1)  # (B, 3)
+        vecs = nearest_points - pos
+
+        return dists, vecs
+
     def calc_min_distance(self, p=None):
         """
         计算无人机到障碍物的最短距离。
@@ -246,19 +384,7 @@ class DroneSimulator:
         Returns:
             dist (B,)
         """
-        pos = p if p is not None else self.p
-        p1 = pos.unsqueeze(1) 
-        B_size = p1.shape[0]
-        
-        obstacle_pcd = self.renderer.obstacle_pcd
-        if obstacle_pcd.shape[0] != B_size:
-            obstacle_pcd_expanded = obstacle_pcd.expand(B_size, -1, -1)
-        else:
-            obstacle_pcd_expanded = obstacle_pcd
-            
-        result = knn_points(p1, obstacle_pcd_expanded, K=1)
-        sq_dists = result.dists.squeeze(-1) # (B, 1) -> (B,)
-        dists = torch.sqrt(sq_dists + 1e-6).squeeze(-1) 
+        dists, _ = self._knn_query(p)
         return dists
 
     def distance_to_obj(self, p=None):
@@ -277,26 +403,32 @@ class DroneSimulator:
         Returns:
             vec (B, 3)
         """
-        pos = p if p is not None else self.p
-        p1 = pos.unsqueeze(1) 
-        B_size = p1.shape[0]
-        
-        obstacle_pcd = self.renderer.obstacle_pcd
-        if obstacle_pcd.shape[0] != B_size:
-            obstacle_pcd_expanded = obstacle_pcd.expand(B_size, -1, -1)
-        else:
-            obstacle_pcd_expanded = obstacle_pcd
-            
-        result = knn_points(p1, obstacle_pcd_expanded, K=1)
-        idx = result.idx.squeeze(-1).squeeze(-1)  # (B,)
-        
-        # 获取最近的点
-        nearest_points = obstacle_pcd_expanded[torch.arange(B_size), idx]  # (B, 3)
-        
-        # 向量：最近点 - 无人机位置
-        vecs = nearest_points - pos
+        _, vecs = self._knn_query(p)
         return vecs
 
+    def vec_to_obj_subdivided(self, n_subdiv=10, dt=None):
+        """
+        在子步插值位置上计算到最近障碍物的向量（参考项目 find_vec_to_nearest_pt 的实现）。
+
+        沿当前步轨迹 p + v * t 均匀采样 n_subdiv 个点，逐点查询最近障碍物。
+        与单点 vec_to_obj 相比，能捕获步内的碰撞风险。
+
+        Args:
+            n_subdiv (int): 子步数量，默认 10（与参考项目一致）。
+            dt (float, optional): 当前步时间步长。默认使用 self.dt。
+
+        Returns:
+            vecs (n_subdiv, B, 3): 各子步位置到最近障碍物的向量。
+        """
+        current_dt = dt if dt is not None else self.dt
+        sub_div = torch.linspace(0, current_dt, n_subdiv, device=self.device)
+
+        vecs_list = []
+        for t_frac in sub_div:
+            p_interp = self.p + self.v * t_frac
+            _, vec = self._knn_query(p_interp)
+            vecs_list.append(vec)
+        return torch.stack(vecs_list)  # (n_subdiv, B, 3)
 
     def update_mesh(self, mesh_path, num_samples=None):
         """

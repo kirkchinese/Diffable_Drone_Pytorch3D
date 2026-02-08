@@ -108,6 +108,7 @@ class DynamicObstacle:
                  rotation: torch.Tensor = None,
                  angular_velocity: torch.Tensor = None,
                  scale: float = 1.0,
+                 num_pcd_samples: int = 500,
                  device: torch.device = None):
         """
         Args:
@@ -117,6 +118,7 @@ class DynamicObstacle:
             rotation: 旋转矩阵 (3, 3) 默认单位矩阵
             angular_velocity: 角速度 (3,) 默认不旋转
             scale: 缩放比例
+            num_pcd_samples: 点云采样数（初始化时一次性采样，之后复用）
             device: 计算设备
         """
         self.device = device or mesh.device
@@ -132,6 +134,11 @@ class DynamicObstacle:
         # 缓存变换后的网格
         self._transformed_mesh = None
         self._needs_update = True
+        
+        # 缓存本地坐标系点云（一次性采样，之后只做 transform）
+        self._local_pcd = sample_points_from_meshes(
+            mesh, num_samples=num_pcd_samples
+        ).squeeze(0) * self.scale  # (N, 3)，已含缩放
         
     def step(self, dt: float):
         """
@@ -197,6 +204,11 @@ class DynamicObstacle:
     def set_velocity(self, velocity: torch.Tensor):
         """设置速度"""
         self.velocity = velocity.to(self.device)
+
+    def get_transformed_pcd(self) -> torch.Tensor:
+        """获取当前位姿下的点云（复用缓存的本地点云 + 旋转平移，避免每步 resample）"""
+        pcd = self._local_pcd @ self.rotation.T + self.position  # (N, 3)
+        return pcd.unsqueeze(0)  # (1, N, 3)
 
 
 class DynamicSceneRenderer(DroneRenderer):
@@ -394,12 +406,15 @@ class DynamicSceneRenderer(DroneRenderer):
                 transformed_mesh = obstacle.get_transformed_mesh()
                 meshes_list.append(transformed_mesh)
                 
-                # 采样动态障碍物点云
-                pcd = sample_points_from_meshes(transformed_mesh, num_samples=500)
+                # 使用缓存的本地点云 + 变换，避免每步重新采样
+                pcd = obstacle.get_transformed_pcd()
                 dynamic_pcds.append(pcd)
             
             # 合并所有网格
             self.mesh = join_meshes_as_scene(meshes_list)
+            # 动态场景网格每步变化，使 extend 缓存失效
+            self._extended_mesh_cache = None
+            self._extended_mesh_bs = 0
             
             # 合并点云
             if dynamic_pcds:
@@ -474,7 +489,7 @@ class DynamicDroneSimulator:
                 static_mesh_path=self.base.renderer.mesh_path if hasattr(self.base.renderer, 'mesh_path') else './data/sample/sample4.obj',
                 device=self.base.device,
                 image_size=self.base.renderer.image_size,
-                focal_length=self.base.renderer.focal_length[0][0],
+                focal_length=self.base.renderer.focal_length[0][0].item(),
             )
             self.base.renderer = self.renderer
             
@@ -497,4 +512,6 @@ class DynamicDroneSimulator:
         
     def __getattr__(self, name):
         """代理到基础仿真器"""
+        if name == 'base':
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute 'base'")
         return getattr(self.base, name)
