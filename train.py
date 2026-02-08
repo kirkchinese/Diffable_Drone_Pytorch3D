@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from drone_env import DroneSimulator
 from model import Model, Model_bigger
 from loss import DroneLoss
+from scene_generator import SceneGenerator
 
 
 def parse_args():
@@ -56,6 +57,21 @@ def parse_args():
     parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
     parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
+    parser.add_argument('--subdivide_times', type=int, default=0,
+                        help='网格细分次数 (默认0, 配合z_clip无质量损失且渲染快)')
+    
+    # 场景随机化参数
+    parser.add_argument('--random_scene', action='store_true', default=False,
+                        help='启用随机场景生成 (每 episode 随机组合障碍物)')
+    parser.add_argument('--num_obstacles_min', type=int, default=5, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_max', type=int, default=15, help='每场景最多障碍物数')
+    parser.add_argument('--obstacle_scale_min', type=float, default=0.5, help='障碍物最小缩放')
+    parser.add_argument('--obstacle_scale_max', type=float, default=3.0, help='障碍物最大缩放')
+    parser.add_argument('--arena_range', type=float, default=10.0, help='场景 X/Y 范围')
+    parser.add_argument('--safe_spawn', action='store_true', default=False,
+                        help='启用碰撞安全的出生点/目标点采样')
+    parser.add_argument('--safe_clearance', type=float, default=1.0,
+                        help='安全出生点到障碍物的最小距离')
     
     # 环境参数 - 无人机物理
     parser.add_argument('--margin_min', type=float, default=0.1, help='无人机安全半径最小值')
@@ -111,6 +127,28 @@ class DroneTrainer:
         if getattr(args, 'disable_airmode', False):
             enable_airmode = False
         
+        # 创建场景生成器（如果启用随机场景）
+        self.scene_generator = None
+        if getattr(args, 'random_scene', False):
+            self.scene_generator = SceneGenerator(
+                device=self.device,
+                arena_range=getattr(args, 'arena_range', 10.0),
+                num_obstacles_range=(
+                    getattr(args, 'num_obstacles_min', 5),
+                    getattr(args, 'num_obstacles_max', 15),
+                ),
+                obstacle_scale_range=(
+                    getattr(args, 'obstacle_scale_min', 0.5),
+                    getattr(args, 'obstacle_scale_max', 3.0),
+                ),
+            )
+            print(f"[SceneGenerator] 已启用随机场景生成, "
+                  f"障碍物数量: {args.num_obstacles_min}-{args.num_obstacles_max}")
+        
+        self.safe_spawn = getattr(args, 'safe_spawn', False) or getattr(args, 'random_scene', False)
+        if self.safe_spawn:
+            print(f"[SafeSpawn] 已启用安全出生点/目标点, 最小安全距离: {getattr(args, 'safe_clearance', 1.0)}")
+        
         # 初始化环境
         self.env = DroneSimulator(
             batch_size=args.batch_size,
@@ -131,7 +169,13 @@ class DroneTrainer:
             init_p_range=getattr(args, 'init_p_range', 2.0),
             init_margin_range=(getattr(args, 'margin_min', 0.1), getattr(args, 'margin_max', 0.3)),
             # 点云采样
-            num_samples=args.num_samples
+            num_samples=args.num_samples,
+            # 渲染优化: subdivide_times=0 在 48x64 下无质量损失, 面片从 106 万降至 1.6 万
+            subdivide_times=args.subdivide_times,
+            # 场景随机化
+            enable_random_scene=getattr(args, 'random_scene', False),
+            scene_generator=self.scene_generator,
+            safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
         )
         
         # 初始化模型
@@ -227,6 +271,17 @@ class DroneTrainer:
         self.env.reset()
         self.model.reset()
         
+        # 随机场景生成 (如果启用)
+        if self.env.enable_random_scene and self.env.scene_generator is not None:
+            self.env.randomize_scene()
+        
+        # 安全出生点采样 (如果启用)
+        if self.safe_spawn:
+            self.env.safe_reset(
+                arena_range=getattr(self.args, 'init_p_range', 8.0),
+                z_range=(1.0, 6.0),
+            )
+        
         # 历史记录
         p_history = []
         v_history = []
@@ -246,32 +301,44 @@ class DroneTrainer:
         initial_act = self.env.act_curr.clone()  # 使用环境当前的执行器状态初始化
         act_buffer = [initial_act.clone() for _ in range(act_lag + 1)]
         
-        # 目标位置 (随机生成) - 独立于初始位置生成，确保样本多样性
-        # p_target 分布: X/Y [-8, 8], Z [0.5, 6.0]
-        # 这样无人机可能需要从左飞到右，从高飞到低，不仅仅是向外扩散
-        angle = torch.rand(B, device=self.device) * 2 * math.pi
-        dist = torch.rand(B, device=self.device) * 5.0 + 3.0 # 距离 3m ~ 8m
-        
-        offset_x = torch.cos(angle) * dist
-        offset_y = torch.sin(angle) * dist
-        offset_z = torch.randn(B, device=self.device) * 2.0 # Z轴差异
-        
-        p_target = self.env.p.clone()
-        p_target[:, 0] += offset_x
-        p_target[:, 1] += offset_y
-        p_target[:, 2] += offset_z
-        
-        p_target[:, 2] = p_target[:, 2].clamp(1.5, 6.0)  # 限制 Z 范围 (最低1.5防止钻地)
+        # 目标位置 (随机生成)
+        if self.safe_spawn:
+            # 使用碰撞安全的目标点采样
+            p_target = self.env.sample_safe_target(
+                arena_range=getattr(self.args, 'init_p_range', 8.0),
+                z_range=(1.5, 6.0),
+                min_distance=3.0,
+                max_distance=8.0,
+            )
+        else:
+            # 原始方式：基于角度/距离偏移，不检查碰撞
+            angle = torch.rand(B, device=self.device) * 2 * math.pi
+            dist = torch.rand(B, device=self.device) * 5.0 + 3.0 # 距离 3m ~ 8m
+            
+            offset_x = torch.cos(angle) * dist
+            offset_y = torch.sin(angle) * dist
+            offset_z = torch.randn(B, device=self.device) * 2.0 # Z轴差异
+            
+            p_target = self.env.p.clone()
+            p_target[:, 0] += offset_x
+            p_target[:, 1] += offset_y
+            p_target[:, 2] += offset_z
+            
+            p_target[:, 2] = p_target[:, 2].clamp(1.5, 6.0)  # 限制 Z 范围 (最低1.5防止钻地)
         
         target_v_raw = p_target - self.env.p
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
-        max_speed = 0.75 + 8 * torch.rand((B, 1), device=self.device)  # 随机范围 [0.75, 8.75) m/s
+        max_speed = 0.75 + 3 * torch.rand((B, 1), device=self.device)  # 随机范围 [0.75, 3.75) m/s
         # max_speed = torch.full((B, 1), 6.0, device=self.device)  # 固定最大速度 6.0 m/s
         
         # 推力估计误差 (模拟真实无人机的推力不确定性)
         thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
+        
+        # Per-sample 相机俯仰角随机化 (参考项目在 reset 中一次性设定整个 episode)
+        # 模拟每架无人机相机安装角的个体差异，episode 内保持不变
+        cam_pitch = args.cam_angle + torch.randn(B, device=self.device)
         
         # 航向漂移 (可选)
         if args.yaw_drift:
@@ -292,7 +359,7 @@ class DroneTrainer:
             # 这里这个是个大坑，参考项目也是这么做的，我之前没有注意到，不这么做，会导致梯度爆炸，这个问题是在pytorch3d中产生的，问题很隐蔽，查了我很久。
             with torch.no_grad():
                 _, depth = self.env.render(
-                    camera_pitch=args.cam_angle,
+                    camera_pitch=cam_pitch,
                     return_tensor=True,
                     return_rgb=False,
                     return_depth=True,
@@ -303,7 +370,7 @@ class DroneTrainer:
             
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
-            vec_to_pt_history.append(self.env.vec_to_obj())
+            vec_to_pt_history.append(self.env.vec_to_obj_subdivided(dt=current_dt))
             
             # 保存可视化帧 (第5个样本)
             if is_save_iter(iteration) and B > 4:
@@ -328,13 +395,6 @@ class DroneTrainer:
             target_v_norm = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
             target_v_unit = target_v_raw / (target_v_norm + 1e-6)
             target_v = target_v_unit * torch.minimum(target_v_norm, max_speed)
-            # 注意：target_v_history 在循环末尾与 v_history 一起记录
-            
-            # 构建观测状态
-            # 转换到局部坐标系 - 关键修复！
-            # 参考项目: torch.squeeze(target_v[:, None] @ R, 1)
-            # 这里 v @ R 相当于 v.unsqueeze(1) @ R，结果是 (B, 1, 3) -> squeeze -> (B, 3)
-            # 这是一种将世界坐标转换到以 R 的列向量为基的坐标系的方式
             target_v_local = torch.squeeze(target_v[:, None] @ R_local, 1)
             local_v = torch.squeeze(self.env.v[:, None] @ R_local, 1)
             
@@ -349,8 +409,10 @@ class DroneTrainer:
             state = torch.cat(state_parts, dim=-1)  # [7] or [10]
             
             # 深度图预处理
+            bg_mask = (depth < 0)  # PyTorch3D 背景像素 zbuf = -1
             x = depth.clamp(0.3, 24.0)
             x = 3.0 / x - 0.6  # 转换为近似线性空间
+            x[bg_mask] = 0.0    # 背景设为 0（无障碍物），避免 -1 被误映射为最大近距信号
             x = x + torch.randn_like(x) * 0.02  # 添加噪声
             # x = F.max_pool2d(x[:, None], kernel_size=4, stride=4) # 缩小尺寸 # 这里我换了个模型，不用缩小了
             x = x.unsqueeze(1)  # 恢复通道维度 (B, H, W) -> (B, 1, H, W) # 与上一行对立，如果你要用小模型就注释这一行，恢复上一行
@@ -358,29 +420,19 @@ class DroneTrainer:
             # 模型推理
             act_raw, _, h = self.model(x, state, h)
             
-            # 解析输出: [加速度向量(3), 速度预测(3)]
-            # 参考项目: a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
-            # act_raw: (B, 6) -> reshape to (B, 3, 2) 
-            # R @ (B, 3, 2) -> (B, 3, 2) -> unbind(-1) -> [a_pred, v_pred]
             act_reshaped = act_raw.reshape(B, 3, 2)  # 关键修复！直接 reshape 为 (B, 3, 2)
             act_world = R_local @ act_reshaped  # 转换到世界坐标系 (B, 3, 2)
             a_pred, v_pred = act_world.unbind(-1)  # 分离加速度和速度预测
             
             v_preds.append(v_pred)
             
-            # 计算实际动作 (参考项目公式)
-            # act = (a_pred - v_pred - g_std) * thr_est_error + g_std
             act = (a_pred - v_pred - self.g_std) * thr_est_error + self.g_std
-            
-            # 加入动作缓冲
+        
             act_buffer.append(act)
             
-            # 关键修复：v_history 和 target_v_history 在 step 之后记录
-            # 与参考项目一致
             v_history.append(self.env.v)
             target_v_history.append(target_v)
-        
-        # 堆叠历史
+
         p_history = torch.stack(p_history)          # (T, B, 3)
         v_history = torch.stack(v_history)          # (T, B, 3)
         target_v_history = torch.stack(target_v_history)  # (T, B, 3)

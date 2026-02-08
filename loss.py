@@ -183,24 +183,28 @@ class DroneLoss:
         metrics['loss_d_snap'] = loss_d_snap
 
         # 障碍物回避计算
-        # vec_to_obj_history: (T, B, 3)
-        # distance: (T, B) - 无人机到最近障碍物的距离
+        # vec_to_obj_history 支持两种格式：
+        #   - 单点:   (T, B, 3)    → distance (T, B)
+        #   - 子步细分: (T, S, B, 3) → distance (T, S, B)
         distance = torch.norm(vec_to_obj_history, 2, -1)
-        # env_margin: (B,) 需要正确 broadcast
-        # distance - margin -> (T, B) - (B,) 自动 broadcast
-        distance = distance - env_margin
+        distance = distance - env_margin  # env_margin (B,) 自动 broadcast
 
-        # 计算接近障碍物的速度，用于加权损失
-        # 在时间轴 (dim=0) 上差分
-        # 负的差分值（距离变小）表示在接近障碍物
-        # 参考项目使用 * 135 (即 9 / ctl_dt，ctl_dt=1/15 时为 135)
+        has_subdiv = (distance.dim() == 3)  # (T, S, B) 表示有子步细分
+
         with torch.no_grad():
-            # diff 在 dim=0 上差分：distance[t+1] - distance[t]
-            # 如果距离变小（接近障碍物），diff 为负，取负后为正
-            v_to_pt = (-torch.diff(distance, 1, 0) * (1.0 / self.ctl_dt) * 9.0).clamp_min(1)
+            if has_subdiv:
+                # 子步细分：沿子步维度 (dim=1) 差分，与参考项目一致
+                # Δt_sub = ctl_dt / (S-1)，所以 1/Δt_sub = (S-1)/ctl_dt
+                S = distance.shape[1]
+                v_to_pt = (-torch.diff(distance, 1, 1) * ((S - 1) / self.ctl_dt)).clamp_min(1)
+            else:
+                # 单点：沿时间轴 (dim=0) 差分，乘以 9/ctl_dt (= 135 @ 15Hz)
+                v_to_pt = (-torch.diff(distance, 1, 0) * (1.0 / self.ctl_dt) * 9.0).clamp_min(1)
 
-        # distance[1:] 和 v_to_pt 形状都是 (T-1, B)
-        dist_slice = distance[1:]
+        if has_subdiv:
+            dist_slice = distance[:, 1:]  # (T, S-1, B)
+        else:
+            dist_slice = distance[1:]  # (T-1, B)
 
         loss_obj_avoidance = self.barrier(dist_slice, v_to_pt)
         metrics['loss_obj_avoidance'] = loss_obj_avoidance
