@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
     parser.add_argument('--image_height', type=int, default=240, help='图像高度')
     parser.add_argument('--image_width', type=int, default=320, help='图像宽度')
+    parser.add_argument('--hfov', type=float, default=90.0,
+                        help='相机水平视场角 (度)，默认90°。焦距由 FOV 和图像宽度自动计算')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
     parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
     parser.add_argument('--subdivide_times', type=int, default=0,
@@ -64,11 +66,11 @@ def parse_args():
     # 场景随机化参数
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成 (每 episode 随机组合障碍物)')
-    parser.add_argument('--num_obstacles_min', type=int, default=10, help='每场景最少障碍物数')
-    parser.add_argument('--num_obstacles_max', type=int, default=20, help='每场景最多障碍物数')
-    parser.add_argument('--obstacle_scale_min', type=float, default=0.5, help='障碍物最小缩放')
-    parser.add_argument('--obstacle_scale_max', type=float, default=3.0, help='障碍物最大缩放')
-    parser.add_argument('--arena_range', type=float, default=10.0, help='场景 X/Y 范围')
+    parser.add_argument('--num_obstacles_min', type=int, default=20, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_max', type=int, default=40, help='每场景最多障碍物数')
+    parser.add_argument('--obstacle_scale_min', type=float, default=0.3, help='障碍物最小缩放')
+    parser.add_argument('--obstacle_scale_max', type=float, default=2.0, help='障碍物最大缩放')
+    parser.add_argument('--arena_range', type=float, default=6.0, help='场景水平范围 [-R,R]')
     parser.add_argument('--safe_spawn', action='store_true', default=False,
                         help='启用碰撞安全的出生点/目标点采样')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
@@ -133,14 +135,14 @@ class DroneTrainer:
         if getattr(args, 'random_scene', False):
             self.scene_generator = SceneGenerator(
                 device=self.device,
-                arena_range=getattr(args, 'arena_range', 10.0),
+                arena_range=getattr(args, 'arena_range', 6.0),
                 num_obstacles_range=(
-                    getattr(args, 'num_obstacles_min', 5),
-                    getattr(args, 'num_obstacles_max', 15),
+                    getattr(args, 'num_obstacles_min', 20),
+                    getattr(args, 'num_obstacles_max', 40),
                 ),
                 obstacle_scale_range=(
-                    getattr(args, 'obstacle_scale_min', 0.5),
-                    getattr(args, 'obstacle_scale_max', 3.0),
+                    getattr(args, 'obstacle_scale_min', 0.3),
+                    getattr(args, 'obstacle_scale_max', 2.0),
                 ),
             )
             print(f"[SceneGenerator] 已启用随机场景生成, "
@@ -150,12 +152,21 @@ class DroneTrainer:
         if self.safe_spawn:
             print(f"[SafeSpawn] 已启用安全出生点/目标点, 最小安全距离: {getattr(args, 'safe_clearance', 1.0)}")
         
+        # 根据 FOV 计算焦距
+        import math
+        focal_length = (args.image_width / 2.0) / math.tan(math.radians(args.hfov / 2.0))
+        hfov_actual = 2 * math.degrees(math.atan(args.image_width / 2.0 / focal_length))
+        vfov_actual = 2 * math.degrees(math.atan(args.image_height / 2.0 / focal_length))
+        print(f"[Camera] HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
+              f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
+
         # 初始化环境
         self.env = DroneSimulator(
             batch_size=args.batch_size,
             dt=self.ctl_dt,
             mesh_path=args.mesh_path,
             image_size=(args.image_height, args.image_width),
+            focal_length=focal_length,
             device=self.device,
             # 动力学参数
             enable_airmode=enable_airmode,

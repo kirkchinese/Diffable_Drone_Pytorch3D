@@ -28,6 +28,32 @@ from pytorch3d.ops import sample_points_from_meshes
 
 
 # ============================================================
+# 坐标系转换工具
+# ============================================================
+
+def obj_to_ros(pos):
+    """
+    OBJ 坐标系 (Y-up) 与 ROS 坐标系 (Z-up) 之间的转换。
+
+    映射关系（自逆变换，双向适用）：
+      OBJ (x, y, z) ↔ ROS (-x, z, y)
+
+    Args:
+        pos: (..., 3) tensor，源坐标系中的位置
+
+    Returns:
+        (..., 3) tensor，目标坐标系中的位置
+    """
+    x = pos[..., 0]
+    y = pos[..., 1]
+    z = pos[..., 2]
+    return torch.stack([-x, z, y], dim=-1)
+
+# ROS→OBJ 是完全相同的变换（自逆）
+ros_to_obj = obj_to_ros
+
+
+# ============================================================
 # 基本几何体原语库
 # ============================================================
 
@@ -94,11 +120,14 @@ def _transform_mesh(mesh, scale, rotation_y, translation):
     """
     对网格施加缩放、Y轴旋转和平移变换。
 
+    注意：本函数在 OBJ 坐标系中工作（Y 轴朝上）。
+    旋转绕 OBJ Y 轴（即世界上方向），对应 ROS 坐标系中的 yaw 旋转。
+
     Args:
         mesh: Meshes 对象（单个网格）
         scale: (3,) tensor 或 float，XYZ 缩放因子
-        rotation_y: float，绕 Z 轴旋转角度（弧度，ROS 坐标系中 Z 朝上）
-        translation: (3,) tensor，平移向量
+        rotation_y: float，绕 OBJ Y 轴旋转角度（弧度）
+        translation: (3,) tensor，OBJ 坐标系中的平移向量 (X=水平, Y=高度, Z=水平)
 
     Returns:
         Meshes: 变换后的新网格
@@ -111,13 +140,13 @@ def _transform_mesh(mesh, scale, rotation_y, translation):
         scale = torch.tensor([scale, scale, scale], device=device)
     verts = verts * scale
 
-    # 绕 Z 轴旋转 (ROS 坐标系 Z 朝上)
+    # 绕 OBJ Y 轴旋转（Y 是上方向，在 XZ 平面旋转）
     cos_a = math.cos(rotation_y)
     sin_a = math.sin(rotation_y)
     R = torch.tensor([
-        [cos_a, -sin_a, 0],
-        [sin_a,  cos_a, 0],
-        [0,      0,     1]
+        [ cos_a, 0, sin_a],
+        [ 0,     1, 0    ],
+        [-sin_a, 0, cos_a]
     ], device=device, dtype=torch.float32)
     verts = verts @ R.T
 
@@ -140,34 +169,49 @@ class SceneGenerator:
     每次调用 generate() 时，从原语库中随机抽取障碍物，
     随机变换（缩放、旋转、平移）后合并为一个场景网格。
 
+    坐标系约定：
+      本模块在 OBJ 坐标系中工作（Y 轴朝上），与加载的 .obj 文件一致。
+      OBJ ↔ ROS 映射: ROS (x,y,z) → OBJ (-x, z, y)  (自逆变换)
+      - OBJ X/Z: 水平平面
+      - OBJ Y: 高度（上方向）
+      - 地板表面位于 OBJ Y ≈ 0
+
     属性：
         device: 计算设备
         primitive_meshes: dict，预加载的原语网格缓存
-        arena_range: float，场景活动区域的半径范围 (X/Y)
-        obstacle_z_range: tuple，障碍物高度范围 (min_z, max_z)
+        arena_range: float，场景活动区域的半径范围 (水平面 X/Z)
+        obstacle_z_range: tuple，障碍物高度范围 (min_height, max_height)，
+                          在 OBJ 坐标系中映射到 Y 轴
         num_obstacles_range: tuple，每场景障碍物数量范围 (min, max)
+        primitive_half_heights: dict，预计算的各原语居中后 Y 方向半高度
     """
 
     def __init__(self,
                  device,
                  primitive_dir=None,
-                 arena_range=10.0,
-                 obstacle_z_range=(0.0, 8.0),
-                 num_obstacles_range=(5, 15),
-                 obstacle_scale_range=(0.5, 3.0),
+                 arena_range=6.0,
+                 obstacle_z_range=(0.0, 5.0),
+                 num_obstacles_range=(20, 40),
+                 obstacle_scale_range=(0.3, 2.0),
                  floor_scale=(1.0, 1.0, 1.0),
                  include_floor=True,
+                 concentration=0.6,
                  seed=None):
         """
         Args:
             device: 计算设备
             primitive_dir: 原语文件目录
-            arena_range: 场景 X/Y 范围 [-arena_range, arena_range]
-            obstacle_z_range: 障碍物底部高度范围 (会保证 Z >= 0)
+            arena_range: 场景水平范围 [-arena_range, arena_range]（OBJ X/Z 平面）
+            obstacle_z_range: 障碍物高度范围 (min, max)。
+                              语义为"高度"，内部映射到 OBJ Y 轴。
+                              会自动保证障碍物底部不低于地板 (OBJ Y >= 0)。
             num_obstacles_range: 障碍物数量范围 (min, max)，含两端
             obstacle_scale_range: 障碍物缩放范围
             floor_scale: 地板缩放因子 (x, y, z)
             include_floor: 是否包含地板
+            concentration: 障碍物向中心集中的比例 (0=均匀, 1=全部集中在中心)。
+                           该比例的障碍物使用截断正态分布放置 (sigma=arena_range/3)，
+                           其余障碍物均匀分布。默认 0.6，保证无人机飞行区域密度合理。
             seed: 随机种子（仅用于 Python random 模块）
         """
         self.device = device
@@ -177,17 +221,24 @@ class SceneGenerator:
         self.obstacle_scale_range = obstacle_scale_range
         self.floor_scale = floor_scale
         self.include_floor = include_floor
+        self.concentration = concentration
 
         if seed is not None:
             random.seed(seed)
 
         # 预加载所有原语网格
         self.primitive_meshes = {}
+        self.primitive_half_heights = {}  # 各原语居中后 Y 方向半高度
         obstacle_names = [k for k, (_, _, is_floor) in PRIMITIVE_REGISTRY.items() if not is_floor]
         for name in obstacle_names:
-            self.primitive_meshes[name] = _center_mesh(
+            centered = _center_mesh(
                 _load_primitive_mesh(name, device=device, primitive_dir=primitive_dir)
             )
+            self.primitive_meshes[name] = centered
+            # 预计算 Y 方向半高度（居中后 Y_max ≈ -Y_min ≈ half_height）
+            verts_y = centered.verts_packed()[:, 1]
+            self.primitive_half_heights[name] = verts_y.max().item()
+
         if include_floor:
             self.primitive_meshes["floor"] = _load_primitive_mesh(
                 "floor", device=device, primitive_dir=primitive_dir
@@ -225,7 +276,11 @@ class SceneGenerator:
             lo, hi = self.num_obstacles_range
             num_obstacles = random.randint(lo, hi)
 
-        for _ in range(num_obstacles):
+        # 决定每个障碍物的放置策略
+        # concentration 比例的障碍物用截断正态分布（集中在中心），其余均匀分布
+        sigma = self.arena_range / 3.0  # 正态分布标准差
+
+        for i in range(num_obstacles):
             # 随机选择原语类型
             name = random.choice(self.obstacle_names)
             base_mesh = self.primitive_meshes[name]
@@ -239,18 +294,38 @@ class SceneGenerator:
             sz = base_scale * random.uniform(0.7, 1.3)
             scale = torch.tensor([sx, sy, sz], device=self.device)
 
-            # 随机旋转 (绕 Z 轴)
-            rot_z = random.uniform(0, 2 * math.pi)
+            # 随机旋转 (绕 OBJ Y 轴，即上方向)
+            rot_y = random.uniform(0, 2 * math.pi)
 
-            # 随机位置 (X/Y 均匀分布，Z 基于障碍物高度)
-            tx = random.uniform(-self.arena_range, self.arena_range)
-            ty = random.uniform(-self.arena_range, self.arena_range)
-            # 障碍物中心 Z：确保底部不低于 0
-            z_lo, z_hi = self.obstacle_z_range
-            tz = random.uniform(z_lo, z_hi)
+            # --- 坐标系: OBJ Y-up ---
+            # OBJ X/Z = 水平面, OBJ Y = 高度
+            # obstacle_z_range 语义为"高度范围"，映射到 OBJ Y
+            height_lo, height_hi = self.obstacle_z_range
+
+            # 水平位置 (OBJ X 和 OBJ Z)
+            # 使用混合分布：concentration 比例用截断正态 (集中在中心)，
+            # 其余均匀分布 (保证边缘也有障碍物)
+            use_concentrated = random.random() < self.concentration
+            if use_concentrated:
+                # 截断正态分布：采样后 clamp 到 arena 范围
+                tx = max(-self.arena_range, min(self.arena_range, random.gauss(0, sigma)))
+                tz = max(-self.arena_range, min(self.arena_range, random.gauss(0, sigma)))
+            else:
+                tx = random.uniform(-self.arena_range, self.arena_range)
+                tz = random.uniform(-self.arena_range, self.arena_range)
+
+            # 高度位置 (OBJ Y): 确保障碍物底部不低于地板 (Y >= 0)
+            # 绕 Y 轴旋转不改变 Y 方向范围，所以 half_height = 原始半高 * sy
+            half_height = self.primitive_half_heights[name] * sy
+            min_ty = max(half_height, height_lo)  # 底部至少在 Y=0
+            if min_ty < height_hi:
+                ty = random.uniform(min_ty, height_hi)
+            else:
+                ty = min_ty  # 退化：缩放太大，至少保证底部齐地板
+
             translation = torch.tensor([tx, ty, tz], device=self.device)
 
-            transformed = _transform_mesh(base_mesh, scale, rot_z, translation)
+            transformed = _transform_mesh(base_mesh, scale, rot_y, translation)
             meshes_to_join.append(transformed)
 
             # 记录障碍物信息（用于碰撞检测参考）
@@ -289,22 +364,29 @@ def sample_safe_points(
     device=None,
 ):
     """
-    采样碰撞安全的点位（出生点或目标点）。
+    采样碰撞安全的点位（出生点或目标点），在 OBJ 坐标系中工作。
 
     使用拒绝采样：随机生成候选点，检查到最近障碍物点云的距离，
     拒绝距离小于 min_clearance 的候选点。
 
+    坐标系约定 (OBJ, Y-up):
+      - index 0 (X): 水平，范围 [-arena_range, arena_range]
+      - index 1 (Y): 高度（上方向），范围 z_range
+      - index 2 (Z): 水平，范围 [-arena_range, arena_range]
+
+    返回值在 OBJ 坐标系中，调用方负责转换到 ROS 坐标系。
+
     Args:
-        obstacle_pcd: (1, N, 3) 或 (N, 3) 障碍物点云
+        obstacle_pcd: (1, N, 3) 或 (N, 3) 障碍物点云（OBJ 坐标系）
         num_points: 需要的安全点数
-        arena_range: X/Y 采样范围 [-arena_range, arena_range]
-        z_range: Z 采样范围 (min, max)
+        arena_range: 水平采样范围 [-arena_range, arena_range]（OBJ X/Z）
+        z_range: 高度采样范围 (min, max)，语义为"高度"，映射到 OBJ Y 轴
         min_clearance: 最小安全距离（到最近障碍物表面）
         max_attempts: 最大采样轮数，超过则放宽约束
         device: 计算设备
 
     Returns:
-        points: (num_points, 3) 安全点位置
+        points: (num_points, 3) 安全点位置（OBJ 坐标系）
     """
     from pytorch3d.ops import knn_points
 
@@ -315,7 +397,7 @@ def sample_safe_points(
     if obstacle_pcd.dim() == 2:
         obstacle_pcd = obstacle_pcd.unsqueeze(0)  # (1, N, 3)
 
-    z_lo, z_hi = z_range
+    height_lo, height_hi = z_range
     accepted = []  # 收集已接受的点
 
     for attempt in range(max_attempts):
@@ -326,9 +408,10 @@ def sample_safe_points(
 
         n_candidates = max(n_needed * 4, 64)  # 多生成 4 倍候选
         candidates = torch.zeros(n_candidates, 3, device=device)
+        # OBJ X/Z = 水平面, OBJ Y = 高度
         candidates[:, 0] = (torch.rand(n_candidates, device=device) - 0.5) * 2 * arena_range
-        candidates[:, 1] = (torch.rand(n_candidates, device=device) - 0.5) * 2 * arena_range
-        candidates[:, 2] = torch.rand(n_candidates, device=device) * (z_hi - z_lo) + z_lo
+        candidates[:, 1] = torch.rand(n_candidates, device=device) * (height_hi - height_lo) + height_lo
+        candidates[:, 2] = (torch.rand(n_candidates, device=device) - 0.5) * 2 * arena_range
 
         # KNN 查询最近障碍物距离
         candidates_expanded = candidates.unsqueeze(0)  # (1, n_candidates, 3)
@@ -354,12 +437,12 @@ def sample_safe_points(
             accepted.append(safe_points[:n_take])
 
     if len(accepted) == 0:
-        # 极端退化：完全找不到安全点，返回高空随机点 (Z=z_hi)
+        # 极端退化：完全找不到安全点，返回高空随机点 (OBJ Y=height_hi)
         print("[WARNING] sample_safe_points: 无法找到安全点，使用高空后备位置")
         fallback = torch.zeros(num_points, 3, device=device)
         fallback[:, 0] = (torch.rand(num_points, device=device) - 0.5) * 2 * arena_range
-        fallback[:, 1] = (torch.rand(num_points, device=device) - 0.5) * 2 * arena_range
-        fallback[:, 2] = z_hi
+        fallback[:, 1] = height_hi  # OBJ Y = 高度
+        fallback[:, 2] = (torch.rand(num_points, device=device) - 0.5) * 2 * arena_range
         return fallback
 
     result = torch.cat(accepted, dim=0)[:num_points]
@@ -385,17 +468,23 @@ def sample_safe_targets(
     device=None,
 ):
     """
-    为每个出生点采样碰撞安全的目标点。
+    为每个出生点采样碰撞安全的目标点（OBJ 坐标系，Y-up）。
 
     在出生点周围的环形区域内采样，确保：
     1) 目标点不在障碍物内部（距离 > min_clearance）
     2) 目标点与出生点的距离在 [min_distance, max_distance] 范围内
 
+    坐标系约定 (OBJ, Y-up):
+      - index 0 (X): 水平
+      - index 1 (Y): 高度（上方向），范围 z_range
+      - index 2 (Z): 水平
+      水平偏移在 XZ 平面，高度偏移在 Y 轴。
+
     Args:
-        obstacle_pcd: (1, N, 3) 障碍物点云
-        spawn_points: (B, 3) 出生点位置
-        arena_range: X/Y 场景范围
-        z_range: 目标点 Z 范围
+        obstacle_pcd: (1, N, 3) 障碍物点云（OBJ 坐标系）
+        spawn_points: (B, 3) 出生点位置（OBJ 坐标系）
+        arena_range: 水平场景范围（OBJ X/Z）
+        z_range: 目标点高度范围，映射到 OBJ Y
         min_clearance: 到障碍物最小安全距离
         min_distance: 到出生点最小距离
         max_distance: 到出生点最大距离
@@ -403,7 +492,7 @@ def sample_safe_targets(
         device: 计算设备
 
     Returns:
-        targets: (B, 3) 安全目标点
+        targets: (B, 3) 安全目标点（OBJ 坐标系）
     """
     from pytorch3d.ops import knn_points
 
@@ -414,7 +503,7 @@ def sample_safe_targets(
         obstacle_pcd = obstacle_pcd.unsqueeze(0)
 
     B = spawn_points.shape[0]
-    z_lo, z_hi = z_range
+    height_lo, height_hi = z_range
     found = torch.zeros(B, dtype=torch.bool, device=device)
     targets = torch.zeros(B, 3, device=device)
 
@@ -427,19 +516,19 @@ def sample_safe_targets(
         remaining_spawn = spawn_points[remaining_mask]  # (R, 3)
         R = remaining_spawn.shape[0]
 
-        # 随机角度 + 距离偏移
+        # 随机角度 + 距离偏移（在 OBJ XZ 水平面内）
         angle = torch.rand(R, device=device) * 2 * math.pi
         dist = torch.rand(R, device=device) * (max_distance - min_distance) + min_distance
 
         candidates = remaining_spawn.clone()
-        candidates[:, 0] = candidates[:, 0] + torch.cos(angle) * dist
-        candidates[:, 1] = candidates[:, 1] + torch.sin(angle) * dist
-        candidates[:, 2] = candidates[:, 2] + torch.randn(R, device=device) * 2.0
-        candidates[:, 2] = candidates[:, 2].clamp(z_lo, z_hi)
+        candidates[:, 0] = candidates[:, 0] + torch.cos(angle) * dist   # OBJ X (水平)
+        candidates[:, 2] = candidates[:, 2] + torch.sin(angle) * dist   # OBJ Z (水平)
+        candidates[:, 1] = candidates[:, 1] + torch.randn(R, device=device) * 2.0  # OBJ Y (高度偏移)
+        candidates[:, 1] = candidates[:, 1].clamp(height_lo, height_hi)
 
-        # 限制在场景范围内
+        # 限制在场景水平范围内（OBJ X/Z）
         candidates[:, 0] = candidates[:, 0].clamp(-arena_range, arena_range)
-        candidates[:, 1] = candidates[:, 1].clamp(-arena_range, arena_range)
+        candidates[:, 2] = candidates[:, 2].clamp(-arena_range, arena_range)
 
         # 检查安全距离
         candidates_expanded = candidates.unsqueeze(0)  # (1, R, 3)
@@ -471,6 +560,6 @@ def sample_safe_targets(
         missing_idx = torch.where(~found)[0]
         for idx in missing_idx:
             targets[idx] = spawn_points[idx].clone()
-            targets[idx, 2] = z_hi  # 移到高空
+            targets[idx, 1] = height_hi  # OBJ Y = 高空
 
     return targets
