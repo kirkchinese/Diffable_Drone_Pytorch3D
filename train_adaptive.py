@@ -23,6 +23,7 @@ from drone_env import DroneSimulator
 from model import Model, Model_bigger,Model_adaptive
 from loss import DroneLoss
 from scene_generator import SceneGenerator
+from training_monitor import TrainingMonitor
 
 
 def parse_args():
@@ -213,6 +214,15 @@ class DroneTrainer:
         log_path = os.path.join(args.log_dir, f'drone_train_{timestamp}')
         self.writer = SummaryWriter(log_path)
         print(f"TensorBoard logs: {log_path}")
+        
+        # 训练监控器（CSV 日志 + 损失曲线 PNG + 控制台摘要），输出到检查点目录
+        self.monitor = TrainingMonitor(
+            log_dir=args.save_dir,
+            smoothing_window=50,
+            csv_flush_interval=25,
+            curve_save_interval=500,
+            console_summary_interval=100,
+        )
         
         # 确保保存目录存在
         os.makedirs(args.save_dir, exist_ok=True)
@@ -487,7 +497,7 @@ class DroneTrainer:
         """主训练循环"""
         args = self.args
         
-        pbar = tqdm(range(args.num_iters), ncols=100)
+        pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
         
         for i in pbar:
             # 运行一个 episode
@@ -498,16 +508,19 @@ class DroneTrainer:
                 print("Loss is NaN, exiting...")
                 break
             
-            # 更新进度条
-            pbar.set_description(f'loss: {loss:.3f}')
-            
             # 反向传播
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
             self.scheduler.step()
             
-            # 记录指标
+            # 记录当前学习率到 metrics
+            metrics['lr'] = self.scheduler.get_last_lr()[0]
+            
+            # 训练监控：CSV + 曲线 + 控制台摘要 + tqdm
+            self.monitor.step(i, loss, metrics, pbar=pbar)
+            
+            # TensorBoard 记录
             self._smooth_dict({
                 'loss': loss,
                 **{k: v for k, v in metrics.items() if isinstance(v, (int, float, torch.Tensor))}
@@ -532,6 +545,7 @@ class DroneTrainer:
         torch.save(self.model.state_dict(), final_path)
         print(f"Training complete. Final model saved to {final_path}")
         
+        self.monitor.close()
         self.writer.close()
     
     def _log_figures(self, iteration, debug_data):
