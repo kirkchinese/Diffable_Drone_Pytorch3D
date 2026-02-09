@@ -133,12 +133,17 @@ class DroneRenderer:
         self.mesh = self._load_mesh(mesh_path, subdivide_times=subdivide_times)
         
         # 配置光栅化设置
+        # bin_size=0 → naive 光栅化：跳过 coarse binning 阶段，
+        # 对小分辨率 (48x64) 速度相当且不会 bin 溢出。
+        # 场景障碍物多时（20-40 个，数万面片），默认 binning 容量不够会报
+        # "Bin size was too small in the coarse rasterization phase" 错误。
         self.raster_settings = RasterizationSettings(
             image_size=self.image_size, 
             blur_radius=0.0, 
             faces_per_pixel=1, 
             perspective_correct=True,
-            z_clip_value=z_clip_value  # 近平面裁剪: 解决跨越 z=0 的三角形投影异常
+            z_clip_value=z_clip_value,  # 近平面裁剪: 解决跨越 z=0 的三角形投影异常
+            bin_size=0,  # naive 光栅化，避免 bin 溢出
         )
         
         # 初始化光照

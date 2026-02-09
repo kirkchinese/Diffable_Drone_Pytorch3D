@@ -8,13 +8,13 @@ from pytorch3d.ops import knn_points, sample_points_from_meshes
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
-    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets
+    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets, obj_to_ros, ros_to_obj
 except ImportError:
     # 简单的 Fallback，防止直接运行此文件时找不到模块
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
-    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets
+    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets, obj_to_ros, ros_to_obj
 
 class DroneSimulator:
     def __init__(self, 
@@ -178,9 +178,11 @@ class DroneSimulator:
         """
         碰撞安全的环境重置：先重置动力学状态，然后用拒绝采样确保出生点不在障碍物内部。
         
+        注意：z_range 语义为"高度范围"，内部通过 OBJ↔ROS 坐标转换正确映射。
+        
         Args:
-            arena_range (float, optional): 出生点 X/Y 范围，默认使用 self.init_p_range
-            z_range (tuple): 出生点 Z 范围
+            arena_range (float, optional): 出生点水平范围，默认使用 self.init_p_range
+            z_range (tuple): 出生点高度范围 (min, max)
             
         Returns:
             state (Tensor): 重置后的状态
@@ -191,8 +193,8 @@ class DroneSimulator:
         if arena_range is None:
             arena_range = self.init_p_range
         
-        # 用拒绝采样获取安全出生点
-        safe_p = sample_safe_points(
+        # 在 OBJ 坐标系中采样安全出生点（obstacle_pcd 在 OBJ 空间）
+        safe_p_obj = sample_safe_points(
             obstacle_pcd=self.renderer.obstacle_pcd,
             num_points=self.B,
             arena_range=arena_range,
@@ -201,8 +203,8 @@ class DroneSimulator:
             device=self.device,
         )
         
-        # 覆盖位置
-        self.p = safe_p
+        # 从 OBJ 坐标系转换到 ROS 坐标系
+        self.p = obj_to_ros(safe_p_obj)
         
         return self._get_state()
 
@@ -212,21 +214,26 @@ class DroneSimulator:
         """
         为当前出生点采样碰撞安全的目标点。
         
+        注意：z_range 语义为"高度范围"，内部通过 OBJ↔ROS 坐标转换正确映射。
+        
         Args:
-            arena_range: X/Y 范围
-            z_range: Z 范围
+            arena_range: 水平范围
+            z_range: 高度范围
             min_distance: 到出生点最小距离
             max_distance: 到出生点最大距离
             
         Returns:
-            targets (Tensor): (B, 3) 安全目标点
+            targets (Tensor): (B, 3) 安全目标点（ROS 坐标系）
         """
         if arena_range is None:
             arena_range = self.init_p_range
-            
-        return sample_safe_targets(
+        
+        # 将出生点从 ROS 转换到 OBJ 坐标系（与 obstacle_pcd 一致）
+        spawn_obj = ros_to_obj(self.p)
+        
+        targets_obj = sample_safe_targets(
             obstacle_pcd=self.renderer.obstacle_pcd,
-            spawn_points=self.p,
+            spawn_points=spawn_obj,
             arena_range=arena_range,
             z_range=z_range,
             min_clearance=self.safe_spawn_clearance,
@@ -234,6 +241,9 @@ class DroneSimulator:
             max_distance=max_distance,
             device=self.device,
         )
+        
+        # 从 OBJ 转换回 ROS
+        return obj_to_ros(targets_obj)
 
     def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None):
         """
@@ -347,15 +357,20 @@ class DroneSimulator:
         共享的 KNN 查询，返回到最近障碍物的距离和向量。
         避免 calc_min_distance 和 vec_to_obj 各自独立调用 knn_points。
 
+        注意: obstacle_pcd 在 OBJ 坐标系中，无人机位置在 ROS 坐标系中，
+              需要先将无人机位置转换到 OBJ 坐标系，查询后再将向量转回 ROS。
+
         Args:
-            p (Tensor, optional): 无人机位置 (B, 3)。如果为 None，使用当前状态 self.p。
+            p (Tensor, optional): 无人机位置 (B, 3)，ROS 坐标系。如果为 None，使用当前状态 self.p。
 
         Returns:
-            dists (B,): 到最近障碍物的欧氏距离
-            vecs (B, 3): 从无人机到最近障碍物点的向量
+            dists (B,): 到最近障碍物的欧氏距离（标量距离在两个坐标系中相同）
+            vecs (B, 3): 从无人机到最近障碍物点的向量（ROS 坐标系）
         """
-        pos = p if p is not None else self.p
-        p1 = pos.unsqueeze(1)
+        pos_ros = p if p is not None else self.p
+        # 将无人机位置从 ROS 转换到 OBJ 坐标系
+        pos_obj = ros_to_obj(pos_ros)
+        p1 = pos_obj.unsqueeze(1)
         B_size = p1.shape[0]
 
         obstacle_pcd = self.renderer.obstacle_pcd
@@ -369,10 +384,14 @@ class DroneSimulator:
         sq_dists = result.dists.squeeze(-1).squeeze(-1)  # (B,)
         dists = torch.sqrt(sq_dists + 1e-6)
 
-        nearest_points = result.knn.squeeze(1).squeeze(1)  # (B, 3)
-        vecs = nearest_points - pos
+        nearest_points_obj = result.knn.squeeze(1).squeeze(1)  # (B, 3)
+        vecs_obj = nearest_points_obj - pos_obj
 
-        return dists, vecs
+        # 将向量从 OBJ 转换回 ROS 坐标系
+        # 注意: 对于方向向量，只需要轴变换不需要位移，obj_to_ros 作为线性变换适用
+        vecs_ros = obj_to_ros(vecs_obj)
+
+        return dists, vecs_ros
 
     def calc_min_distance(self, p=None):
         """
