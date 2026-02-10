@@ -116,18 +116,54 @@ def _center_mesh(mesh):
     return mesh.update_padded(new_verts.unsqueeze(0))
 
 
-def _transform_mesh(mesh, scale, rotation_y, translation):
+def _random_rotation_matrix(device, max_tilt=math.pi / 4):
     """
-    对网格施加缩放、Y轴旋转和平移变换。
+    生成随机旋转矩阵：完整 yaw 旋转 + 受限 pitch/roll。
+
+    用于给障碍物添加多轴旋转，使场景更自然、更具挑战性。
+    Yaw 在 [0, 2π) 范围完全随机，Pitch/Roll 在 [-max_tilt, max_tilt] 范围。
+
+    Args:
+        device: 计算设备
+        max_tilt: pitch/roll 最大倾斜角（弧度），默认 π/4（45°）
+
+    Returns:
+        (3, 3) 旋转矩阵 (float32)
+    """
+    yaw = random.uniform(0, 2 * math.pi)
+    pitch = random.uniform(-max_tilt, max_tilt)
+    roll = random.uniform(-max_tilt, max_tilt)
+
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+
+    # OBJ 坐标系: Y-up，Yaw 绕 Y 轴, Pitch 绕 X 轴, Roll 绕 Z 轴
+    Ry = torch.tensor([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]],
+                       device=device, dtype=torch.float32)
+    Rx = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]],
+                       device=device, dtype=torch.float32)
+    Rz = torch.tensor([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]],
+                       device=device, dtype=torch.float32)
+    return Ry @ Rx @ Rz
+
+
+def _transform_mesh(mesh, scale, rotation_y=0.0, translation=None, rotation_matrix=None):
+    """
+    对网格施加缩放、旋转和平移变换。
+
+    支持两种旋转方式：
+      1. rotation_matrix (3×3 tensor): 完整旋转矩阵（优先使用）
+      2. rotation_y (float): 仅绕 OBJ Y 轴旋转（兼容旧代码）
 
     注意：本函数在 OBJ 坐标系中工作（Y 轴朝上）。
-    旋转绕 OBJ Y 轴（即世界上方向），对应 ROS 坐标系中的 yaw 旋转。
 
     Args:
         mesh: Meshes 对象（单个网格）
         scale: (3,) tensor 或 float，XYZ 缩放因子
-        rotation_y: float，绕 OBJ Y 轴旋转角度（弧度）
-        translation: (3,) tensor，OBJ 坐标系中的平移向量 (X=水平, Y=高度, Z=水平)
+        rotation_y: float，绕 OBJ Y 轴旋转角度（弧度），当 rotation_matrix=None 时使用
+        translation: (3,) tensor，OBJ 坐标系中的平移向量
+        rotation_matrix: (3,3) tensor，完整旋转矩阵，优先于 rotation_y
 
     Returns:
         Meshes: 变换后的新网格
@@ -140,18 +176,22 @@ def _transform_mesh(mesh, scale, rotation_y, translation):
         scale = torch.tensor([scale, scale, scale], device=device)
     verts = verts * scale
 
-    # 绕 OBJ Y 轴旋转（Y 是上方向，在 XZ 平面旋转）
-    cos_a = math.cos(rotation_y)
-    sin_a = math.sin(rotation_y)
-    R = torch.tensor([
-        [ cos_a, 0, sin_a],
-        [ 0,     1, 0    ],
-        [-sin_a, 0, cos_a]
-    ], device=device, dtype=torch.float32)
-    verts = verts @ R.T
+    # 旋转
+    if rotation_matrix is not None:
+        verts = verts @ rotation_matrix.T
+    else:
+        cos_a = math.cos(rotation_y)
+        sin_a = math.sin(rotation_y)
+        R = torch.tensor([
+            [ cos_a, 0, sin_a],
+            [ 0,     1, 0    ],
+            [-sin_a, 0, cos_a]
+        ], device=device, dtype=torch.float32)
+        verts = verts @ R.T
 
     # 平移
-    verts = verts + translation
+    if translation is not None:
+        verts = verts + translation
 
     # 重建网格（保留纹理和面片）
     new_mesh = mesh.update_padded(verts.unsqueeze(0))
@@ -192,15 +232,20 @@ class SceneGenerator:
                  arena_range=6.0,
                  obstacle_z_range=(0.0, 5.0),
                  num_obstacles_range=(20, 40),
-                 obstacle_scale_range=(0.3, 2.0),
+                 obstacle_scale_range=(0.3, 1.5),
                  floor_scale=(1.0, 1.0, 1.0),
                  include_floor=True,
-                 concentration=0.6,
+                 concentration=0.0,
+                 grid_jitter=True,
+                 enable_3d_rotation=True,
+                 max_tilt=math.pi / 4,
+                 ground_clearance=0.05,
+                 normalize_primitives=True,
                  seed=None):
         """
         Args:
             device: 计算设备
-            primitive_dir: 原语文件目录
+            primitive_dir: 文件目录
             arena_range: 场景水平范围 [-arena_range, arena_range]（OBJ X/Z 平面）
             obstacle_z_range: 障碍物高度范围 (min, max)。
                               语义为"高度"，内部映射到 OBJ Y 轴。
@@ -209,9 +254,17 @@ class SceneGenerator:
             obstacle_scale_range: 障碍物缩放范围
             floor_scale: 地板缩放因子 (x, y, z)
             include_floor: 是否包含地板
-            concentration: 障碍物向中心集中的比例 (0=均匀, 1=全部集中在中心)。
-                           该比例的障碍物使用截断正态分布放置 (sigma=arena_range/3)，
-                           其余障碍物均匀分布。默认 0.6，保证无人机飞行区域密度合理。
+            concentration: 障碍物向中心集中的比例 (0=均匀, 1=全部集中)。
+                           仅在 grid_jitter=False 时生效。默认 0.0（纯均匀分布）。
+            grid_jitter: 使用网格抖动分布（推荐）。将场景分为网格，每格放置0或1个
+                         障碍物，确保全场均匀覆盖（包括边缘区域）。默认 True。
+            enable_3d_rotation: 启用三轴旋转（yaw + 受限 pitch/roll），默认 True。
+                                False 则仅绕 Y 轴旋转（兼容旧行为）。
+            max_tilt: 三轴旋转时 pitch/roll 最大倾斜角（弧度），默认 π/4。
+            ground_clearance: 障碍物底部距地面最小间距（OBJ Y），默认 0.05m。
+            normalize_primitives: 将所有原语归一化到单位包围盒 (max extent = 1.0)，
+                                  确保不同形状的缩放行为一致。默认 True。
+                                  归一化后 scale=1.0 表示最大维度为 1m。
             seed: 随机种子（仅用于 Python random 模块）
         """
         self.device = device
@@ -222,6 +275,11 @@ class SceneGenerator:
         self.floor_scale = floor_scale
         self.include_floor = include_floor
         self.concentration = concentration
+        self.grid_jitter = grid_jitter
+        self.enable_3d_rotation = enable_3d_rotation
+        self.max_tilt = max_tilt
+        self.ground_clearance = ground_clearance
+        self.normalize_primitives = normalize_primitives
 
         if seed is not None:
             random.seed(seed)
@@ -234,6 +292,15 @@ class SceneGenerator:
             centered = _center_mesh(
                 _load_primitive_mesh(name, device=device, primitive_dir=primitive_dir)
             )
+
+            # 可选：归一化到单位包围盒（max extent = 1.0）
+            if normalize_primitives:
+                verts = centered.verts_packed()
+                max_extent = (verts.max(0).values - verts.min(0).values).max().item()
+                if max_extent > 1e-6:
+                    normalized_verts = verts / max_extent
+                    centered = centered.update_padded(normalized_verts.unsqueeze(0))
+
             self.primitive_meshes[name] = centered
             # 预计算 Y 方向半高度（居中后 Y_max ≈ -Y_min ≈ half_height）
             verts_y = centered.verts_packed()[:, 1]
@@ -246,10 +313,85 @@ class SceneGenerator:
 
         self.obstacle_names = obstacle_names
 
+    def _grid_jitter_positions(self, num_obstacles):
+        """
+        网格抖动位置生成：将场景划分为均匀网格，随机选取网格并在格内抖动。
+
+        确保障碍物均匀覆盖整个场景（包括边缘区域），避免中心聚集。
+
+        Args:
+            num_obstacles: 需要的障碍物数量
+
+        Returns:
+            list of (x, z) 位置元组（OBJ 坐标系水平面）
+        """
+        arena = self.arena_range
+        # 网格边数：略多于 sqrt(num_obstacles)，保证有足够的格子
+        grid_side = max(math.ceil(math.sqrt(num_obstacles * 1.2)), 3)
+        cell_size = 2.0 * arena / grid_side
+
+        # 生成所有网格中心
+        cells = []
+        for i in range(grid_side):
+            for j in range(grid_side):
+                cx = -arena + (i + 0.5) * cell_size
+                cz = -arena + (j + 0.5) * cell_size
+                cells.append((cx, cz))
+
+        # 随机选取 num_obstacles 个格子
+        random.shuffle(cells)
+        selected = cells[:num_obstacles]
+
+        # 在格内添加抖动（±40% cell_size）
+        positions = []
+        for cx, cz in selected:
+            jx = random.uniform(-0.4, 0.4) * cell_size
+            jz = random.uniform(-0.4, 0.4) * cell_size
+            px = max(-arena + 0.05, min(arena - 0.05, cx + jx))
+            pz = max(-arena + 0.05, min(arena - 0.05, cz + jz))
+            positions.append((px, pz))
+
+        # 如果需要的障碍物多于网格数，额外随机填充
+        while len(positions) < num_obstacles:
+            px = random.uniform(-arena, arena)
+            pz = random.uniform(-arena, arena)
+            positions.append((px, pz))
+
+        return positions
+
+    def _random_positions(self, num_obstacles):
+        """
+        随机位置生成（旧模式兼容）：支持可选的中心集中分布。
+
+        Args:
+            num_obstacles: 障碍物数量
+
+        Returns:
+            list of (x, z) 位置元组
+        """
+        arena = self.arena_range
+        sigma = arena / 3.0
+        positions = []
+        for _ in range(num_obstacles):
+            if random.random() < self.concentration:
+                tx = max(-arena, min(arena, random.gauss(0, sigma)))
+                tz = max(-arena, min(arena, random.gauss(0, sigma)))
+            else:
+                tx = random.uniform(-arena, arena)
+                tz = random.uniform(-arena, arena)
+            positions.append((tx, tz))
+        return positions
+
     @torch.no_grad()
     def generate(self, num_obstacles=None):
         """
         生成一个随机场景。
+
+        改进点（相比旧版本）：
+        - 网格抖动分布：障碍物均匀覆盖整个场景（包括边缘），无死角
+        - 三轴旋转：障碍物具有随机 pitch/roll，更自然且增加挑战
+        - 归一化：不同形状缩放行为一致，避免圆环等过大
+        - 动态高度计算：旋转后实际 Y 范围精确计算，杜绝地下放置
 
         Returns:
             scene_mesh (Meshes): 合并后的场景网格（所有障碍物 + 地板）
@@ -276,63 +418,64 @@ class SceneGenerator:
             lo, hi = self.num_obstacles_range
             num_obstacles = random.randint(lo, hi)
 
-        # 决定每个障碍物的放置策略
-        # concentration 比例的障碍物用截断正态分布（集中在中心），其余均匀分布
-        sigma = self.arena_range / 3.0  # 正态分布标准差
+        # 生成水平位置
+        if self.grid_jitter:
+            positions = self._grid_jitter_positions(num_obstacles)
+        else:
+            positions = self._random_positions(num_obstacles)
 
-        for i in range(num_obstacles):
+        height_lo, height_hi = self.obstacle_z_range
+
+        for i, (px, pz) in enumerate(positions):
             # 随机选择原语类型
             name = random.choice(self.obstacle_names)
             base_mesh = self.primitive_meshes[name]
+            base_verts = base_mesh.verts_packed()  # (V, 3), 已居中 (归一化后)
 
-            # 随机缩放 (XYZ 独立，但不会差太多)
+            # 随机缩放 (XYZ 独立，基础值 ±30% 扰动)
             s_lo, s_hi = self.obstacle_scale_range
             base_scale = random.uniform(s_lo, s_hi)
-            # 各轴在 base_scale 基础上加一点扰动 (±30%)
             sx = base_scale * random.uniform(0.7, 1.3)
             sy = base_scale * random.uniform(0.7, 1.3)
             sz = base_scale * random.uniform(0.7, 1.3)
             scale = torch.tensor([sx, sy, sz], device=self.device)
 
-            # 随机旋转 (绕 OBJ Y 轴，即上方向)
-            rot_y = random.uniform(0, 2 * math.pi)
+            # 缩放
+            verts = base_verts * scale
 
-            # --- 坐标系: OBJ Y-up ---
-            # OBJ X/Z = 水平面, OBJ Y = 高度
-            # obstacle_z_range 语义为"高度范围"，映射到 OBJ Y
-            height_lo, height_hi = self.obstacle_z_range
-
-            # 水平位置 (OBJ X 和 OBJ Z)
-            # 使用混合分布：concentration 比例用截断正态 (集中在中心)，
-            # 其余均匀分布 (保证边缘也有障碍物)
-            use_concentrated = random.random() < self.concentration
-            if use_concentrated:
-                # 截断正态分布：采样后 clamp 到 arena 范围
-                tx = max(-self.arena_range, min(self.arena_range, random.gauss(0, sigma)))
-                tz = max(-self.arena_range, min(self.arena_range, random.gauss(0, sigma)))
+            # 旋转
+            if self.enable_3d_rotation:
+                R = _random_rotation_matrix(self.device, self.max_tilt)
+                verts = verts @ R.T
             else:
-                tx = random.uniform(-self.arena_range, self.arena_range)
-                tz = random.uniform(-self.arena_range, self.arena_range)
+                rot_y = random.uniform(0, 2 * math.pi)
+                cos_a = math.cos(rot_y)
+                sin_a = math.sin(rot_y)
+                Ry = torch.tensor([
+                    [ cos_a, 0, sin_a],
+                    [ 0,     1, 0    ],
+                    [-sin_a, 0, cos_a]
+                ], device=self.device, dtype=torch.float32)
+                verts = verts @ Ry.T
 
-            # 高度位置 (OBJ Y): 确保障碍物底部不低于地板 (Y >= 0)
-            # 绕 Y 轴旋转不改变 Y 方向范围，所以 half_height = 原始半高 * sy
-            half_height = self.primitive_half_heights[name] * sy
-            min_ty = max(half_height, height_lo)  # 底部至少在 Y=0
-            if min_ty < height_hi:
-                ty = random.uniform(min_ty, height_hi)
-            else:
-                ty = min_ty  # 退化：缩放太大，至少保证底部齐地板
+            # 动态计算旋转后实际 Y 范围（精确防止地下放置）
+            y_min_local = verts[:, 1].min().item()
+            # 确保底部 >= ground_clearance：ty + y_min_local >= ground_clearance
+            min_ty = self.ground_clearance - y_min_local  # y_min_local 通常为负
+            min_ty = max(min_ty, height_lo)
+            ty = random.uniform(min_ty, height_hi) if min_ty < height_hi else min_ty
 
-            translation = torch.tensor([tx, ty, tz], device=self.device)
+            # 平移
+            translation = torch.tensor([px, ty, pz], device=self.device)
+            verts = verts + translation
 
-            transformed = _transform_mesh(base_mesh, scale, rot_y, translation)
+            # 创建变换后的网格
+            transformed = base_mesh.update_padded(verts.unsqueeze(0))
             meshes_to_join.append(transformed)
 
             # 记录障碍物信息（用于碰撞检测参考）
-            # 计算变换后的包围盒半范围
-            t_verts = transformed.verts_packed()
-            half_ext = (t_verts.max(0).values - t_verts.min(0).values) / 2.0
-            center = (t_verts.max(0).values + t_verts.min(0).values) / 2.0
+            half_ext = (verts.max(0).values - verts.min(0).values) / 2.0
+            center = (verts.max(0).values + verts.min(0).values) / 2.0
             obstacle_info.append({
                 "name": name,
                 "center": center,
@@ -347,6 +490,153 @@ class SceneGenerator:
         scene_mesh = join_meshes_as_scene(meshes_to_join)
 
         return scene_mesh, obstacle_info
+
+
+# ============================================================
+# 跨地图出生/目标点采样
+# ============================================================
+
+@torch.no_grad()
+def sample_cross_map_spawn_target(
+    obstacle_pcd,
+    num_points,
+    arena_range=6.0,
+    z_range=(1.0, 3.0),
+    min_clearance=1.0,
+    max_attempts=50,
+    device=None,
+):
+    """
+    采样跨地图的出生/目标点对（OBJ 坐标系，Y-up）。
+
+    策略：
+    - 为每个 batch 元素随机选取一个"穿越方向"角度 θ
+    - 出生点在 θ 方向的"负侧"（靠近一个边缘）
+    - 目标点在 θ 方向的"正侧"（靠近对面边缘）
+    - 确保无人机必须穿越场景中央区域，不能绕行边缘
+    - 两点均通过碰撞检测保证安全
+
+    Args:
+        obstacle_pcd: (1, N, 3) 或 (N, 3) 障碍物点云（OBJ 坐标系）
+        num_points: 需要的点对数（= batch_size）
+        arena_range: 水平场景范围
+        z_range: 高度范围 (min, max)，映射到 OBJ Y
+        min_clearance: 到障碍物最小安全距离
+        max_attempts: 最大采样轮数
+        device: 计算设备
+
+    Returns:
+        spawn_points: (num_points, 3) 出生点（OBJ 坐标系）
+        target_points: (num_points, 3) 目标点（OBJ 坐标系）
+    """
+    from pytorch3d.ops import knn_points
+
+    if device is None:
+        device = obstacle_pcd.device
+    if obstacle_pcd.dim() == 2:
+        obstacle_pcd = obstacle_pcd.unsqueeze(0)
+
+    height_lo, height_hi = z_range
+
+    # 每个 batch 元素的穿越方向
+    theta = torch.rand(num_points, device=device) * 2 * math.pi
+    cos_t = torch.cos(theta)
+    sin_t = torch.sin(theta)
+
+    spawn = torch.zeros(num_points, 3, device=device)
+    target = torch.zeros(num_points, 3, device=device)
+    spawn_found = torch.zeros(num_points, dtype=torch.bool, device=device)
+    target_found = torch.zeros(num_points, dtype=torch.bool, device=device)
+
+    R = arena_range
+
+    for attempt in range(max_attempts):
+        # 逐步放宽安全距离
+        progress = attempt / max(max_attempts - 1, 1)
+        if progress < 0.7:
+            current_clearance = min_clearance
+        else:
+            t = (progress - 0.7) / 0.3
+            current_clearance = min_clearance * (1.0 - 0.7 * t)
+
+        # ---- 出生点：在穿越方向的"负侧" ----
+        if not spawn_found.all():
+            idx = torch.where(~spawn_found)[0]
+            n = idx.shape[0]
+            n_cand = max(n * 4, 32)
+
+            # 沿穿越方向：[-0.9R, -0.2R]（靠近一个边缘）
+            along = -(torch.rand(n_cand, device=device) * 0.7 + 0.2) * R
+            # 垂直方向：[-0.8R, 0.8R]
+            perp = (torch.rand(n_cand, device=device) - 0.5) * 1.6 * R
+            # 候选点从 idx 中循环取穿越方向
+            idx_rep = idx.repeat((n_cand + n - 1) // n)[:n_cand]
+            cx = along * cos_t[idx_rep] - perp * sin_t[idx_rep]
+            cz = along * sin_t[idx_rep] + perp * cos_t[idx_rep]
+            cy = torch.rand(n_cand, device=device) * (height_hi - height_lo) + height_lo
+            cx = cx.clamp(-R * 0.95, R * 0.95)
+            cz = cz.clamp(-R * 0.95, R * 0.95)
+            candidates = torch.stack([cx, cy, cz], dim=-1)
+
+            dists = knn_points(candidates.unsqueeze(0), obstacle_pcd, K=1).dists.squeeze(0).squeeze(-1).sqrt()
+            safe = dists > current_clearance
+
+            # 分配到对应的 batch 元素
+            for k, global_idx in enumerate(idx):
+                # 取该 batch 元素对应的候选点
+                mask_k = (idx_rep == global_idx) & safe
+                safe_cands = candidates[mask_k]
+                if safe_cands.shape[0] > 0 and not spawn_found[global_idx]:
+                    spawn[global_idx] = safe_cands[0]
+                    spawn_found[global_idx] = True
+
+        # ---- 目标点：在穿越方向的"正侧" ----
+        if not target_found.all():
+            idx = torch.where(~target_found)[0]
+            n = idx.shape[0]
+            n_cand = max(n * 4, 32)
+
+            along = (torch.rand(n_cand, device=device) * 0.7 + 0.2) * R
+            perp = (torch.rand(n_cand, device=device) - 0.5) * 1.6 * R
+            idx_rep = idx.repeat((n_cand + n - 1) // n)[:n_cand]
+            cx = along * cos_t[idx_rep] - perp * sin_t[idx_rep]
+            cz = along * sin_t[idx_rep] + perp * cos_t[idx_rep]
+            cy = torch.rand(n_cand, device=device) * (height_hi - height_lo) + height_lo
+            cx = cx.clamp(-R * 0.95, R * 0.95)
+            cz = cz.clamp(-R * 0.95, R * 0.95)
+            candidates = torch.stack([cx, cy, cz], dim=-1)
+
+            dists = knn_points(candidates.unsqueeze(0), obstacle_pcd, K=1).dists.squeeze(0).squeeze(-1).sqrt()
+            safe = dists > current_clearance
+
+            for k, global_idx in enumerate(idx):
+                mask_k = (idx_rep == global_idx) & safe
+                safe_cands = candidates[mask_k]
+                if safe_cands.shape[0] > 0 and not target_found[global_idx]:
+                    target[global_idx] = safe_cands[0]
+                    target_found[global_idx] = True
+
+        if spawn_found.all() and target_found.all():
+            break
+
+    # 后备：未找到的点使用默认位置
+    if not spawn_found.all():
+        missing = ~spawn_found
+        n_miss = missing.sum().item()
+        print(f"[WARNING] sample_cross_map: {n_miss} spawn points using fallback")
+        spawn[missing, 0] = -R * 0.7
+        spawn[missing, 1] = height_hi
+        spawn[missing, 2] = 0.0
+
+    if not target_found.all():
+        missing = ~target_found
+        n_miss = missing.sum().item()
+        print(f"[WARNING] sample_cross_map: {n_miss} target points using fallback")
+        target[missing, 0] = R * 0.7
+        target[missing, 1] = height_hi
+        target[missing, 2] = 0.0
+
+    return spawn, target
 
 
 # ============================================================

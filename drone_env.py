@@ -8,13 +8,15 @@ from pytorch3d.ops import knn_points, sample_points_from_meshes
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
-    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets, obj_to_ros, ros_to_obj
+    from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
+                                  sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 except ImportError:
     # 简单的 Fallback，防止直接运行此文件时找不到模块
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import DroneRenderer
-    from scene_generator import SceneGenerator, sample_safe_points, sample_safe_targets, obj_to_ros, ros_to_obj
+    from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
+                                  sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 
 class DroneSimulator:
     def __init__(self, 
@@ -244,6 +246,45 @@ class DroneSimulator:
         
         # 从 OBJ 转换回 ROS
         return obj_to_ros(targets_obj)
+
+    @torch.no_grad()
+    def safe_reset_cross_map(self, arena_range=None, z_range=(1.0, 3.0)):
+        """
+        跨地图碰撞安全重置：出生点和目标点在场景的对向两侧。
+
+        确保无人机必须穿越场景中央障碍物区域，不能绕边缘飞行。
+        同时返回出生后的状态和目标位置。
+
+        注意：z_range 语义为"高度范围"，内部通过 OBJ↔ROS 坐标转换正确映射。
+
+        Args:
+            arena_range (float, optional): 水平范围，默认使用 self.init_p_range
+            z_range (tuple): 高度范围 (min, max)
+
+        Returns:
+            state (Tensor): 重置后的状态
+            targets_ros (Tensor): (B, 3) 目标点（ROS 坐标系）
+        """
+        # 先执行常规 reset（初始化所有动力学状态）
+        self.reset()
+
+        if arena_range is None:
+            arena_range = self.init_p_range
+
+        # 在 OBJ 坐标系中采样跨地图出生/目标点对
+        spawn_obj, target_obj = sample_cross_map_spawn_target(
+            obstacle_pcd=self.renderer.obstacle_pcd,
+            num_points=self.B,
+            arena_range=arena_range,
+            z_range=z_range,
+            min_clearance=self.safe_spawn_clearance,
+            device=self.device,
+        )
+
+        # 从 OBJ 转换到 ROS 坐标系
+        self.p = obj_to_ros(spawn_obj)
+
+        return self._get_state(), obj_to_ros(target_obj)
 
     def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None):
         """
