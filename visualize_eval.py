@@ -102,6 +102,10 @@ def parse_args():
                         help='障碍物点云采样数')
     parser.add_argument('--subdivide_times', type=int, default=0,
                         help='网格细分次数')
+    parser.add_argument('--depth_min', type=float, default=0.3,
+                        help='深度图近截断距离 (米)，同时也是渲染器近平面裁剪值')
+    parser.add_argument('--depth_max', type=float, default=24.0,
+                        help='深度图远截断距离 (米)')
 
     # 高分辨率渲染选项（用于可视化输出，不影响模型输入）
     parser.add_argument('--viz_height', type=int, default=480,
@@ -114,9 +118,9 @@ def parse_args():
     # 场景随机化
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成')
-    parser.add_argument('--num_obstacles_min', type=int, default=20,
+    parser.add_argument('--num_obstacles_min', type=int, default=50,
                         help='最少障碍物数')
-    parser.add_argument('--num_obstacles_max', type=int, default=40,
+    parser.add_argument('--num_obstacles_max', type=int, default=80,
                         help='最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3,
                         help='障碍物最小缩放')
@@ -215,7 +219,7 @@ class HighResRenderer:
             blur_radius=0.0,
             faces_per_pixel=1,
             perspective_correct=True,
-            z_clip_value=0.01,
+            z_clip_value=0.3,  # 与 depth_min 默认值对齐，避免 clip_faces OOM
             max_faces_per_bin=50000,
         )
         self.rasterizer = MeshRasterizer(raster_settings=self.raster_settings)
@@ -293,6 +297,7 @@ class EvalRunner:
             init_margin_range=(args.margin_min, args.margin_max),
             num_samples=args.num_samples,
             subdivide_times=args.subdivide_times,
+            z_clip_value=args.depth_min,
             enable_random_scene=args.random_scene,
             scene_generator=self.scene_generator,
             safe_spawn_clearance=args.safe_clearance,
@@ -360,22 +365,26 @@ class EvalRunner:
 
         # 安全出生点 + 目标点
         spawn_z_max = getattr(args, 'spawn_z_max', 3.0)
-        if getattr(args, 'force_cross_map', False) and self.env.enable_random_scene:
+        # 随机场景时自动启用跨地图模式（除非用户显式关闭），确保飞行路径穿越障碍区域
+        use_cross_map = (getattr(args, 'force_cross_map', False) or self.env.enable_random_scene)
+        # 采样范围必须与障碍物分布范围一致，否则安全采样会把点推到障碍物场外面
+        spawn_arena = args.arena_range if self.env.enable_random_scene else args.init_p_range
+        if use_cross_map and self.env.enable_random_scene:
             _, p_target = self.env.safe_reset_cross_map(
-                arena_range=args.arena_range,
+                arena_range=spawn_arena,
                 z_range=(1.0, spawn_z_max),
             )
         else:
             self.env.safe_reset(
-                arena_range=args.init_p_range,
+                arena_range=spawn_arena,
                 z_range=(1.0, spawn_z_max),
             )
             # 安全目标点
             p_target = self.env.sample_safe_target(
-                arena_range=args.init_p_range,
+                arena_range=spawn_arena,
                 z_range=(1.0, spawn_z_max),
                 min_distance=3.0,
-                max_distance=8.0,
+                max_distance=spawn_arena * 1.2,
             )
         target_v_raw = p_target - self.env.p
 
@@ -484,7 +493,7 @@ class EvalRunner:
 
             # 深度图预处理（与 train.py 完全一致）
             bg_mask = (depth_lo < 0)
-            x = depth_lo.clamp(0.3, 24.0)
+            x = depth_lo.clamp(args.depth_min, args.depth_max)
             x = 3.0 / x - 0.6
             x[bg_mask] = 0.0
             x = x.unsqueeze(1)  # (B, 1, H, W)

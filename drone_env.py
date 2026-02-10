@@ -54,6 +54,8 @@ class DroneSimulator:
                  act_queue_len=2,
                  # 相机参数
                  cam_offset_body=[0.1, 0.0, 0.0],
+                 # 渲染参数
+                 z_clip_value=0.3,
                  # 场景随机化参数
                  enable_random_scene=False,
                  scene_generator=None,
@@ -110,7 +112,8 @@ class DroneSimulator:
             principal_point=principal_point,
             lights_location=lights_location,
             num_samples=num_samples,
-            subdivide_times=subdivide_times
+            subdivide_times=subdivide_times,
+            z_clip_value=z_clip_value,
         )
         
         # 内部状态初始化

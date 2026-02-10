@@ -62,12 +62,16 @@ def parse_args():
     parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
     parser.add_argument('--subdivide_times', type=int, default=0,
                         help='网格细分次数 (默认0, 配合z_clip无质量损失且渲染快)')
+    parser.add_argument('--depth_min', type=float, default=0.3,
+                        help='深度图近截断距离 (米)，近于此的深度被截断。同时也是渲染器近平面裁剪值')
+    parser.add_argument('--depth_max', type=float, default=24.0,
+                        help='深度图远截断距离 (米)，远于此的深度被截断')
     
     # 场景随机化参数
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成 (每 episode 随机组合障碍物)')
-    parser.add_argument('--num_obstacles_min', type=int, default=25, help='每场景最少障碍物数')
-    parser.add_argument('--num_obstacles_max', type=int, default=50, help='每场景最多障碍物数')
+    parser.add_argument('--num_obstacles_min', type=int, default=50, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_max', type=int, default=80, help='每场景最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3, help='障碍物最小缩放')
     parser.add_argument('--obstacle_scale_max', type=float, default=1.5, help='障碍物最大缩放')
     parser.add_argument('--arena_range', type=float, default=6.0, help='场景水平范围 [-R,R]')
@@ -189,6 +193,8 @@ class DroneTrainer:
             num_samples=args.num_samples,
             # 渲染优化: subdivide_times=0 在 48x64 下无质量损失, 面片从 106 万降至 1.6 万
             subdivide_times=args.subdivide_times,
+            # 渲染近平面裁剪: 与 depth_min 对齐，避免 clip_faces OOM
+            z_clip_value=getattr(args, 'depth_min', 0.3),
             # 场景随机化
             enable_random_scene=getattr(args, 'random_scene', False),
             scene_generator=self.scene_generator,
@@ -248,6 +254,13 @@ class DroneTrainer:
         
         # 重力标准向量
         self.g_std = torch.tensor([0.0, 0.0, -9.80665], device=self.device)
+
+        # Best AR 追踪（用于保存最佳策略 checkpoint）
+        # AR = success_rate × avg_speed，综合衡量"安全且高效"的行为质量
+        self.best_ar = -1.0
+        self.best_ar_iter = -1
+        self.ar_ema = 0.0           # 指数移动平均，减少单次波动
+        self.ar_ema_alpha = 0.05    # EMA 平滑系数
         
     def _load_model(self, path):
         """加载模型"""
@@ -302,18 +315,23 @@ class DroneTrainer:
             self.env.randomize_scene()
         
         # 安全出生点采样 (如果启用)
+        # 随机场景时自动启用跨地图模式，确保飞行路径穿越障碍区域
+        use_cross_map = getattr(self.args, 'force_cross_map', False) or self.env.enable_random_scene
+        # 采样范围必须与障碍物分布范围一致
+        spawn_arena = getattr(self.args, 'arena_range', 6.0) if self.env.enable_random_scene \
+                      else getattr(self.args, 'init_p_range', 8.0)
         if self.safe_spawn:
-            if getattr(self.args, 'force_cross_map', False):
+            if use_cross_map and self.env.enable_random_scene:
                 # 跨地图模式：出生/目标在对向两侧，防止绕行
                 spawn_z_max = getattr(self.args, 'spawn_z_max', 3.0)
                 _, p_target = self.env.safe_reset_cross_map(
-                    arena_range=getattr(self.args, 'arena_range', 6.0),
+                    arena_range=spawn_arena,
                     z_range=(1.0, spawn_z_max),
                 )
                 cross_map_mode = True
             else:
                 self.env.safe_reset(
-                    arena_range=getattr(self.args, 'init_p_range', 8.0),
+                    arena_range=spawn_arena,
                     z_range=(1.0, getattr(self.args, 'spawn_z_max', 3.0)),
                 )
                 cross_map_mode = False
@@ -347,10 +365,10 @@ class DroneTrainer:
         elif self.safe_spawn:
             # 使用碰撞安全的目标点采样（低空）
             p_target = self.env.sample_safe_target(
-                arena_range=getattr(self.args, 'arena_range', 6.0),
+                arena_range=spawn_arena,
                 z_range=(1.0, spawn_z_max),
                 min_distance=3.0,
-                max_distance=8.0,
+                max_distance=spawn_arena * 1.2,
             )
         else:
             # 原始方式：基于角度/距离偏移，不检查碰撞
@@ -452,7 +470,7 @@ class DroneTrainer:
             
             # 深度图预处理
             bg_mask = (depth < 0)  # PyTorch3D 背景像素 zbuf = -1
-            x = depth.clamp(0.3, 24.0)
+            x = depth.clamp(args.depth_min, args.depth_max)
             x = 3.0 / x - 0.6  # 转换为近似线性空间
             x[bg_mask] = 0.0    # 背景设为 0（无障碍物），避免 -1 被误映射为最大近距信号
             x = x + torch.randn_like(x) * 0.02  # 添加噪声
@@ -516,19 +534,26 @@ class DroneTrainer:
         pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
         
         for i in pbar:
-            # 运行一个 episode
-            loss, metrics, debug_data = self.run_episode(i)
-            
-            # 检查 NaN
-            if torch.isnan(loss):
-                print("Loss is NaN, exiting...")
-                break
-            
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
+            try:
+                # 运行一个 episode
+                loss, metrics, debug_data = self.run_episode(i)
+                
+                # 检查 NaN
+                if torch.isnan(loss):
+                    print("Loss is NaN, exiting...")
+                    break
+                
+                # 反向传播
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+            except torch.cuda.OutOfMemoryError:
+                # 渲染 / knn / backward 等任意环节 OOM → 放弃本轮，清理后继续
+                # 仅在 OOM 时调用 empty_cache；正常流程不调，让缓存池高效复用
+                torch.cuda.empty_cache()
+                print(f"\n[OOM] iter {i}: episode OOM, skipping")
+                continue
             
             # 记录当前学习率到 metrics
             metrics['lr'] = self.scheduler.get_last_lr()[0]
@@ -551,6 +576,18 @@ class DroneTrainer:
                 torch.save(self.model.state_dict(), save_path)
                 print(f"\nSaved model to {save_path}")
             
+            # ---- Best AR checkpoint（独立保存，不覆盖常规 checkpoint）----
+            current_ar = float(metrics.get('ar', 0.0))
+            self.ar_ema = self.ar_ema_alpha * current_ar + (1 - self.ar_ema_alpha) * self.ar_ema
+            # 前 200 步预热：EMA 还不稳定，跳过
+            if i >= 200 and self.ar_ema > self.best_ar:
+                self.best_ar = self.ar_ema
+                self.best_ar_iter = i + 1
+                best_path = os.path.join(args.save_dir, 'best_ar.pth')
+                torch.save(self.model.state_dict(), best_path)
+                # 同时记录到 TensorBoard
+                self.writer.add_scalar('best_ar', self.best_ar, i + 1)
+            
             if (i + 1) % 25 == 0:
                 for k, v in self.scaler_q.items():
                     self.writer.add_scalar(k, sum(v) / len(v), i + 1)
@@ -560,6 +597,8 @@ class DroneTrainer:
         final_path = os.path.join(args.save_dir, 'checkpoint_final.pth')
         torch.save(self.model.state_dict(), final_path)
         print(f"Training complete. Final model saved to {final_path}")
+        if self.best_ar_iter > 0:
+            print(f"Best AR model: best_ar.pth (AR={self.best_ar:.4f} @ iter {self.best_ar_iter})")
         
         self.monitor.close()
         self.writer.close()
