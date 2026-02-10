@@ -61,7 +61,7 @@ except ImportError:
 
 from drone_env import DroneSimulator
 from model import Model, Model_bigger
-from scene_generator import SceneGenerator, obj_to_ros
+from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
 
 
 # ================================================================
@@ -120,12 +120,16 @@ def parse_args():
                         help='最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3,
                         help='障碍物最小缩放')
-    parser.add_argument('--obstacle_scale_max', type=float, default=2.0,
+    parser.add_argument('--obstacle_scale_max', type=float, default=1.5,
                         help='障碍物最大缩放')
     parser.add_argument('--arena_range', type=float, default=6.0,
                         help='场景 X/Y 范围')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
                         help='安全出生点到障碍物的最小距离')
+    parser.add_argument('--force_cross_map', action='store_true', default=False,
+                        help='强制出生/目标点在场景对向两侧')
+    parser.add_argument('--spawn_z_max', type=float, default=3.0,
+                        help='出生/目标点最大高度')
 
     # 无人机物理（与训练保持一致）
     parser.add_argument('--init_p_range', type=float, default=8.0,
@@ -354,19 +358,25 @@ class EvalRunner:
             # 随机场景后需要更新高分辨率渲染器的mesh缓存
             self.hires_renderer.env_renderer = self.env.renderer
 
-        # 安全出生点
-        self.env.safe_reset(
-            arena_range=args.init_p_range,
-            z_range=(1.0, 6.0),
-        )
-
-        # 安全目标点
-        p_target = self.env.sample_safe_target(
-            arena_range=args.init_p_range,
-            z_range=(1.5, 6.0),
-            min_distance=3.0,
-            max_distance=8.0,
-        )
+        # 安全出生点 + 目标点
+        spawn_z_max = getattr(args, 'spawn_z_max', 3.0)
+        if getattr(args, 'force_cross_map', False) and self.env.enable_random_scene:
+            _, p_target = self.env.safe_reset_cross_map(
+                arena_range=args.arena_range,
+                z_range=(1.0, spawn_z_max),
+            )
+        else:
+            self.env.safe_reset(
+                arena_range=args.init_p_range,
+                z_range=(1.0, spawn_z_max),
+            )
+            # 安全目标点
+            p_target = self.env.sample_safe_target(
+                arena_range=args.init_p_range,
+                z_range=(1.0, spawn_z_max),
+                min_distance=3.0,
+                max_distance=8.0,
+            )
         target_v_raw = p_target - self.env.p
 
         # 固定速度用于评估一致性

@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重')
     parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加加速度正则化权重')
     parser.add_argument('--coef_d_snap', type=float, default=0.0, help='snap正则化权重 (legacy)')
-    parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='地面亲和损失权重')
+    parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度惩罚损失权重 (防止飞高规避)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     
@@ -66,15 +66,19 @@ def parse_args():
     # 场景随机化参数
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成 (每 episode 随机组合障碍物)')
-    parser.add_argument('--num_obstacles_min', type=int, default=20, help='每场景最少障碍物数')
-    parser.add_argument('--num_obstacles_max', type=int, default=40, help='每场景最多障碍物数')
+    parser.add_argument('--num_obstacles_min', type=int, default=25, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_max', type=int, default=50, help='每场景最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3, help='障碍物最小缩放')
-    parser.add_argument('--obstacle_scale_max', type=float, default=2.0, help='障碍物最大缩放')
+    parser.add_argument('--obstacle_scale_max', type=float, default=1.5, help='障碍物最大缩放')
     parser.add_argument('--arena_range', type=float, default=6.0, help='场景水平范围 [-R,R]')
     parser.add_argument('--safe_spawn', action='store_true', default=False,
                         help='启用碰撞安全的出生点/目标点采样')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
                         help='安全出生点到障碍物的最小距离')
+    parser.add_argument('--force_cross_map', action='store_true', default=False,
+                        help='强制出生/目标点在场景对向两侧（防止绕行）')
+    parser.add_argument('--spawn_z_max', type=float, default=3.0,
+                        help='出生/目标点最大高度（防止飞高规避）')
     
     # 环境参数 - 无人机物理
     parser.add_argument('--margin_min', type=float, default=0.1, help='无人机安全半径最小值')
@@ -142,11 +146,12 @@ class DroneTrainer:
                 ),
                 obstacle_scale_range=(
                     getattr(args, 'obstacle_scale_min', 0.3),
-                    getattr(args, 'obstacle_scale_max', 2.0),
+                    getattr(args, 'obstacle_scale_max', 1.5),
                 ),
             )
             print(f"[SceneGenerator] 已启用随机场景生成, "
-                  f"障碍物数量: {args.num_obstacles_min}-{args.num_obstacles_max}")
+                  f"障碍物数量: {args.num_obstacles_min}-{args.num_obstacles_max}, "
+                  f"归一化+网格抖动+3D旋转")
         
         self.safe_spawn = getattr(args, 'safe_spawn', False) or getattr(args, 'random_scene', False)
         if self.safe_spawn:
@@ -298,10 +303,22 @@ class DroneTrainer:
         
         # 安全出生点采样 (如果启用)
         if self.safe_spawn:
-            self.env.safe_reset(
-                arena_range=getattr(self.args, 'init_p_range', 8.0),
-                z_range=(1.0, 6.0),
-            )
+            if getattr(self.args, 'force_cross_map', False):
+                # 跨地图模式：出生/目标在对向两侧，防止绕行
+                spawn_z_max = getattr(self.args, 'spawn_z_max', 3.0)
+                _, p_target = self.env.safe_reset_cross_map(
+                    arena_range=getattr(self.args, 'arena_range', 6.0),
+                    z_range=(1.0, spawn_z_max),
+                )
+                cross_map_mode = True
+            else:
+                self.env.safe_reset(
+                    arena_range=getattr(self.args, 'init_p_range', 8.0),
+                    z_range=(1.0, getattr(self.args, 'spawn_z_max', 3.0)),
+                )
+                cross_map_mode = False
+        else:
+            cross_map_mode = False
         
         # 历史记录
         p_history = []
@@ -323,11 +340,15 @@ class DroneTrainer:
         act_buffer = [initial_act.clone() for _ in range(act_lag + 1)]
         
         # 目标位置 (随机生成)
-        if self.safe_spawn:
-            # 使用碰撞安全的目标点采样
+        spawn_z_max = getattr(self.args, 'spawn_z_max', 3.0)
+        if cross_map_mode:
+            # 跨地图模式下 p_target 已由 safe_reset_cross_map 返回
+            pass
+        elif self.safe_spawn:
+            # 使用碰撞安全的目标点采样（低空）
             p_target = self.env.sample_safe_target(
-                arena_range=getattr(self.args, 'init_p_range', 8.0),
-                z_range=(1.5, 6.0),
+                arena_range=getattr(self.args, 'arena_range', 6.0),
+                z_range=(1.0, spawn_z_max),
                 min_distance=3.0,
                 max_distance=8.0,
             )
@@ -345,7 +366,7 @@ class DroneTrainer:
             p_target[:, 1] += offset_y
             p_target[:, 2] += offset_z
             
-            p_target[:, 2] = p_target[:, 2].clamp(1.5, 6.0)  # 限制 Z 范围 (最低1.5防止钻地)
+            p_target[:, 2] = p_target[:, 2].clamp(1.5, spawn_z_max)  # 限制 Z 范围
         
         target_v_raw = p_target - self.env.p
         
