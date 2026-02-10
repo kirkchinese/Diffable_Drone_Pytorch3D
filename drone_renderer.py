@@ -78,7 +78,7 @@ class DroneRenderer:
                  lights_location=[[0.0, 0.0, -3.0]],
                  num_samples=20000,
                  subdivide_times=3,
-                 z_clip_value=0.01):
+                 z_clip_value=0.3):
         """
         初始化无人机渲染器。
 
@@ -95,9 +95,10 @@ class DroneRenderer:
             subdivide_times (int, optional): 网格细分次数，默认 3。
                 设为 0 配合 z_clip_value 可获得等价质量但 10-40x 更快的渲染。
                 细分主要用于精细化网格几何，不再是解决面片消失的手段。
-            z_clip_value (float, optional): 近平面裁剪值，默认 0.01。
-                将跨越 z=0 的三角形沿近平面裁剪，防止投影到无穷大后消失。
-                这是解决"大面片消失"问题的正确方案，比细分更高效。
+            z_clip_value (float, optional): 近平面裁剪值，默认 0.3。
+                将跨越近平面的三角形裁剪，防止投影到无穷大后消失。
+                设为 0.3 与训练中 depth.clamp(0.3, 24) 对齐，
+                避免无人机贴近障碍物时 clip_faces 产生海量碎片导致 OOM。
                 设为 None 禁用（不推荐，会导致近处三角形丢失）。
 
         Raises:
