@@ -248,16 +248,16 @@ class TrainingMonitor:
             avg_time = 0
         
         print(f"\n{'─' * 65}")
-        print(f"  📊 Iter {step:>6d}  |  经过 {elapsed_str}  |  {avg_time:.2f} s/it")
+        print(f"  # Iter {step:>6d}  |  已用时 {elapsed_str}  |  {avg_time:.2f} s/it")
         print(f"{'─' * 65}")
         
         # 按类别分组显示
         groups = {
-            '📉 损失': ['loss', 'loss_v', 'loss_v_pred', 'loss_collide',
+            '# 损失': ['loss', 'loss_v', 'loss_v_pred', 'loss_collide',
                         'loss_obj_avoidance', 'loss_d_acc', 'loss_d_jerk',
                         'loss_speed', 'loss_ground_affinity', 'loss_bias'],
-            '🎯 性能': ['success_rate', 'avg_speed', 'max_speed', 'ar'],
-            '⚙️ 系统': ['step_time', 'lr'],
+            '# 模型性能': ['success_rate', 'avg_speed', 'max_speed', 'ar'],
+            '# 迭代速度': ['step_time', 'lr'],
         }
         
         for group_name, keys in groups.items():

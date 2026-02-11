@@ -28,6 +28,214 @@ from pytorch3d.ops import sample_points_from_meshes
 
 
 # ============================================================
+# 网格简化工具
+# ============================================================
+
+def _decimate_mesh(mesh, target_faces, device=None):
+    """
+    基于顶点聚类 (Vertex Clustering) 的网格简化。
+
+    纯 PyTorch 实现，不依赖 trimesh / open3d。
+    原理：将顶点位置量化到均匀网格，同一格子内的顶点合并为一个
+    （使用格内均值），面片重映射后去除退化三角形。
+
+    用于在加载原语时预简化高面片网格（如圆环 1152→~200 面），
+    从而降低整个场景的面片总数和渲染开销。
+
+    Args:
+        mesh: Meshes 对象（单个网格）
+        target_faces: 目标面片数（近似值，实际结果可能略有偏差）
+        device: 计算设备
+
+    Returns:
+        Meshes: 简化后的新网格（保留纹理颜色）
+    """
+    verts = mesh.verts_packed()           # (V, 3)
+    faces = mesh.faces_packed()           # (F, 3)
+    if device is None:
+        device = verts.device
+
+    num_faces = faces.shape[0]
+    if num_faces <= target_faces:
+        return mesh  # 已经足够简单，无需简化
+
+    # 自适应网格分辨率：通过二分搜索找到使结果面片数最接近 target 的 grid_res
+    bbox_min = verts.min(0).values
+    bbox_max = verts.max(0).values
+    bbox_size = bbox_max - bbox_min
+    bbox_size = bbox_size.clamp(min=1e-6)
+
+    best_res = 4
+    best_diff = float('inf')
+    lo_res, hi_res = 3, 64
+
+    for _ in range(16):  # 二分搜索
+        mid_res = (lo_res + hi_res) // 2
+        if mid_res <= lo_res:
+            break
+        # 试量化
+        cell_size = bbox_size / mid_res
+        q = ((verts - bbox_min) / cell_size).long().clamp(max=mid_res - 1)
+        keys = q[:, 0] * (mid_res * mid_res) + q[:, 1] * mid_res + q[:, 2]
+        inv = keys.unique(return_inverse=True)[1]
+        test_faces = inv[faces]
+        valid = (test_faces[:, 0] != test_faces[:, 1]) & \
+                (test_faces[:, 1] != test_faces[:, 2]) & \
+                (test_faces[:, 0] != test_faces[:, 2])
+        n_valid = valid.sum().item()
+        diff = abs(n_valid - target_faces)
+        if diff < best_diff:
+            best_diff = diff
+            best_res = mid_res
+        if n_valid < target_faces:
+            lo_res = mid_res  # 网格太粗 → 结果面太少 → 需要更细
+        else:
+            hi_res = mid_res  # 面太多 → 需要更粗
+
+    grid_res = best_res
+    cell_size = bbox_size / grid_res
+
+    # 量化顶点到网格
+    quantized = ((verts - bbox_min) / cell_size).long().clamp(max=grid_res - 1)
+    keys = quantized[:, 0] * (grid_res * grid_res) + quantized[:, 1] * grid_res + quantized[:, 2]
+
+    # 为每个唯一 key 分配新顶点 ID
+    unique_keys, inverse = keys.unique(return_inverse=True)
+    num_new_verts = unique_keys.shape[0]
+
+    # 新顶点位置 = 格内顶点均值
+    new_verts = torch.zeros(num_new_verts, 3, device=device)
+    counts = torch.zeros(num_new_verts, device=device)
+    new_verts.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), verts)
+    counts.scatter_add_(0, inverse, torch.ones(verts.shape[0], device=device))
+    new_verts = new_verts / counts.unsqueeze(-1).clamp(min=1)
+
+    # 新顶点颜色 = 格内均值
+    has_texture = mesh.textures is not None
+    new_colors = None
+    if has_texture:
+        try:
+            vert_colors = mesh.textures.verts_features_packed()  # (V, C)
+            new_colors = torch.zeros(num_new_verts, vert_colors.shape[1], device=device)
+            new_colors.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, vert_colors.shape[1]), vert_colors)
+            new_colors = new_colors / counts.unsqueeze(-1).clamp(min=1)
+        except Exception:
+            new_colors = torch.ones(num_new_verts, 3, device=device)
+
+    # 重映射面片
+    new_faces = inverse[faces]  # (F, 3)
+
+    # 去除退化面（三个顶点中有重复的）
+    valid = (new_faces[:, 0] != new_faces[:, 1]) & \
+            (new_faces[:, 1] != new_faces[:, 2]) & \
+            (new_faces[:, 0] != new_faces[:, 2])
+    new_faces = new_faces[valid]
+
+    # 向量化去重面片（排序后去重）
+    if new_faces.shape[0] > 0:
+        sorted_faces, _ = new_faces.sort(dim=1)
+        face_keys = sorted_faces[:, 0].long() * (num_new_verts + 1) ** 2 + \
+                    sorted_faces[:, 1].long() * (num_new_verts + 1) + \
+                    sorted_faces[:, 2].long()
+        _, inv_idx, counts_f = face_keys.unique(return_inverse=True, return_counts=True)
+        # 使用 scatter_reduce 找到每个 unique key 的第一个出现位置
+        perm = torch.arange(new_faces.shape[0], device=device)
+        first_occ = torch.full((counts_f.shape[0],), new_faces.shape[0], dtype=torch.long, device=device)
+        first_occ.scatter_reduce_(0, inv_idx, perm, reduce='amin')
+        new_faces = new_faces[first_occ]
+
+    if new_faces.shape[0] == 0:
+        return mesh  # 简化失败，返回原始网格
+
+    # 紧凑化：去掉未使用的顶点
+    used_verts = new_faces.unique()
+    remap = torch.full((num_new_verts,), -1, dtype=torch.long, device=device)
+    remap[used_verts] = torch.arange(used_verts.shape[0], device=device)
+    new_verts = new_verts[used_verts]
+    new_faces = remap[new_faces]
+
+    # 构建新网格
+    if new_colors is not None:
+        new_colors = new_colors[used_verts]
+        textures = TexturesVertex(verts_features=new_colors.unsqueeze(0))
+    else:
+        textures = TexturesVertex(verts_features=torch.ones_like(new_verts).unsqueeze(0))
+
+    return Meshes(verts=[new_verts], faces=[new_faces], textures=textures)
+
+
+def _weld_scene_vertices(mesh, epsilon=1e-4):
+    """
+    场景级顶点焊接：合并距离小于 epsilon 的重复顶点，去除退化面片。
+
+    在 join_meshes_as_scene 之后调用，可合并重叠物体间的近似重复顶点，
+    并清理退化/重复面片，减少场景总面片数。
+
+    Args:
+        mesh: Meshes 对象（合并后的场景网格）
+        epsilon: 焊接距离阈值（默认 0.1mm）
+
+    Returns:
+        Meshes: 焊接后的新网格
+    """
+    verts = mesh.verts_packed()
+    faces = mesh.faces_packed()
+    device = verts.device
+
+    # 用量化实现近似顶点合并（O(V) 复杂度）
+    quantized = (verts / epsilon).round().long()
+    keys = quantized[:, 0] * 1000003 + quantized[:, 1] * 1009 + quantized[:, 2]
+    unique_keys, inverse = keys.unique(return_inverse=True)
+
+    if unique_keys.shape[0] == verts.shape[0]:
+        return mesh  # 无重复顶点
+
+    num_new = unique_keys.shape[0]
+    new_verts = torch.zeros(num_new, 3, device=device)
+    counts = torch.zeros(num_new, device=device)
+    new_verts.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), verts)
+    counts.scatter_add_(0, inverse, torch.ones(verts.shape[0], device=device))
+    new_verts = new_verts / counts.unsqueeze(-1).clamp(min=1)
+
+    # 处理纹理
+    new_colors = None
+    if mesh.textures is not None:
+        try:
+            vert_colors = mesh.textures.verts_features_packed()
+            new_colors = torch.zeros(num_new, vert_colors.shape[1], device=device)
+            new_colors.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, vert_colors.shape[1]), vert_colors)
+            new_colors = new_colors / counts.unsqueeze(-1).clamp(min=1)
+        except Exception:
+            new_colors = torch.ones(num_new, 3, device=device)
+
+    new_faces = inverse[faces]
+
+    # 去退化面
+    valid = (new_faces[:, 0] != new_faces[:, 1]) & \
+            (new_faces[:, 1] != new_faces[:, 2]) & \
+            (new_faces[:, 0] != new_faces[:, 2])
+    new_faces = new_faces[valid]
+
+    if new_faces.shape[0] == 0:
+        return mesh
+
+    # 紧凑化
+    used = new_faces.unique()
+    remap = torch.full((num_new,), -1, dtype=torch.long, device=device)
+    remap[used] = torch.arange(used.shape[0], device=device)
+    new_verts = new_verts[used]
+    new_faces = remap[new_faces]
+
+    if new_colors is not None:
+        new_colors = new_colors[used]
+        textures = TexturesVertex(verts_features=new_colors.unsqueeze(0))
+    else:
+        textures = TexturesVertex(verts_features=torch.ones_like(new_verts).unsqueeze(0))
+
+    return Meshes(verts=[new_verts], faces=[new_faces], textures=textures)
+
+
+# ============================================================
 # 坐标系转换工具
 # ============================================================
 
@@ -68,6 +276,7 @@ PRIMITIVE_REGISTRY = {
     "torus":    ("圆环5_5_1.obj",     (0.5, 3.0),  False),
     "cone":     ("椎体2_2_2.obj",     (0.5, 3.0),  False),
     "floor":    ("地板.obj",          (1.0, 1.0),  True),
+    "cube":     ("方块.obj",         (0.5, 3.0),  False),
 }
 
 
@@ -76,7 +285,7 @@ def _load_primitive_mesh(name, device, primitive_dir=None):
     加载单个原语网格。
 
     Args:
-        name: 原语名称 (PRIMITIVE_REGISTRY 中的 key)
+        name: 原型名称 (PRIMITIVE_REGISTRY 中的 key)
         device: 计算设备
         primitive_dir: 原语文件目录，None 使用默认路径
 
@@ -206,7 +415,7 @@ class SceneGenerator:
     """
     随机场景生成器。
 
-    每次调用 generate() 时，从原语库中随机抽取障碍物，
+    每次调用 generate() 时，从原型库中随机抽取障碍物，
     随机变换（缩放、旋转、平移）后合并为一个场景网格。
 
     坐标系约定：
@@ -240,7 +449,12 @@ class SceneGenerator:
                  enable_3d_rotation=True,
                  max_tilt=math.pi / 4,
                  ground_clearance=0.05,
+                 ground_ratio=0.6,
+                 cluster_ratio=0.3,
+                 cluster_spread=1.5,
                  normalize_primitives=True,
+                 max_faces_per_primitive=200,
+                 weld_scene=True,
                  seed=None):
         """
         Args:
@@ -262,9 +476,22 @@ class SceneGenerator:
                                 False 则仅绕 Y 轴旋转（兼容旧行为）。
             max_tilt: 三轴旋转时 pitch/roll 最大倾斜角（弧度），默认 π/4。
             ground_clearance: 障碍物底部距地面最小间距（OBJ Y），默认 0.05m。
+            ground_ratio: 接地物体比例 (0.0~1.0)。接地物体底部紧贴地面，
+                          Y 轴缩放偏大形成柱子/墙壁，迫使无人机绕行而非从下方穿越。
+                          默认 0.6（60% 物体接地）。
+            cluster_ratio: 簇生物体比例 (0.0~1.0)。这部分物体不使用网格位置，
+                           而是放置在已有物体附近，允许重叠以形成复合形状，
+                           提高模型对大型/异形障碍物的泛化能力。默认 0.3。
+            cluster_spread: 簇生物体相对于父物体的最大水平偏移距离 (m)，默认 1.5。
+                            值越小，组合越紧密；值越大，组合越松散。
             normalize_primitives: 将所有原语归一化到单位包围盒 (max extent = 1.0)，
                                   确保不同形状的缩放行为一致。默认 True。
                                   归一化后 scale=1.0 表示最大维度为 1m。
+            max_faces_per_primitive: 每个原语的最大面片数，超过则在加载时自动简化。
+                                     默认 200，可显著降低场景总面片数（尤其是圆环 1152→~200、
+                                     球 960→~200）。设为 0 或 None 禁用简化。
+            weld_scene: 在 join_meshes_as_scene 后进行顶点焊接和退化面清理。
+                        可合并重叠簇生物体间的重复顶点，默认 True。
             seed: 随机种子（仅用于 Python random 模块）
         """
         self.device = device
@@ -279,7 +506,12 @@ class SceneGenerator:
         self.enable_3d_rotation = enable_3d_rotation
         self.max_tilt = max_tilt
         self.ground_clearance = ground_clearance
+        self.ground_ratio = ground_ratio
+        self.cluster_ratio = cluster_ratio
+        self.cluster_spread = cluster_spread
         self.normalize_primitives = normalize_primitives
+        self.max_faces_per_primitive = max_faces_per_primitive
+        self.weld_scene = weld_scene
 
         if seed is not None:
             random.seed(seed)
@@ -300,6 +532,15 @@ class SceneGenerator:
                 if max_extent > 1e-6:
                     normalized_verts = verts / max_extent
                     centered = centered.update_padded(normalized_verts.unsqueeze(0))
+
+            # 简化高面片原语（在20 加载时一次性完成，不影响 generate 速度）
+            if max_faces_per_primitive and max_faces_per_primitive > 0:
+                n_before = centered.faces_packed().shape[0]
+                if n_before > max_faces_per_primitive:
+                    centered = _decimate_mesh(centered, max_faces_per_primitive, device=device)
+                    n_after = centered.faces_packed().shape[0]
+                    print(f"  [Decimate] {name}: {n_before} → {n_after} faces "
+                          f"({(1 - n_after/n_before)*100:.0f}% 减少)")
 
             self.primitive_meshes[name] = centered
             # 预计算 Y 方向半高度（居中后 Y_max ≈ -Y_min ≈ half_height）
@@ -387,11 +628,16 @@ class SceneGenerator:
         """
         生成一个随机场景。
 
-        改进点（相比旧版本）：
-        - 网格抖动分布：障碍物均匀覆盖整个场景（包括边缘），无死角
-        - 三轴旋转：障碍物具有随机 pitch/roll，更自然且增加挑战
-        - 归一化：不同形状缩放行为一致，避免圆环等过大
-        - 动态高度计算：旋转后实际 Y 范围精确计算，杜绝地下放置
+        放置策略（两层架构）：
+        1. **主体障碍物** (n_primary)：通过网格抖动均匀覆盖场景。
+        2. **簇生障碍物** (n_cluster)：放置在已有障碍物附近（cluster_spread 范围内），
+           允许重叠以形成复合形状，提高模型对大型/异形障碍物的泛化能力。
+
+        接地机制：
+        - 每个障碍物以 ground_ratio 概率"接地"——底部紧贴地面，
+          Y 轴缩放偏大（1.0–3.0×），形成柱子/墙壁/岩石等地面障碍物。
+        - 非接地物体照旧在 [height_lo, height_hi] 范围内随机悬浮。
+        - 这迫使无人机学习绕行机动，而非从所有物体下方穿越。
 
         Returns:
             scene_mesh (Meshes): 合并后的场景网格（所有障碍物 + 地板）
@@ -418,26 +664,41 @@ class SceneGenerator:
             lo, hi = self.num_obstacles_range
             num_obstacles = random.randint(lo, hi)
 
-        # 生成水平位置
+        # 分离主体与簇生障碍物
+        n_primary = max(int(num_obstacles * (1 - self.cluster_ratio)), 1)
+        n_cluster = num_obstacles - n_primary
+
+        # 生成主体水平位置
         if self.grid_jitter:
-            positions = self._grid_jitter_positions(num_obstacles)
+            primary_positions = self._grid_jitter_positions(n_primary)
         else:
-            positions = self._random_positions(num_obstacles)
+            primary_positions = self._random_positions(n_primary)
 
         height_lo, height_hi = self.obstacle_z_range
 
-        for i, (px, pz) in enumerate(positions):
-            # 随机选择原语类型
+        # 已放置障碍物中心列表（供簇生物体参考）
+        placed_centers = []
+
+        def _place_one(px, pz, force_grounded=None):
+            """放置单个障碍物，返回无。直接修改外层 meshes_to_join / obstacle_info。"""
             name = random.choice(self.obstacle_names)
             base_mesh = self.primitive_meshes[name]
             base_verts = base_mesh.verts_packed()  # (V, 3), 已居中 (归一化后)
+
+            # 决定是否接地
+            is_grounded = force_grounded if force_grounded is not None \
+                else (random.random() < self.ground_ratio)
 
             # 随机缩放 (XYZ 独立，基础值 ±30% 扰动)
             s_lo, s_hi = self.obstacle_scale_range
             base_scale = random.uniform(s_lo, s_hi)
             sx = base_scale * random.uniform(0.7, 1.3)
-            sy = base_scale * random.uniform(0.7, 1.3)
             sz = base_scale * random.uniform(0.7, 1.3)
+            if is_grounded:
+                # 接地物体：Y 轴缩放偏大，形成柱子/墙壁/树桩等
+                sy = base_scale * random.uniform(1.0, 3.0)
+            else:
+                sy = base_scale * random.uniform(0.7, 1.3)
             scale = torch.tensor([sx, sy, sz], device=self.device)
 
             # 缩放
@@ -460,10 +721,15 @@ class SceneGenerator:
 
             # 动态计算旋转后实际 Y 范围（精确防止地下放置）
             y_min_local = verts[:, 1].min().item()
-            # 确保底部 >= ground_clearance：ty + y_min_local >= ground_clearance
-            min_ty = self.ground_clearance - y_min_local  # y_min_local 通常为负
-            min_ty = max(min_ty, height_lo)
-            ty = random.uniform(min_ty, height_hi) if min_ty < height_hi else min_ty
+
+            if is_grounded:
+                # 接地：底部紧贴地面
+                ty = self.ground_clearance - y_min_local
+            else:
+                # 悬浮：在 [min_ty, height_hi] 范围内随机
+                min_ty = self.ground_clearance - y_min_local  # y_min_local 通常为负
+                min_ty = max(min_ty, height_lo)
+                ty = random.uniform(min_ty, height_hi) if min_ty < height_hi else min_ty
 
             # 平移
             translation = torch.tensor([px, ty, pz], device=self.device)
@@ -482,12 +748,44 @@ class SceneGenerator:
                 "scale": scale,
                 "half_extent": half_ext,
             })
+            placed_centers.append((px, ty, pz))
+
+        # --- 主体障碍物：均匀网格分布 ---
+        for px, pz in primary_positions:
+            _place_one(px, pz)
+
+        # --- 簇生障碍物：在已有物体附近组合，形成复合形状 ---
+        for _ in range(n_cluster):
+            if placed_centers:
+                parent = random.choice(placed_centers)
+                dx = random.uniform(-self.cluster_spread, self.cluster_spread)
+                dz = random.uniform(-self.cluster_spread, self.cluster_spread)
+                cx = max(-self.arena_range + 0.05,
+                         min(self.arena_range - 0.05, parent[0] + dx))
+                cz = max(-self.arena_range + 0.05,
+                         min(self.arena_range - 0.05, parent[2] + dz))
+                _place_one(cx, cz)
+            else:
+                px = random.uniform(-self.arena_range, self.arena_range)
+                pz = random.uniform(-self.arena_range, self.arena_range)
+                _place_one(px, pz)
 
         # 3) 合并所有网格为一个场景
         if len(meshes_to_join) == 0:
             raise ValueError("No meshes to join! Check include_floor and num_obstacles settings.")
 
         scene_mesh = join_meshes_as_scene(meshes_to_join)
+
+        # 场景级拓扑优化：合并重复顶点、清理退化面
+        if self.weld_scene:
+            v_before = scene_mesh.verts_packed().shape[0]
+            f_before = scene_mesh.faces_packed().shape[0]
+            scene_mesh = _weld_scene_vertices(scene_mesh, epsilon=1e-4)
+            v_after = scene_mesh.verts_packed().shape[0]
+            f_after = scene_mesh.faces_packed().shape[0]
+            if v_before != v_after or f_before != f_after:
+                pass  # 静默优化，可取消注释以查看效果
+                # print(f"  [Weld] verts {v_before}→{v_after}, faces {f_before}→{f_after}")
 
         return scene_mesh, obstacle_info
 

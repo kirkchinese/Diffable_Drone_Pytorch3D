@@ -98,13 +98,13 @@ def parse_args():
                         help='模型相机水平视场角 (度)，需与训练时一致，默认90°')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample.obj',
                         help='障碍物网格路径 (仅在非随机场景时使用)')
-    parser.add_argument('--num_samples', type=int, default=100000,
+    parser.add_argument('--num_samples', type=int, default=50000,
                         help='障碍物点云采样数')
     parser.add_argument('--subdivide_times', type=int, default=0,
                         help='网格细分次数')
     parser.add_argument('--depth_min', type=float, default=0.3,
                         help='深度图近截断距离 (米)，同时也是渲染器近平面裁剪值')
-    parser.add_argument('--depth_max', type=float, default=24.0,
+    parser.add_argument('--depth_max', type=float, default=3.0,
                         help='深度图远截断距离 (米)')
 
     # 高分辨率渲染选项（用于可视化输出，不影响模型输入）
@@ -128,15 +128,21 @@ def parse_args():
                         help='障碍物最大缩放')
     parser.add_argument('--arena_range', type=float, default=6.0,
                         help='场景 X/Y 范围')
+    parser.add_argument('--ground_ratio', type=float, default=0.6,
+                        help='接地物体比例 (0~1)')
+    parser.add_argument('--cluster_ratio', type=float, default=0.3,
+                        help='簇生物体比例 (0~1)')
+    parser.add_argument('--cluster_spread', type=float, default=1.5,
+                        help='簇生物体最大水平偏移 (m)')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
                         help='安全出生点到障碍物的最小距离')
     parser.add_argument('--force_cross_map', action='store_true', default=False,
                         help='强制出生/目标点在场景对向两侧')
-    parser.add_argument('--spawn_z_max', type=float, default=3.0,
+    parser.add_argument('--spawn_z_max', type=float, default=1.5,
                         help='出生/目标点最大高度')
 
     # 无人机物理（与训练保持一致）
-    parser.add_argument('--init_p_range', type=float, default=8.0,
+    parser.add_argument('--init_p_range', type=float, default=6.0,
                         help='初始位置范围')
     parser.add_argument('--margin_min', type=float, default=0.1,
                         help='无人机安全半径最小值')
@@ -268,8 +274,12 @@ class EvalRunner:
                 arena_range=args.arena_range,
                 num_obstacles_range=(args.num_obstacles_min, args.num_obstacles_max),
                 obstacle_scale_range=(args.obstacle_scale_min, args.obstacle_scale_max),
+                ground_ratio=args.ground_ratio,
+                cluster_ratio=args.cluster_ratio,
+                cluster_spread=args.cluster_spread,
             )
-            print(f"[SceneGenerator] 随机场景: 障碍物 {args.num_obstacles_min}–{args.num_obstacles_max}")
+            print(f"[SceneGenerator] 随机场景: 障碍物 {args.num_obstacles_min}–{args.num_obstacles_max}, "
+                  f"接地率: {args.ground_ratio:.0%}, 簇生率: {args.cluster_ratio:.0%}")
 
         # ---------- 根据 FOV 计算焦距 ----------
         focal_length = (args.image_width / 2.0) / math.tan(math.radians(args.hfov / 2.0))

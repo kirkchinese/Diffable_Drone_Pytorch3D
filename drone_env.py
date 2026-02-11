@@ -473,25 +473,41 @@ class DroneSimulator:
         """
         在子步插值位置上计算到最近障碍物的向量（参考项目 find_vec_to_nearest_pt 的实现）。
 
-        沿当前步轨迹 p + v * t 均匀采样 n_subdiv 个点，逐点查询最近障碍物。
-        与单点 vec_to_obj 相比，能捕获步内的碰撞风险。
+        沿当前步轨迹 p + v * t 均匀采样 n_subdiv 个点，**一次性批量 KNN 查询**
+        所有子步的最近障碍物。与单点 vec_to_obj 相比，能捕获步内的碰撞风险。
+
+        优化：使用单次 CUDA 调用处理所有子步。本实现将 S×B 个查询点
+        合并为一次 knn_points 调用，消除 S 次独立 CUDA kernel launch 的开销。
 
         Args:
             n_subdiv (int): 子步数量，默认 10（与参考项目一致）。
             dt (float, optional): 当前步时间步长。默认使用 self.dt。
 
         Returns:
-            vecs (n_subdiv, B, 3): 各子步位置到最近障碍物的向量。
+            vecs (n_subdiv, B, 3): 各子步位置到最近障碍物的向量（ROS 坐标系）。
         """
         current_dt = dt if dt is not None else self.dt
         sub_div = torch.linspace(0, current_dt, n_subdiv, device=self.device)
 
-        vecs_list = []
-        for t_frac in sub_div:
-            p_interp = self.p + self.v * t_frac
-            _, vec = self._knn_query(p_interp)
-            vecs_list.append(vec)
-        return torch.stack(vecs_list)  # (n_subdiv, B, 3)
+        # 批量生成所有子步的插值位置: (S, B, 3) in ROS
+        p_all_ros = self.p.unsqueeze(0) + self.v.unsqueeze(0) * sub_div[:, None, None]
+        S, B, _ = p_all_ros.shape
+
+        # 转换到 OBJ 坐标系并展平为 (S*B, 3)
+        p_flat_obj = ros_to_obj(p_all_ros.reshape(S * B, 3))
+
+        # 单次批量 KNN 查询: (1, S*B, 3) vs (1, N, 3)
+        p_query = p_flat_obj.unsqueeze(0)  # (1, S*B, 3)
+        obstacle_pcd = self.renderer.obstacle_pcd  # (1, N, 3)
+
+        result = knn_points(p_query, obstacle_pcd, K=1, return_nn=True)
+        nearest_obj = result.knn.squeeze(0).squeeze(1)  # (S*B, 3)
+
+        # 计算向量 (OBJ 空间) 并转换回 ROS
+        vecs_obj = nearest_obj - p_flat_obj  # (S*B, 3)
+        vecs_ros = obj_to_ros(vecs_obj)      # (S*B, 3)
+
+        return vecs_ros.reshape(S, B, 3)  # (S, B, 3)
 
     def update_mesh(self, mesh_path, num_samples=None):
         """

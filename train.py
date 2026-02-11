@@ -5,6 +5,7 @@
 """
 
 import os
+import gc
 import math
 import argparse
 from collections import defaultdict
@@ -38,6 +39,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
+    parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
     
     # 损失函数权重
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
@@ -64,17 +66,29 @@ def parse_args():
                         help='网格细分次数 (默认0, 配合z_clip无质量损失且渲染快)')
     parser.add_argument('--depth_min', type=float, default=0.3,
                         help='深度图近截断距离 (米)，近于此的深度被截断。同时也是渲染器近平面裁剪值')
-    parser.add_argument('--depth_max', type=float, default=24.0,
-                        help='深度图远截断距离 (米)，远于此的深度被截断')
+    parser.add_argument('--depth_max', type=float, default=10.0,
+                        help='深度图远截断距离 (米)，远于此的深度被截断。'
+                             '参考项目使用 24.0；过小会导致模型"近视"来不及避障')
+    # parser.add_argument('--depth_dilate', type=int, default=0,
+    #                     help='深度图障碍物膨胀核大小 (奇数, 0=禁用)。'
+    #                          'stride=1 max_pool2d 使障碍物在深度图中向外扩展，'
+    #                          '类似机器人导航中的 C-space 膨胀。'
+    #                          '默认禁用，仅在擦碰问题严重时尝试开启 (5 或 7)')
     
     # 场景随机化参数
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成 (每 episode 随机组合障碍物)')
-    parser.add_argument('--num_obstacles_min', type=int, default=50, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_min', type=int, default=30, help='每场景最少障碍物数')
     parser.add_argument('--num_obstacles_max', type=int, default=80, help='每场景最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3, help='障碍物最小缩放')
     parser.add_argument('--obstacle_scale_max', type=float, default=1.5, help='障碍物最大缩放')
     parser.add_argument('--arena_range', type=float, default=6.0, help='场景水平范围 [-R,R]')
+    parser.add_argument('--ground_ratio', type=float, default=0.6,
+                        help='接地物体比例 (0~1)，接地物体底部紧贴地面形成柱子/墙壁')
+    parser.add_argument('--cluster_ratio', type=float, default=0.3,
+                        help='簇生物体比例 (0~1)，放置在已有物体附近形成复合形状')
+    parser.add_argument('--cluster_spread', type=float, default=1.5,
+                        help='簇生物体相对父物体的最大水平偏移 (m)')
     parser.add_argument('--safe_spawn', action='store_true', default=False,
                         help='启用碰撞安全的出生点/目标点采样')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
@@ -86,7 +100,7 @@ def parse_args():
     
     # 环境参数 - 无人机物理
     parser.add_argument('--margin_min', type=float, default=0.1, help='无人机安全半径最小值')
-    parser.add_argument('--margin_max', type=float, default=0.7, help='无人机安全半径最大值')
+    parser.add_argument('--margin_max', type=float, default=0.3, help='无人机安全半径最大值')
     parser.add_argument('--init_p_range', type=float, default=8.0, help='初始位置范围')
     parser.add_argument('--noise_std', type=float, default=0.04, help='环境扰动噪声标准差')
     parser.add_argument('--yaw_inertia', type=float, default=5.0, help='偏航惯性')
@@ -152,9 +166,14 @@ class DroneTrainer:
                     getattr(args, 'obstacle_scale_min', 0.3),
                     getattr(args, 'obstacle_scale_max', 1.5),
                 ),
+                ground_ratio=getattr(args, 'ground_ratio', 0.6),
+                cluster_ratio=getattr(args, 'cluster_ratio', 0.3),
+                cluster_spread=getattr(args, 'cluster_spread', 1.5),
             )
             print(f"[SceneGenerator] 已启用随机场景生成, "
                   f"障碍物数量: {args.num_obstacles_min}-{args.num_obstacles_max}, "
+                  f"接地率: {args.ground_ratio:.0%}, "
+                  f"簇生率: {args.cluster_ratio:.0%}, "
                   f"归一化+网格抖动+3D旋转")
         
         self.safe_spawn = getattr(args, 'safe_spawn', False) or getattr(args, 'random_scene', False)
@@ -417,16 +436,18 @@ class DroneTrainer:
             
             # 渲染深度图 - 使用 no_grad() 避免 PyTorch3D 透视投影反向传播的数值问题
             # 这里这个是个大坑，参考项目也是这么做的，我之前没有注意到，不这么做，会导致梯度爆炸，这个问题是在pytorch3d中产生的，问题很隐蔽，查了我很久。
-            with torch.no_grad():
-                _, depth = self.env.render(
-                    camera_pitch=cam_pitch,
-                    return_tensor=True,
-                    return_rgb=False,
-                    return_depth=True,
-                    dt=current_dt
-                )
-            # 重新启用梯度（深度图作为模型输入）
-            depth = depth.requires_grad_(False)  # 确保深度图不需要梯度
+            # 跳帧优化: 深度图不参与梯度计算, 相邻帧变化很小, 可隔帧渲染节省开销
+            if t % args.render_interval == 0:
+                with torch.no_grad():
+                    _, depth = self.env.render(
+                        camera_pitch=cam_pitch,
+                        return_tensor=True,
+                        return_rgb=False,
+                        return_depth=True,
+                        dt=current_dt
+                    )
+                # 重新启用梯度（深度图作为模型输入）
+                depth = depth.requires_grad_(False)  # 确保深度图不需要梯度
             
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
@@ -469,16 +490,25 @@ class DroneTrainer:
             state = torch.cat(state_parts, dim=-1)  # [7] or [10]
             
             # 深度图预处理
-            bg_mask = (depth < 0)  # PyTorch3D 背景像素 zbuf = -1
+            # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
+            bg_mask = (depth < 0) | (depth > args.depth_max)
             x = depth.clamp(args.depth_min, args.depth_max)
-            x = 3.0 / x - 0.6  # 转换为近似线性空间
-            x[bg_mask] = 0.0    # 背景设为 0（无障碍物），避免 -1 被误映射为最大近距信号
+            x = 3.0 / x - 0.6  # 逆距离变换: 近→高值(9.4@0.3m), 远→低值(0.0@5m)
+            x[bg_mask] = 0.0    # 空像素设为 0（无障碍物）
             x = x + torch.randn_like(x) * 0.02  # 添加噪声
-            # x = F.max_pool2d(x[:, None], kernel_size=4, stride=4) # 缩小尺寸 # 这里我换了个模型，不用缩小了
-            x = x.unsqueeze(1)  # 恢复通道维度 (B, H, W) -> (B, 1, H, W) # 与上一行对立，如果你要用小模型就注释这一行，恢复上一行
+            x = x.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+            # 可选: stride=1 max_pool 膨胀障碍物，类似 C-space expansion。
+            # 默认禁用；仅在擦碰问题严重时通过 --depth_dilate 5 开启。
+            # if args.depth_dilate > 1:
+            #     pad = args.depth_dilate // 2
+            #     x = F.max_pool2d(x, kernel_size=args.depth_dilate, stride=1, padding=pad)
 
             # 模型推理
             act_raw, _, h = self.model(x, state, h)
+            
+            # Truncated BPTT: 每 30 步截断 GRU 梯度，避免 150 步全序列反向传播占满显存
+            if t > 0 and t % 30 == 0:
+                h = h.detach()
             
             act_reshaped = act_raw.reshape(B, 3, 2)  # 关键修复！直接 reshape 为 (B, 3, 2)
             act_world = R_local @ act_reshaped  # 转换到世界坐标系 (B, 3, 2)
@@ -525,7 +555,12 @@ class DroneTrainer:
             metrics['max_speed'] = speed_history.max(0).values.mean()
             metrics['ar'] = (success.float() * avg_speed).mean()  # 成功率 × 平均速度
         
-        return loss, metrics, (p_history, v_history, act_buffer_stacked, vid)
+        # 非保存迭代时 detach debug_data，避免计算图被引用残留到下一轮
+        debug_out = (
+            p_history.detach(), v_history.detach(),
+            act_buffer_stacked.detach(), vid
+        )
+        return loss, metrics, debug_out
     
     def train(self):
         """主训练循环"""
@@ -544,13 +579,16 @@ class DroneTrainer:
                     break
                 
                 # 反向传播
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
                 self.scheduler.step()
             except torch.cuda.OutOfMemoryError:
-                # 渲染 / knn / backward 等任意环节 OOM → 放弃本轮，清理后继续
-                # 仅在 OOM 时调用 empty_cache；正常流程不调，让缓存池高效复用
+                # OOM 时 Python traceback 会持有 run_episode 内所有局部变量的引用
+                # （包括计算图、历史 tensor 等），必须先 gc.collect() 打断引用链
+                self.optimizer.zero_grad(set_to_none=True)  # 释放残留梯度显存
+                gc.collect()
                 torch.cuda.empty_cache()
                 print(f"\n[OOM] iter {i}: episode OOM, skipping")
                 continue
@@ -612,7 +650,7 @@ class DroneTrainer:
         
         # 位置历史图
         fig_p, ax = plt.subplots()
-        p_cpu = p_history[:, 4].cpu().detach()
+        p_cpu = p_history[:, 4].detach().cpu()
         ax.plot(p_cpu[:, 0], label='x')
         ax.plot(p_cpu[:, 1], label='y')
         ax.plot(p_cpu[:, 2], label='z')
@@ -621,7 +659,7 @@ class DroneTrainer:
         
         # 速度历史图
         fig_v, ax = plt.subplots()
-        v_cpu = v_history[:, 4].cpu().detach()
+        v_cpu = v_history[:, 4].detach().cpu()
         ax.plot(v_cpu[:, 0], label='x')
         ax.plot(v_cpu[:, 1], label='y')
         ax.plot(v_cpu[:, 2], label='z')
@@ -630,7 +668,7 @@ class DroneTrainer:
         
         # 动作历史图
         fig_a, ax = plt.subplots()
-        act_cpu = act_buffer[:, 4].cpu().detach()
+        act_cpu = act_buffer[:, 4].detach().cpu()
         ax.plot(act_cpu[:, 0], label='x')
         ax.plot(act_cpu[:, 1], label='y')
         ax.plot(act_cpu[:, 2], label='z')
