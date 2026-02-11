@@ -78,7 +78,7 @@ def parse_args():
     # 场景随机化参数
     parser.add_argument('--random_scene', action='store_true', default=False,
                         help='启用随机场景生成 (每 episode 随机组合障碍物)')
-    parser.add_argument('--num_obstacles_min', type=int, default=30, help='每场景最少障碍物数')
+    parser.add_argument('--num_obstacles_min', type=int, default=40, help='每场景最少障碍物数')
     parser.add_argument('--num_obstacles_max', type=int, default=80, help='每场景最多障碍物数')
     parser.add_argument('--obstacle_scale_min', type=float, default=0.3, help='障碍物最小缩放')
     parser.add_argument('--obstacle_scale_max', type=float, default=1.5, help='障碍物最大缩放')
@@ -99,8 +99,8 @@ def parse_args():
                         help='出生/目标点最大高度（防止飞高规避）')
     
     # 环境参数 - 无人机物理
-    parser.add_argument('--margin_min', type=float, default=0.1, help='无人机安全半径最小值')
-    parser.add_argument('--margin_max', type=float, default=0.3, help='无人机安全半径最大值')
+    parser.add_argument('--margin_min', type=float, default=0.3, help='无人机安全半径最小值')
+    parser.add_argument('--margin_max', type=float, default=0.8, help='无人机安全半径最大值')
     parser.add_argument('--init_p_range', type=float, default=8.0, help='初始位置范围')
     parser.add_argument('--noise_std', type=float, default=0.04, help='环境扰动噪声标准差')
     parser.add_argument('--yaw_inertia', type=float, default=5.0, help='偏航惯性')

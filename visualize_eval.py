@@ -144,7 +144,7 @@ def parse_args():
     # 无人机物理（与训练保持一致）
     parser.add_argument('--init_p_range', type=float, default=6.0,
                         help='初始位置范围')
-    parser.add_argument('--margin_min', type=float, default=0.1,
+    parser.add_argument('--margin_min', type=float, default=0.3,
                         help='无人机安全半径最小值')
     parser.add_argument('--margin_max', type=float, default=0.7,
                         help='无人机安全半径最大值')
