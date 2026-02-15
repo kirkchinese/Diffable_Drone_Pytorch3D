@@ -32,6 +32,10 @@ class DroneLoss:
                  coef_d_snap=0.0,
                  coef_ground_affinity=0.0,
                  coef_bias=0.0,
+                 coef_stall=0.0,
+                 coef_yaw_explore=0.0,
+                 coef_progress=0.0,
+                 yaw_penalty_start_rad=0.5,
                  ctl_dt=0.02,
                  window_size=30):
         """
@@ -48,6 +52,14 @@ class DroneLoss:
             coef_d_snap (float): 快照（snap）平滑损失权重。
             coef_ground_affinity (float): 地面亲和损失权重。
             coef_bias (float): 偏向损失权重。
+            coef_stall (float): 停滞惩罚权重。惩罚速度过低以打破
+                "正对障碍物原地不动"的局部极小值。
+            coef_yaw_explore (float): 偏航探索损失权重。结合速度与偏航角的复合损失：
+                - 低速时小角度偏航提供负损失（奖励探索），超过阈值变为惩罚
+                - 高速时任何偏航都为惩罚（抑制危险转向）            coef_progress (float): 路径进度损失权重。奖励任何缩短与目标距离的运动，
+                允许模型绕行而不被强制沿直线飞行。负梯度鼓励模型在面对障碍物时
+                选择绕行路径而非原地停滞。            yaw_penalty_start_rad (float): 偏航探索损失中“开始由奖励转惩罚”的角度阈值（弧度）。
+                即 |yaw| < alpha 时为奖励区间，|yaw| > alpha 时为惩罚区间。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
         """
@@ -61,10 +73,14 @@ class DroneLoss:
             'd_jerk': coef_d_jerk,
             'd_snap': coef_d_snap,
             'ground_affinity': coef_ground_affinity,
-            'bias': coef_bias
+            'bias': coef_bias,
+            'stall': coef_stall,
+            'yaw_explore': coef_yaw_explore,
+            'progress': coef_progress
         }
         self.ctl_dt = ctl_dt
         self.window_size = window_size
+        self.yaw_penalty_start_rad = max(float(yaw_penalty_start_rad), 1e-6)
 
     def barrier(self, x: torch.Tensor, v_to_pt: torch.Tensor) -> torch.Tensor:
         """
@@ -89,7 +105,9 @@ class DroneLoss:
                 vec_to_obj_history,
                 v_preds,
                 env_margin,
-                env_g_std=None):
+                env_g_std=None,
+                yaw_history=None,
+                p_target=None):
         """
         计算总损失和各项指标。
 
@@ -216,6 +234,59 @@ class DroneLoss:
         loss_speed = F.smooth_l1_loss(fwd_v, target_v_norm)
         metrics['loss_speed'] = loss_speed
 
+        # 停滞惩罚: 当速度低于 0.3 m/s 时产生递增惩罚
+        # 打破"正对障碍物原地不动"的局部极小值
+        # 使用 softplus 实现平滑阈值: speed ↑ → penalty ↓
+        speed = v_history.norm(2, -1)  # (T, B)
+        # softplus(-k*(speed - threshold)) 在 speed < threshold 时产生惩罚
+        loss_stall = F.softplus(-10.0 * (speed - 0.3)).mean()
+        metrics['loss_stall'] = loss_stall
+
+        # 路径进度损失: 奖励任何缩短与目标点距离的运动
+        # p_target: (B, 3) 目标位置
+        if p_target is not None and self.coefs.get('progress', 0.0) > 0:
+            # dist_to_target: (T, B) 每个时刻到目标的距离
+            dist_to_target = (p_target.unsqueeze(0) - p_history).norm(2, -1)
+            # step_progress: (T-1, B) 正值 = 靠近目标
+            step_progress = -torch.diff(dist_to_target, dim=0)
+            # loss = 负的平均进度 → 最小化 loss = 最大化进度
+            loss_progress = -step_progress.mean()
+        else:
+            loss_progress = torch.tensor(0.0, device=p_history.device)
+        metrics['loss_progress'] = loss_progress
+
+        # 偏航探索损失: 速度门控的奖励-惩罚复合项
+        # yaw_history: (T, B) 累积偏航偏移角 (弧度)
+        if yaw_history is not None:
+            # 使用平滑绝对值 sqrt(y² + ε²) 代替 abs(y)
+            # 原因: abs(0) 的子梯度为 0，导致 y≈0 时无梯度信号（死区）
+            # 平滑版本在 y≈0 附近提供强梯度: ∂/∂y ≈ y(2 - α/ε)，驱动探索启动
+            eps_sq = 0.01 ** 2  # ε = 0.01
+            smooth_abs_yaw = (yaw_history.pow(2) + eps_sq).sqrt()  # (T, B)
+            
+            # ------ 偏航形状函数 ------
+            # f(y) = y² - α·smooth_abs(y)
+            # 等价于 smooth_abs · (smooth_abs - α)，但数值更稳定
+            # |y| < α: 负值 (奖励探索), |y| > α: 正值 (惩罚过度旋转)
+            # α 默认为 0.5 rad ≈ 29°, 最大奖励在 α/2
+            alpha = self.yaw_penalty_start_rad
+            yaw_reward = yaw_history.pow(2) - alpha * smooth_abs_yaw  # (T, B)
+            
+            # ------ 速度门控 ------
+            # 低速 (< 1 m/s): gate ≈ 1 → 使用 yaw_reward (含负值奖励)
+            # 高速 (> 1 m/s): gate ≈ 0 → 使用纯二次惩罚
+            speed = v_history.norm(2, -1)  # (T, B)
+            speed_gate = torch.sigmoid(-5.0 * (speed - 1.0))
+            
+            # ------ 混合 ------
+            # 低速: loss = yaw_reward (小角度负值奖励，大角度正值惩罚)
+            # 高速: loss = y² (任何偏航都惩罚)
+            yaw_penalty = yaw_history.pow(2)
+            loss_yaw_explore = (speed_gate * yaw_reward + (1 - speed_gate) * yaw_penalty).mean()
+        else:
+            loss_yaw_explore = torch.tensor(0.0, device=p_history.device)
+        metrics['loss_yaw_explore'] = loss_yaw_explore
+
         # 总损失
         total_loss = (
             self.coefs['v'] * loss_v +
@@ -227,7 +298,10 @@ class DroneLoss:
             self.coefs['d_jerk'] * loss_d_jerk +
             self.coefs['d_snap'] * loss_d_snap +
             self.coefs['ground_affinity'] * loss_ground_affinity +
-            self.coefs['bias'] * loss_bias
+            self.coefs['bias'] * loss_bias +
+            self.coefs['stall'] * loss_stall +
+            self.coefs['yaw_explore'] * loss_yaw_explore +
+            self.coefs['progress'] * loss_progress
         )
 
         # 附加指标

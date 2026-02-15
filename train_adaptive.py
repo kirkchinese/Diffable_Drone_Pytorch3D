@@ -45,13 +45,18 @@ def parse_args():
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
     parser.add_argument('--coef_speed', type=float, default=0.0, help='速度损失权重 (legacy)')
     parser.add_argument('--coef_v_pred', type=float, default=2.0, help='速度预测损失权重')
-    parser.add_argument('--coef_collide', type=float, default=2.0, help='碰撞损失权重')
-    parser.add_argument('--coef_obj_avoidance', type=float, default=1.5, help='障碍物回避损失权重')
+    parser.add_argument('--coef_collide', type=float, default=5.0,
+                        help='碰撞损失权重 (参考项目单机配置=7.5, 多机=5.0)')
+    parser.add_argument('--coef_obj_avoidance', type=float, default=3.0,
+                        help='障碍物回避损失权重 (参考项目单机配置=3.0, 多机=2.0)')
     parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重')
     parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加加速度正则化权重')
     parser.add_argument('--coef_d_snap', type=float, default=0.0, help='snap正则化权重 (legacy)')
     parser.add_argument('--coef_ground_affinity', type=float, default=0.1, help='高度惩罚损失权重 (防止飞高规避)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
+    parser.add_argument('--coef_stall', type=float, default=0.5,
+                        help='停滞惩罚权重，惩罚速度低于 0.3m/s 的状态。'
+                             '打破正对障碍物时"原地不动"的局部极小值')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     
     # 环境参数 - 渲染
@@ -246,6 +251,7 @@ class DroneTrainer:
             coef_d_snap=args.coef_d_snap,
             coef_ground_affinity=args.coef_ground_affinity,
             coef_bias=args.coef_bias,
+            coef_stall=getattr(args, 'coef_stall', 0.0),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )

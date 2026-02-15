@@ -60,7 +60,7 @@ except ImportError:
     HAS_IMAGEIO = False
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger
+from model import Model, Model_bigger, Model_bigger_yaw
 from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
 
 
@@ -160,6 +160,8 @@ def parse_args():
     # 模型参数
     parser.add_argument('--no_odom', action='store_true', default=False,
                         help='不使用里程计速度作为输入')
+    parser.add_argument('--enable_yaw_control', action='store_true', default=False,
+                        help='启用模型自主偏航控制 (需与训练时的 --enable_yaw_control 一致)')
 
     # 目标点设置
     parser.add_argument('--max_speed', type=float, default=2.5,
@@ -320,9 +322,29 @@ class EvalRunner:
             hfov_deg=args.viz_fov,
         )
 
-        # ---------- 模型 ----------
-        dim_obs = 7 if args.no_odom else 10
-        self.model = Model_bigger(dim_obs=dim_obs, dim_action=6).to(self.device)
+        # ---------- 模型 (自动检测是否支持偏航控制) ----------
+        yaw_control_flag = getattr(args, 'enable_yaw_control', False)
+        # 从 checkpoint 中自动检测是否为 yaw 模型
+        ckpt_state = torch.load(args.checkpoint, map_location=self.device, weights_only=True)
+        ckpt_has_yaw = any('fc_yaw' in k for k in ckpt_state.keys())
+        if yaw_control_flag and not ckpt_has_yaw:
+            print(f"[WARNING] --enable_yaw_control 已指定, 但 checkpoint 中未检测到 fc_yaw 层")
+            print(f"[WARNING] 这是一个旧版模型, 将自动禁用偏航控制可视化")
+            yaw_control_flag = False
+        elif not yaw_control_flag and ckpt_has_yaw:
+            print(f"[AutoDetect] checkpoint 中检测到 fc_yaw 层, 自动启用偏航控制")
+            yaw_control_flag = True
+        self.yaw_control = yaw_control_flag
+
+        obs_extra = 1 if self.yaw_control else 0
+        dim_obs = (7 if args.no_odom else 10) + obs_extra
+        if self.yaw_control:
+            self.model = Model_bigger_yaw(dim_obs=dim_obs, dim_action=6).to(self.device)
+            print(f"[YawControl] 已启用模型自主偏航控制, dim_obs={dim_obs}")
+        else:
+            self.model = Model_bigger(dim_obs=dim_obs, dim_action=6).to(self.device)
+            if not ckpt_has_yaw:
+                print(f"[Info] 旧版模型 (无偏航控制头), 偏航偏移量将不会显示")
         self._load_checkpoint(args.checkpoint)
         self.model.eval()
 
@@ -331,6 +353,17 @@ class EvalRunner:
 
     def _load_checkpoint(self, path):
         state_dict = torch.load(path, map_location=self.device, weights_only=True)
+        # 处理维度不匹配的层（跨架构热启动）
+        model_state = self.model.state_dict()
+        for key in list(state_dict.keys()):
+            if key in model_state and state_dict[key].shape != model_state[key].shape:
+                old_shape = state_dict[key].shape
+                new_shape = model_state[key].shape
+                print(f"[HotStart] {key}: {old_shape} → {new_shape}, 零填充新增维度")
+                new_param = model_state[key].clone()
+                slices = tuple(slice(0, min(o, n)) for o, n in zip(old_shape, new_shape))
+                new_param[slices] = state_dict[key][slices]
+                state_dict[key] = new_param
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"[WARNING] Missing keys: {missing}")
@@ -403,6 +436,10 @@ class EvalRunner:
         thr_est_error = torch.ones((B, 1), device=self.device)  # 评估时不加推力噪声
         cam_pitch = torch.full((B,), args.cam_angle, device=self.device, dtype=torch.float32)
 
+        # 偏航控制状态
+        yaw_control = self.yaw_control
+        yaw_offset = torch.zeros(B, device=self.device)
+
         # 动作延迟缓冲
         act_lag = 1
         act_buffer = [self.env.act_curr.clone() for _ in range(act_lag + 1)]
@@ -424,6 +461,8 @@ class EvalRunner:
             'depth_frames': [],   # list of (B, H, W) float numpy  (广角可视化)
             'model_depth_frames': [], # list of (B, H, W) float numpy (模型输入)
             'collision': [],      # (T, B) bool
+            'yaw_offset': [],     # (T, B)     偏航累积偏移 (弧度, 仅 yaw_control)
+            'yaw_rate': [],       # (T, B)     偏航角速度 (rad/s, 仅 yaw_control)
             'margin': self.env.margin.cpu().numpy().copy(),  # (B,)
             'p_start': self.env.p.clone().cpu().numpy(),
             'p_target': p_target.clone().cpu().numpy(),
@@ -480,8 +519,19 @@ class EvalRunner:
                 target_v_raw.norm(2, -1).cpu().numpy().copy()
             )
 
+            # ---------- 偏航控制: 旋转目标方向 ----------
+            if yaw_control and yaw_offset is not None:
+                cos_y = torch.cos(yaw_offset)
+                sin_y = torch.sin(yaw_offset)
+                tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+                rotated_x = cos_y * tx - sin_y * ty
+                rotated_y = sin_y * tx + cos_y * ty
+                heading_vector = torch.stack([rotated_x, rotated_y, target_v_raw[:, 2]], dim=-1)
+            else:
+                heading_vector = target_v_raw
+
             # ---------- 执行动作 ----------
-            self.env.step(act_cmd=act_buffer[t], target_pos_vector=target_v_raw, dt=current_dt)
+            self.env.step(act_cmd=act_buffer[t], target_pos_vector=heading_vector, dt=current_dt)
 
             # ---------- 模型推理 ----------
             R_local = self._compute_local_R()
@@ -499,16 +549,29 @@ class EvalRunner:
             ]
             if not args.no_odom:
                 state_parts.insert(0, local_v)
+            if yaw_control and yaw_offset is not None:
+                state_parts.append(yaw_offset[:, None])
             state = torch.cat(state_parts, dim=-1)
 
             # 深度图预处理（与 train.py 完全一致）
-            bg_mask = (depth_lo < 0)
+            bg_mask = (depth_lo < 0) | (depth_lo > args.depth_max)
             x = depth_lo.clamp(args.depth_min, args.depth_max)
             x = 3.0 / x - 0.6
             x[bg_mask] = 0.0
             x = x.unsqueeze(1)  # (B, 1, H, W)
 
-            act_raw, _, h = self.model(x, state, h)
+            act_raw, yaw_rate_raw, h = self.model(x, state, h)
+
+            # 偏航控制: 累积 yaw_rate
+            if yaw_control and yaw_rate_raw is not None:
+                yaw_rate = torch.tanh(yaw_rate_raw) * 1.0
+                yaw_offset = yaw_offset + yaw_rate * current_dt
+                yaw_offset = torch.remainder(yaw_offset + math.pi, 2 * math.pi) - math.pi
+                rec['yaw_offset'].append(yaw_offset.cpu().numpy().copy())
+                rec['yaw_rate'].append(yaw_rate.cpu().numpy().copy())
+            else:
+                rec['yaw_offset'].append(np.zeros(B))
+                rec['yaw_rate'].append(np.zeros(B))
 
             act_reshaped = act_raw.reshape(B, 3, 2)
             act_world = R_local @ act_reshaped
@@ -521,7 +584,8 @@ class EvalRunner:
 
         # 堆叠
         for key in ['p', 'v', 'a', 'speed', 'dist_to_obs', 'dist_to_target',
-                    'target_v', 'heading', 'attitude_z', 'depth_valid_pct', 'collision']:
+                    'target_v', 'heading', 'attitude_z', 'depth_valid_pct', 'collision',
+                    'yaw_offset', 'yaw_rate']:
             rec[key] = np.stack(rec[key], axis=0)
 
         # 打印 episode 摘要
@@ -531,9 +595,11 @@ class EvalRunner:
             min_d = float(rec['dist_to_obs'][:, b].min())
             final_d = float(rec['dist_to_target'][-1, b])
             avg_depth = float(rec['depth_valid_pct'][:, b].mean())
+            max_yaw = float(np.abs(rec['yaw_offset'][:, b]).max())
             print(f"  [Ep{episode_idx} B{b}] Collisions={n_coll}/{args.timesteps} | "
                   f"Avg Speed={avg_spd:.2f} m/s | Min Dist={min_d:.3f} m | "
-                  f"Final->Target={final_d:.2f} m | Avg Depth Valid={avg_depth:.1f}%")
+                  f"Final->Target={final_d:.2f} m | Avg Depth Valid={avg_depth:.1f}%"
+                  f" | Max |yaw|={np.degrees(max_yaw):.1f}°")
 
         return rec
 
@@ -558,8 +624,8 @@ class EvalRunner:
         T = p.shape[0]
         t_axis = np.arange(T) * self.ctl_dt
 
-        fig = plt.figure(figsize=(24, 20))
-        gs = GridSpec(4, 3, figure=fig, hspace=0.35, wspace=0.30)
+        fig = plt.figure(figsize=(24, 24))
+        gs = GridSpec(5, 3, figure=fig, hspace=0.35, wspace=0.30)
 
         # ---- 3D 轨迹 (大图) ----
         ax3d = fig.add_subplot(gs[0:2, 0:2], projection='3d')
@@ -678,6 +744,45 @@ class EvalRunner:
         ax_dpct.set_title(_L('深度图有效像素占比', 'Depth Valid Pixel %'))
         ax_dpct.set_ylim(bottom=0)
         ax_dpct.grid(True, alpha=0.3)
+
+        # ---- Row 5: Yaw offset & rate ----
+        yaw_off = rec['yaw_offset'][:, sample_idx]   # (T,) rad
+        yaw_rt  = rec['yaw_rate'][:, sample_idx]     # (T,) rad/s
+        has_yaw = np.any(np.abs(yaw_off) > 1e-6) or np.any(np.abs(yaw_rt) > 1e-6)
+
+        ax_yaw = fig.add_subplot(gs[4, 0])
+        ax_yaw.plot(t_axis, np.degrees(yaw_off), 'b-', linewidth=1.2, label=_L('偏航偏移', 'Yaw Offset'))
+        ax_yaw.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+        # 标注探索奖励区 (±29°)
+        ax_yaw.axhline(y=28.6, color='g', linestyle='--', alpha=0.3, label='±α (29°)')
+        ax_yaw.axhline(y=-28.6, color='g', linestyle='--', alpha=0.3)
+        ax_yaw.fill_between(t_axis, -28.6, 28.6, alpha=0.05, color='green')
+        ax_yaw.set_xlabel(_L('时间 (s)', 'Time (s)'))
+        ax_yaw.set_ylabel(_L('角度 (°)', 'Angle (°)'))
+        ax_yaw.set_title(_L('偏航累积偏移', 'Yaw Offset') + (' [活跃]' if has_yaw else ' [未启用]'))
+        ax_yaw.legend(fontsize=8)
+        ax_yaw.grid(True, alpha=0.3)
+
+        ax_yr = fig.add_subplot(gs[4, 1])
+        ax_yr.plot(t_axis, np.degrees(yaw_rt), 'r-', linewidth=0.8, label=_L('偏航角速度', 'Yaw Rate'))
+        ax_yr.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+        ax_yr.set_xlabel(_L('时间 (s)', 'Time (s)'))
+        ax_yr.set_ylabel(_L('角速度 (°/s)', 'Rate (°/s)'))
+        ax_yr.set_title(_L('偏航角速度', 'Yaw Rate'))
+        ax_yr.legend(fontsize=8)
+        ax_yr.grid(True, alpha=0.3)
+
+        # 偏航 vs 速度关系图（与损失函数设计对应）
+        ax_yv = fig.add_subplot(gs[4, 2])
+        ax_yv.scatter(speed, np.abs(np.degrees(yaw_off)), c=t_axis, cmap='viridis',
+                      s=8, alpha=0.6)
+        ax_yv.axvline(x=1.0, color='orange', linestyle='--', alpha=0.5,
+                       label=_L('速度门控阈值', 'Speed gate (1 m/s)'))
+        ax_yv.set_xlabel(_L('速度 (m/s)', 'Speed (m/s)'))
+        ax_yv.set_ylabel(_L('|偏航| (°)', '|Yaw| (°)'))
+        ax_yv.set_title(_L('偏航 vs 速度', 'Yaw vs Speed'))
+        ax_yv.legend(fontsize=8)
+        ax_yv.grid(True, alpha=0.3)
 
         # ---- Summary ----
         n_collisions = int(coll_mask.sum())
@@ -804,15 +909,59 @@ class EvalRunner:
         p_target = rec['p_target'][sample_idx]
         p_start = rec['p_start'][sample_idx]
         all_p = rec['p'][:, sample_idx]  # (T, 3)
+        all_yaw_offset = rec['yaw_offset'][:, sample_idx]  # (T,) rad
+        all_yaw_rate = rec['yaw_rate'][:, sample_idx]      # (T,) rad/s
+        yaw_control_active = np.any(np.abs(all_yaw_offset) > 1e-6) or np.any(np.abs(all_yaw_rate) > 1e-6)
 
         for t in range(T):
             fig = plt.figure(figsize=(16, 10))
             gs = GridSpec(2, 2, figure=fig, hspace=0.25, wspace=0.20)
 
-            # ---- Top-left: RGB ----
+            # ---- Top-left: RGB + Yaw HUD overlay ----
             ax_rgb = fig.add_subplot(gs[0, 0])
-            rgb = rec['rgb_frames'][t][sample_idx]
+            rgb = rec['rgb_frames'][t][sample_idx].copy()
             ax_rgb.imshow(rgb)
+            # Yaw offset HUD: 在 RGB 帧上绘制半透明偏航指示器
+            yaw_off_t = all_yaw_offset[t]
+            yaw_deg_t = np.degrees(yaw_off_t)
+            if yaw_control_active:
+                # 在图像右上角绘制偏航罗盘（compass）
+                img_h, img_w = rgb.shape[:2]
+                cx_frac, cy_frac = 0.88, 0.18  # 右上角 (axes 坐标)
+                r_frac = 0.12  # 半径（相对 axes）
+                # 画圆环背景
+                compass_circle = plt.Circle((cx_frac, 1.0 - cy_frac), r_frac,
+                    transform=ax_rgb.transAxes, fill=True,
+                    facecolor='black', edgecolor='white', alpha=0.55, linewidth=1.5, zorder=10)
+                ax_rgb.add_patch(compass_circle)
+                # 零位参考线 (上方竖线 = 0°)
+                ax_rgb.plot([cx_frac, cx_frac],
+                    [1.0 - cy_frac, 1.0 - cy_frac + r_frac * 0.85],
+                    color='gray', linewidth=1, alpha=0.6,
+                    transform=ax_rgb.transAxes, zorder=11)
+                # 偏航指针 (从圆心指向偏航方向)
+                needle_x = cx_frac + r_frac * 0.8 * np.sin(yaw_off_t)
+                needle_y = (1.0 - cy_frac) + r_frac * 0.8 * np.cos(yaw_off_t)
+                arrow_color = '#FF4444' if abs(yaw_deg_t) > 30 else ('#FFAA00' if abs(yaw_deg_t) > 15 else '#44FF44')
+                ax_rgb.annotate('', xy=(needle_x, needle_y),
+                    xytext=(cx_frac, 1.0 - cy_frac),
+                    arrowprops=dict(arrowstyle='->', color=arrow_color, lw=2.5),
+                    transform=ax_rgb.transAxes, zorder=12)
+                # 偏航角度文字
+                ax_rgb.text(cx_frac, 1.0 - cy_frac - r_frac - 0.03,
+                    f'YAW {yaw_deg_t:+.1f}°',
+                    transform=ax_rgb.transAxes, fontsize=9, fontweight='bold',
+                    ha='center', va='top', color=arrow_color,
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6),
+                    zorder=12)
+            else:
+                # 旧模型无偏航控制，在右上角显示提示
+                ax_rgb.text(0.88, 0.92,
+                    'YAW N/A',
+                    transform=ax_rgb.transAxes, fontsize=8, fontweight='bold',
+                    ha='center', va='top', color='#888888',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.4),
+                    zorder=12)
             ax_rgb.set_title('RGB (Wide-Angle FPV)', fontsize=11)
             ax_rgb.axis('off')
 
@@ -842,11 +991,37 @@ class EvalRunner:
             p_t = all_p[t]
             ax_traj.scatter(p_t[0], p_t[1], c='blue', s=60, marker='o',
                            zorder=6, edgecolors='k')
-            # Heading arrow
+            # Heading arrow (机体朝向)
             hdg = rec['heading'][t, sample_idx]
             ax_traj.annotate('', xy=(p_t[0] + hdg[0]*0.8, p_t[1] + hdg[1]*0.8),
                             xytext=(p_t[0], p_t[1]),
                             arrowprops=dict(arrowstyle='->', color='orange', lw=2))
+            # Yaw-adjusted target direction arrow (偏航偏移后的感知目标方向)
+            if yaw_control_active:
+                yaw_t = all_yaw_offset[t]
+                raw_dir = p_target[:2] - p_t[:2]  # XY 方向
+                raw_len = np.linalg.norm(raw_dir)
+                if raw_len > 0.1:
+                    raw_unit = raw_dir / raw_len
+                    # 旋转 raw_unit 以显示 yaw offset 后的感知方向
+                    cos_y = np.cos(yaw_t)
+                    sin_y = np.sin(yaw_t)
+                    rotated_unit = np.array([
+                        cos_y * raw_unit[0] - sin_y * raw_unit[1],
+                        sin_y * raw_unit[0] + cos_y * raw_unit[1],
+                    ])
+                    arrow_len = min(1.5, raw_len * 0.3)
+                    # 实际目标方向 (绿色虚线)
+                    ax_traj.annotate('', xy=(p_t[0] + raw_unit[0]*arrow_len,
+                                            p_t[1] + raw_unit[1]*arrow_len),
+                                    xytext=(p_t[0], p_t[1]),
+                                    arrowprops=dict(arrowstyle='->', color='limegreen',
+                                                    lw=1.5, linestyle='--'))
+                    # 偏航旋转后的感知方向 (洋红色实线)
+                    ax_traj.annotate('', xy=(p_t[0] + rotated_unit[0]*arrow_len,
+                                            p_t[1] + rotated_unit[1]*arrow_len),
+                                    xytext=(p_t[0], p_t[1]),
+                                    arrowprops=dict(arrowstyle='->', color='magenta', lw=2))
             # Collision markers
             coll_so_far = rec['collision'][:t+1, sample_idx].astype(bool)
             if coll_so_far.any():
@@ -862,7 +1037,18 @@ class EvalRunner:
             ax_traj.set_xlabel('X (m)')
             ax_traj.set_ylabel('Y (m)')
             ax_traj.set_title('Top-Down Trajectory (XY)', fontsize=11)
-            ax_traj.legend(fontsize=8, loc='upper left')
+            if yaw_control_active:
+                # 在轨迹图添加箭头图例说明
+                from matplotlib.lines import Line2D
+                custom_handles = [
+                    Line2D([0], [0], color='orange', lw=2, label='Heading'),
+                    Line2D([0], [0], color='limegreen', lw=1.5, linestyle='--', label='To Target'),
+                    Line2D([0], [0], color='magenta', lw=2, label='Yaw-Rotated'),
+                ]
+                ax_traj.legend(handles=ax_traj.get_legend_handles_labels()[0] + custom_handles,
+                              fontsize=7, loc='upper left')
+            else:
+                ax_traj.legend(fontsize=8, loc='upper left')
             ax_traj.grid(True, alpha=0.3)
 
             # ---- Bottom-right: Detailed status panel ----
@@ -880,6 +1066,10 @@ class EvalRunner:
             init_d2t = float(np.linalg.norm(p_start - p_target))
             progress = max(0, (1.0 - d2t / max(init_d2t, 0.01))) * 100
             total_coll = int(rec['collision'][:t+1, sample_idx].sum())
+
+            # 偏航控制状态
+            yaw_off_deg = np.degrees(all_yaw_offset[t])
+            yaw_rate_deg = np.degrees(all_yaw_rate[t])
 
             info_lines = [
                 f"Step: {t}/{T}    Time: {t * self.ctl_dt:.2f} s",
@@ -905,6 +1095,14 @@ class EvalRunner:
                 f"  ATTITUDE",
                 f"    Heading: ({hdg[0]:+.2f}, {hdg[1]:+.2f}, {hdg[2]:+.2f})",
                 f"    Tilt Z:  ({att_z[0]:+.2f}, {att_z[1]:+.2f}, {att_z[2]:+.2f})",
+                f"  YAW CONTROL {'[ACTIVE]' if yaw_control_active else '[N/A 旧模型]'}",
+                *([
+                    f"    Offset:  {yaw_off_deg:+7.2f}°",
+                    f"    Rate:    {yaw_rate_deg:+7.2f}°/s",
+                    f"    |Offset|: {'▓' * min(int(abs(yaw_off_deg) / 3), 20)}{'░' * max(0, 20 - min(int(abs(yaw_off_deg) / 3), 20))} {abs(yaw_off_deg):.1f}°",
+                ] if yaw_control_active else [
+                    f"    (此模型无偏航控制头)",
+                ]),
                 f"  SENSOR",
                 f"    Depth Valid: {depth_pct:.1f}%",
             ]
@@ -918,9 +1116,11 @@ class EvalRunner:
                         bbox=dict(boxstyle='round,pad=0.4', facecolor=facecolor, alpha=0.9))
             ax_info.set_title('Flight Status', fontsize=11)
 
+            yaw_title = f' | Yaw {np.degrees(all_yaw_offset[t]):+.1f}°' if yaw_control_active else ''
             fig.suptitle(
                 f'Episode {episode_idx} | Step {t}/{T} | '
-                f'Speed {spd:.2f} m/s | Obs {dst:.2f} m | Target {d2t:.1f} m',
+                f'Speed {spd:.2f} m/s | Obs {dst:.2f} m | Target {d2t:.1f} m'
+                f'{yaw_title}',
                 fontsize=12, y=0.99
             )
             fig.subplots_adjust(top=0.95, bottom=0.05, left=0.04, right=0.98)

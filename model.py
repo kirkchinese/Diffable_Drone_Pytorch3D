@@ -68,6 +68,60 @@ class Model_bigger(nn.Module):
         return act, None, hx
 
 
+class Model_bigger_yaw(nn.Module):
+    """
+    带偏航控制的无人机模型。
+    
+    在 Model_bigger 基础上增加独立的偏航角速度输出头 (1维)。
+    主动作头输出 dim_action 维 (加速度+速度预测)，偏航头独立输出 1 维 yaw_rate。
+    分离设计使得偏航头可以用更小的初始权重，避免干扰已有的飞行控制。
+    
+    支持从 Model_bigger checkpoint 热启动：fc_yaw 是新层，其余层权重兼容。
+    """
+    def __init__(self, dim_obs=9, dim_action=6) -> None:
+        super().__init__()
+        # 与 Model_bigger 完全相同的骨干网络
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, 2, 1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(32, 64, 3, 2, 1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(128, 256, 3, 2, 1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Flatten(),
+            nn.Linear(256*3*4, 256, bias=False),
+        )
+        self.v_proj = nn.Linear(dim_obs, 256)
+        self.v_proj.weight.data.mul_(0.5)
+
+        self.gru = nn.GRUCell(256, 256)
+        
+        # 主动作头：加速度 + 速度预测 (与 Model_bigger 相同)
+        self.fc = nn.Linear(256, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        
+        # 偏航头：输出 yaw_rate (标量)，独立于飞行动作
+        # 更小的初始权重 (0.001)：训练初期偏航偏移≈0，行为与无偏航版本一致
+        self.fc_yaw = nn.Linear(256, 1, bias=False)
+        self.fc_yaw.weight.data.mul_(0.001)
+        
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x: torch.Tensor, v, hx=None):
+        img_feat = self.stem(x)
+        x = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(x, hx)
+        features = self.act(hx)
+        act = self.fc(features)
+        yaw_rate = self.fc_yaw(features).squeeze(-1)  # (B,)
+        return act, yaw_rate, hx
+
+
 class Model_adaptive(nn.Module):
     """
     自适应分辨率模型 - 可接受任意大小的深度图输入

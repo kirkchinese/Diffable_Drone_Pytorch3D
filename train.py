@@ -21,7 +21,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger
+from model import Model, Model_bigger, Model_bigger_yaw
 from loss import DroneLoss
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
@@ -45,13 +45,18 @@ def parse_args():
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
     parser.add_argument('--coef_speed', type=float, default=0.0, help='速度损失权重 (legacy)')
     parser.add_argument('--coef_v_pred', type=float, default=2.0, help='速度预测损失权重')
-    parser.add_argument('--coef_collide', type=float, default=2.0, help='碰撞损失权重')
-    parser.add_argument('--coef_obj_avoidance', type=float, default=1.5, help='障碍物回避损失权重')
+    parser.add_argument('--coef_collide', type=float, default=5.0,
+                        help='碰撞损失权重 (参考项目单机配置=7.5, 多机=5.0)')
+    parser.add_argument('--coef_obj_avoidance', type=float, default=3.0,
+                        help='障碍物回避损失权重 (参考项目单机配置=3.0, 多机=2.0)')
     parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重')
     parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加加速度正则化权重')
     parser.add_argument('--coef_d_snap', type=float, default=0.0, help='snap正则化权重 (legacy)')
     parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度惩罚损失权重 (防止飞高规避)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
+    parser.add_argument('--coef_stall', type=float, default=0.0,
+                        help='停滞惩罚权重，惩罚速度低于 0.3m/s 的状态。'
+                             '打破正对障碍物时"原地不动"的局部极小值，实测是劣化项')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     
     # 环境参数 - 渲染
@@ -113,6 +118,17 @@ def parse_args():
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
     parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
+    parser.add_argument('--enable_yaw_control', default=False, action='store_true',
+                        help='启用模型自主偏航控制。模型额外输出 yaw_rate，累积为偏航偏移量\n'
+                             '旋转目标方向向量，使无人机可以主动转头寻找绕行路径。\n'
+                             '需要从头训练或从 Model_bigger checkpoint 热启动 (strict=False)')
+    parser.add_argument('--coef_yaw_explore', type=float, default=2.0,
+                        help='偏航探索损失权重 (仅 enable_yaw_control 时生效)。\n'
+                             '低速时小角度偏航提供负损失（奖励探索），超过 ~29° 变为惩罚；\n'
+                             '高速时任何偏航都是惩罚（抑制危险转向）')
+    parser.add_argument('--yaw_penalty_start_deg', type=float, default=29.0,
+                        help='偏航探索损失中“开始惩罚”的角度阈值（度）。\n'
+                            '低速时 |yaw_offset| 小于该阈值为奖励区间，大于该阈值为惩罚区间')
     parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
     
     # 保存参数
@@ -221,10 +237,21 @@ class DroneTrainer:
         )
         
         # 初始化模型
+        yaw_control = getattr(args, 'enable_yaw_control', False)
+        # 偏航控制增加 1 维 obs (yaw_offset)
+        obs_extra = 1 if yaw_control else 0
         if args.no_odom:
-            self.model = Model_bigger(dim_obs=7, dim_action=6).to(self.device) # 这里换了个大一点的模型，如果换回去就用 Model
+            dim_obs = 7 + obs_extra
         else:
-            self.model = Model_bigger(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
+            dim_obs = 10 + obs_extra  # 7 + 3 (local_v) + obs_extra
+        
+        if yaw_control:
+            self.model = Model_bigger_yaw(dim_obs=dim_obs, dim_action=6).to(self.device)
+            print(f"[YawControl] 已启用模型自主偏航控制, dim_obs={dim_obs}, "
+                  f"coef_yaw_explore={getattr(args, 'coef_yaw_explore', 0.5)}, "
+                  f"yaw_penalty_start_deg={getattr(args, 'yaw_penalty_start_deg', 29.0)}")
+        else:
+            self.model = Model_bigger(dim_obs=dim_obs, dim_action=6).to(self.device)
         
         # 加载预训练模型
         if args.resume:
@@ -246,6 +273,9 @@ class DroneTrainer:
             coef_d_snap=args.coef_d_snap,
             coef_ground_affinity=args.coef_ground_affinity,
             coef_bias=args.coef_bias,
+            coef_stall=getattr(args, 'coef_stall', 0.0),
+            coef_yaw_explore=getattr(args, 'coef_yaw_explore', 0.5) if getattr(args, 'enable_yaw_control', False) else 0.0,
+            yaw_penalty_start_rad=math.radians(getattr(args, 'yaw_penalty_start_deg', 29.0)),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )
@@ -282,8 +312,22 @@ class DroneTrainer:
         self.ar_ema_alpha = 0.05    # EMA 平滑系数
         
     def _load_model(self, path):
-        """加载模型"""
+        """加载模型，支持跨架构热启动（如 Model_bigger → Model_bigger_yaw）"""
         state_dict = torch.load(path, map_location=self.device)
+        
+        # 处理维度不匹配的层（如 v_proj 从 dim_obs=10 → 11）
+        model_state = self.model.state_dict()
+        for key in list(state_dict.keys()):
+            if key in model_state and state_dict[key].shape != model_state[key].shape:
+                old_shape = state_dict[key].shape
+                new_shape = model_state[key].shape
+                print(f"[HotStart] {key}: {old_shape} → {new_shape}, 零填充新增维度")
+                new_param = model_state[key].clone()  # 保留当前模型的初始化值
+                # 计算可以复制的公共切片
+                slices = tuple(slice(0, min(o, n)) for o, n in zip(old_shape, new_shape))
+                new_param[slices] = state_dict[key][slices]
+                state_dict[key] = new_param
+        
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
@@ -363,6 +407,7 @@ class DroneTrainer:
         target_v_history = []
         vec_to_pt_history = []
         v_preds = []
+        yaw_history = []  # 偏航偏移累积历史 (仅 yaw_control 模式)
         vid = []
         
         # GRU 隐藏状态
@@ -419,6 +464,10 @@ class DroneTrainer:
         # 模拟每架无人机相机安装角的个体差异，episode 内保持不变
         cam_pitch = args.cam_angle + torch.randn(B, device=self.device)
         
+        # 偏航控制状态
+        yaw_control = getattr(args, 'enable_yaw_control', False)
+        yaw_offset = torch.zeros(B, device=self.device)  # 累积偏航偏移 (弧度)
+        
         # 航向漂移 (可选)
         if args.yaw_drift:
             drift_av = torch.randn(B, device=self.device) * (5 * math.pi / 180 / 15)
@@ -463,10 +512,23 @@ class DroneTrainer:
             else:
                 target_v_raw = p_target - self.env.p.detach()  # detach 防止通过瞬移优化
             
+            # 偏航控制：将目标向量按 yaw_offset 旋转
+            # 旋转后无人机机头朝向旋转后的方向，而非直接朝向目标
+            if yaw_control:
+                cos_y = torch.cos(yaw_offset)  # (B,)
+                sin_y = torch.sin(yaw_offset)
+                # 绕 Z 轴旋转 target_v_raw 的 XY 分量
+                tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+                rotated_x = cos_y * tx - sin_y * ty
+                rotated_y = sin_y * tx + cos_y * ty
+                heading_vector = torch.stack([rotated_x, rotated_y, target_v_raw[:, 2]], dim=-1)
+            else:
+                heading_vector = target_v_raw
+            
             # 执行动作 (使用延迟缓冲中的动作)
             # 关键：使用 act_buffer[t] 而不是取模，参考项目的实现方式
             self.env.step(act_cmd=act_buffer[t], 
-                         target_pos_vector=target_v_raw, 
+                         target_pos_vector=heading_vector, 
                          dt=current_dt)
             
             # 计算局部坐标系
@@ -487,7 +549,9 @@ class DroneTrainer:
             ]
             if not args.no_odom:
                 state_parts.insert(0, local_v)  # 加入局部速度 [3]
-            state = torch.cat(state_parts, dim=-1)  # [7] or [10]
+            if yaw_control:
+                state_parts.append(yaw_offset[:, None])  # 当前偏航偏移 [1]
+            state = torch.cat(state_parts, dim=-1)  # [7/10] or [8/11] with yaw
             
             # 深度图预处理
             # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
@@ -504,7 +568,16 @@ class DroneTrainer:
             #     x = F.max_pool2d(x, kernel_size=args.depth_dilate, stride=1, padding=pad)
 
             # 模型推理
-            act_raw, _, h = self.model(x, state, h)
+            act_raw, yaw_rate_raw, h = self.model(x, state, h)
+            
+            # 偏航控制：累积 yaw_rate 到 yaw_offset
+            if yaw_control and yaw_rate_raw is not None:
+                # tanh 限制 yaw_rate 到 [-1, 1] rad/s，防止极端旋转
+                yaw_rate = torch.tanh(yaw_rate_raw) * 1.0  # 最大 ±1 rad/s ≈ ±57°/s
+                yaw_offset = yaw_offset + yaw_rate * current_dt
+                # 限制累积偏航到 [-π, π]，防止无限旋转
+                yaw_offset = torch.remainder(yaw_offset + math.pi, 2 * math.pi) - math.pi
+                yaw_history.append(yaw_offset)
             
             # Truncated BPTT: 每 30 步截断 GRU 梯度，避免 150 步全序列反向传播占满显存
             if t > 0 and t % 30 == 0:
@@ -529,6 +602,7 @@ class DroneTrainer:
         vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
+        yaw_history_stacked = torch.stack(yaw_history) if yaw_history else None  # (T, B) or None
         
         # 计算损失
         loss, metrics = self.losser.forward(
@@ -539,7 +613,8 @@ class DroneTrainer:
             vec_to_obj_history=vec_to_pt_history,
             v_preds=v_preds,
             env_margin=self.env.margin,
-            env_g_std=self.g_std
+            env_g_std=self.g_std,
+            yaw_history=yaw_history_stacked
         )
         
         # 计算额外指标

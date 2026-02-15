@@ -1,6 +1,7 @@
 import torch
 import os
 import sys
+import math
 from pytorch3d.ops import knn_points, sample_points_from_meshes
 
 # 尝试导入同目录下的模块
@@ -51,7 +52,7 @@ class DroneSimulator:
                  init_margin_range=(0.1, 0.3),
                  # 运行参数
                  wind_std=0.1,
-                 act_queue_len=2,
+                 act_queue_len=0,
                  # 相机参数
                  cam_offset_body=[0.1, 0.0, 0.0],
                  # 渲染参数
@@ -138,7 +139,10 @@ class DroneSimulator:
         # 环境扰动
         self.dg = torch.randn((self.B, 3), device=self.device) * self.init_dg_range
         
-        # 模拟控制延迟的队列
+        # 离散动作延迟队列
+        # 注意: act_queue_len 默认 0 (直通)。参考项目 DiffPhysDrone 不使用离散队列，
+        # 仅靠 pitch_ctl_delay 低通滤波器模拟执行器响应延迟。如果此处 >0，
+        # 会在训练 act_buffer 的 act_lag 之上叠加额外延迟，削弱梯度信号。
         self.act_queue = [torch.zeros(self.B, 3, device=self.device) for _ in range(self.act_queue_len)]
         
         # 安全边距
@@ -508,6 +512,75 @@ class DroneSimulator:
         vecs_ros = obj_to_ros(vecs_obj)      # (S*B, 3)
 
         return vecs_ros.reshape(S, B, 3)  # (S, B, 3)
+
+    @torch.no_grad()
+    def get_panoramic_clearance(self, n_sectors=8, max_range=8.0, height_band=2.0):
+        """
+        全向障碍物距离扫描：计算无人机周围 N 个扇区内最近障碍物的距离。
+
+        在水平面上将 360° 等分为 n_sectors 个扇区，以机头朝向为 0° 基准。
+        利用已有的障碍物点云进行角度分桶 + 最小距离计算，无需额外渲染。
+
+        用途：为模型提供 360° 空间感知，解决纯前视深度图在面对大障碍物时
+        "不知道侧方/后方是否有可通行路径" 的信息缺失问题。
+
+        扇区编号（以 8 扇区为例，每 45° 一个）：
+            0: 正前方,  1: 右前方,  2: 正右方,  3: 右后方,
+            4: 正后方,  5: 左后方,  6: 正左方,  7: 左前方
+
+        Args:
+            n_sectors: 扇区数量，默认 8（每 45° 一个扇区）
+            max_range: 最大探测距离（米），超出视为无障碍物
+            height_band: 垂直过滤带宽（米），只考虑与无人机高度差
+                         在此范围内的障碍物（避免地面和天花板干扰）
+
+        Returns:
+            (B, n_sectors) 各扇区最近障碍物距离（米），范围 [0, max_range]
+        """
+        B = self.p.shape[0]
+
+        # 在 OBJ 坐标系中计算（与障碍物点云一致）
+        pos_obj = ros_to_obj(self.p)  # (B, 3)
+        pcd = self.renderer.obstacle_pcd  # (1, N, 3) or (B, N, 3)
+        if pcd.shape[0] != B:
+            pcd = pcd.expand(B, -1, -1)
+
+        # 相对向量 (B, N, 3) in OBJ
+        rel = pcd - pos_obj.unsqueeze(1)
+
+        # OBJ 坐标系: Y 轴朝上，水平面为 XZ
+        # 垂直过滤：只考虑高度差在 height_band 内的障碍物
+        height_ok = rel[:, :, 1].abs() < height_band  # (B, N)
+
+        # 水平距离 (XZ 平面)
+        horiz_dist = (rel[:, :, 0].pow(2) + rel[:, :, 2].pow(2)).sqrt()  # (B, N)
+
+        # 障碍物角度 (OBJ 水平面)
+        obstacle_angle = torch.atan2(rel[:, :, 2], rel[:, :, 0])  # (B, N)
+
+        # 无人机机头朝向角度 (OBJ 水平面)
+        fwd_ros = self.R[:, :, 0]  # Body X axis in ROS (B, 3)
+        fwd_obj = ros_to_obj(fwd_ros)  # (B, 3) in OBJ
+        heading = torch.atan2(fwd_obj[:, 2], fwd_obj[:, 0])  # (B,)
+
+        # 相对角度（以机头为 0° 基准）
+        rel_angle = obstacle_angle - heading.unsqueeze(1)  # (B, N)
+        rel_angle = torch.remainder(rel_angle + math.pi, 2 * math.pi) - math.pi  # [-π, π]
+
+        # 扇区分配: sector 0 以正前方为中心
+        sector_size = 2 * math.pi / n_sectors
+        sector_idx = ((rel_angle + sector_size / 2) / sector_size).floor().long() % n_sectors
+
+        # 逐扇区求最小距离（仅 8 次迭代，开销可忽略）
+        INF = max_range + 1.0
+        sector_dists = torch.full((B, n_sectors), max_range, device=self.device)
+        for s in range(n_sectors):
+            mask = (sector_idx == s) & height_ok  # (B, N)
+            d = horiz_dist.clone()
+            d[~mask] = INF
+            sector_dists[:, s] = d.min(dim=1).values
+
+        return sector_dists.clamp(0, max_range)
 
     def update_mesh(self, mesh_path, num_samples=None):
         """
