@@ -20,6 +20,25 @@ except ImportError:
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 
 class DroneSimulator:
+    """
+    无人机可微分仿真环境。
+
+    集成了渲染器 (DroneRenderer)、物理引擎 (drone_dynamics)、
+    障碍物检测 (KNN 点云查询) 和场景管理的完整仿真环境。
+
+    支持功能:
+        - 批量仿真: 同时模拟 B 架无人机
+        - 可微分渲染: PyTorch3D 深度图 + RGB 渲染
+        - 碰撞检测: KNN 最近邻点云查询
+        - 场景随机化: SceneGenerator 动态生成障碍物
+        - 安全重置: 拒绝采样确保出生点不在障碍物内部
+        - 全向感知: 360° 扇区距离扫描 (get_panoramic_clearance)
+
+    坐标系约定:
+        - 外部接口使用 ROS (ENU): +X 前, +Y 左, +Z 上
+        - 内部渲染/点云使用 OBJ 坐标系: +X 右, +Y 上, +Z 前
+        - OBJ↔ROS 转换通过 obj_to_ros() / ros_to_obj() 完成（自逆变换）
+    """
     def __init__(self, 
                  batch_size=4, 
                  dt=0.02, 

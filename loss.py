@@ -56,9 +56,11 @@ class DroneLoss:
                 "正对障碍物原地不动"的局部极小值。
             coef_yaw_explore (float): 偏航探索损失权重。结合速度与偏航角的复合损失：
                 - 低速时小角度偏航提供负损失（奖励探索），超过阈值变为惩罚
-                - 高速时任何偏航都为惩罚（抑制危险转向）            coef_progress (float): 路径进度损失权重。奖励任何缩短与目标距离的运动，
+                - 高速时任何偏航都为惩罚（抑制危险转向）
+            coef_progress (float): 路径进度损失权重。奖励任何缩短与目标距离的运动，
                 允许模型绕行而不被强制沿直线飞行。负梯度鼓励模型在面对障碍物时
-                选择绕行路径而非原地停滞。            yaw_penalty_start_rad (float): 偏航探索损失中“开始由奖励转惩罚”的角度阈值（弧度）。
+                选择绕行路径而非原地停滞。
+            yaw_penalty_start_rad (float): 偏航探索损失中"开始由奖励转惩罚"的角度阈值（弧度）。
                 即 |yaw| < alpha 时为奖励区间，|yaw| > alpha 时为惩罚区间。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
@@ -120,6 +122,10 @@ class DroneLoss:
             v_preds: (T, B, 3) 模型预测的速度。
             env_margin: (B,) 或标量。安全边距。
             env_g_std: (3,) 重力向量。默认为 [0, 0, -9.80665]。
+            yaw_history: (T, B) 偏航偏移累积历史（弧度），仅在启用偏航控制时提供，
+                否则为 None。用于计算 yaw_explore 损失。
+            p_target: (B, 3) 目标位置（ROS 坐标系）。用于计算 progress 损失，
+                为 None 则跳过 progress 损失计算。
 
         Returns:
             tuple: (总损失, 指标字典)

@@ -32,41 +32,111 @@ def parse_args():
     parser = argparse.ArgumentParser(description='无人机避障训练脚本')
     
     # 训练参数
-    parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
-    parser.add_argument('--batch_size', type=int, default=16, help='批量大小')
-    parser.add_argument('--num_iters', type=int, default=50000, help='训练迭代次数')
-    parser.add_argument('--timesteps', type=int, default=150, help='每次迭代的模拟步数')
-    parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
-    parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
-    parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
-    parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
+    parser.add_argument('--resume', default=None,
+                        help='恢复训练的模型 checkpoint 路径 (.pth)。\n'
+                             '支持跨架构热启动（如 Model_bigger → Model_bigger_yaw），\n'
+                             '维度不匹配的层会自动零填充新增维度')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='每个 episode 并行仿真的无人机数量。\n'
+                             '影响显存占用和梯度估计方差。参考项目默认 16。\n'
+                             '48x64 分辨率下 B=16 约需 4GB 显存，B=32 约需 7GB')
+    parser.add_argument('--num_iters', type=int, default=50000,
+                        help='总训练迭代次数。每次迭代运行一个完整 episode。\n'
+                             '通常 5000 步可见初步避障行为，20000+ 步趋于收敛')
+    parser.add_argument('--timesteps', type=int, default=150,
+                        help='每个 episode 的仿真步数。在 ctl_dt=1/15s 下，\n'
+                             '150 步 = 10 秒飞行时间。更长的 episode 能学到更远距离\n'
+                             '的导航策略，但显存和计算量线性增加')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                        help='AdamW 优化器初始学习率。使用 CosineAnnealing 调度，\n'
+                             '从 lr 退火到 lr*0.01。参考项目使用 1e-3，太大会导致\n'
+                             '策略抖动，太小收敛慢')
+    parser.add_argument('--grad_decay', type=float, default=0.4,
+                        help='梯度衰减系数 (0~1)。每个仿真步对位置/速度梯度乘以\n'
+                             'grad_decay^dt，防止长序列反向传播时梯度爆炸。\n'
+                             '0.4 表示每步衰减约 95%%，使近期步的梯度信号远强于早期步。\n'
+                             '设为 1.0 则不衰减（通常会导致训练不稳定）')
+    parser.add_argument('--ctl_dt', type=float, default=1/15,
+                        help='控制循环时间步长 (秒)。即模型每 ctl_dt 秒输出一次动作。\n'
+                             '参考项目使用 1/15≈0.067s (15Hz)。训练时会在此基础上\n'
+                             '添加 ±10%% 随机抖动模拟真实控制器的时钟不确定性')
+    parser.add_argument('--render_interval', type=int, default=1, 
+                        help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)。\n'
+                             '强烈不建议设为 >1，隔帧渲染会导致观测严重滞后，\n'
+                             '模型性能大幅下降且训练反而更慢（梯度信号更差需要更多步收敛）')
     
     # 损失函数权重
-    parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
-    parser.add_argument('--coef_speed', type=float, default=0.0, help='速度损失权重 (legacy)')
-    parser.add_argument('--coef_v_pred', type=float, default=2.0, help='速度预测损失权重')
+    parser.add_argument('--coef_v', type=float, default=1.0,
+                        help='速度跟踪损失权重。计算滑动窗口平均速度与目标速度的 SmoothL1 损失，\n'
+                             '是驱动无人机飞向目标的核心损失项。\n'
+                             '参考项目默认 1.0。设为 0 则无人机不会主动飞向目标')
+    parser.add_argument('--coef_speed', type=float, default=0.0,
+                        help='速度标量损失权重 (legacy，已弃用)。\n'
+                             '只约束速度大小不约束方向，效果不如 coef_v。保留仅为兼容性')
+    parser.add_argument('--coef_v_pred', type=float, default=2.0,
+                        help='速度预测辅助损失权重。模型同时输出加速度指令和速度预测，\n'
+                             '速度预测与实际速度的 MSE 损失作为自监督信号，\n'
+                             '帮助模型建立"动作→状态变化"的内部模型。\n'
+                             '参考项目默认 2.0。通常不需要调整')
     parser.add_argument('--coef_collide', type=float, default=5.0,
                         help='碰撞损失权重 (参考项目单机配置=7.5, 多机=5.0)')
     parser.add_argument('--coef_obj_avoidance', type=float, default=3.0,
                         help='障碍物回避损失权重 (参考项目单机配置=3.0, 多机=2.0)')
-    parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重')
-    parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加加速度正则化权重')
-    parser.add_argument('--coef_d_snap', type=float, default=0.0, help='snap正则化权重 (legacy)')
-    parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度惩罚损失权重 (防止飞高规避)')
-    parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
+    parser.add_argument('--coef_d_acc', type=float, default=0.01,
+                        help='加速度 L2 正则化权重。惩罚过大的推力指令，\n'
+                             '使飞行更加平滑省电。参考项目默认 0.01')
+    parser.add_argument('--coef_d_jerk', type=float, default=0.001,
+                        help='加加速度 (jerk) 正则化权重。惩罚加速度的快速变化，\n'
+                             '抑制动作抖动。jerk = d(acc)/dt，乘以 1/ctl_dt 归一化。\n'
+                             '参考项目默认 0.001。过大会使避障反应变迟钝')
+    parser.add_argument('--coef_d_snap', type=float, default=0.0,
+                        help='snap (加加加速度) 正则化权重 (legacy，默认禁用)。\n'
+                             '惩罚推力方向的二阶变化率。参考项目中有定义但通常不启用，\n'
+                             '因 jerk 正则化已足够平滑')
+    parser.add_argument('--coef_ground_affinity', type=float, default=0.0,
+                        help='高度惩罚损失权重。惩罚 Z>0 (ROS坐标系中 Z 向上) 的飞行高度，\n'
+                             '防止模型学会"飞到障碍物上方"来规避碰撞。\n'
+                             '用于低空穿越场景，默认禁用')
+    parser.add_argument('--coef_bias', type=float, default=0.0,
+                        help='方向偏差损失权重。惩罚速度中垂直于目标方向的分量，\n'
+                             '鼓励模型沿目标方向直线飞行。默认禁用，\n'
+                             '因为过强会阻碍绕行行为')
     parser.add_argument('--coef_stall', type=float, default=0.0,
                         help='停滞惩罚权重，惩罚速度低于 0.3m/s 的状态。'
                              '打破正对障碍物时"原地不动"的局部极小值，实测是劣化项')
-    parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
+    parser.add_argument('--coef_progress', type=float, default=0.0,
+                        help='路径进度损失权重。奖励任何缩短与目标距离的运动，\n'
+                             '允许模型绕行而不被强制沿直线飞行。推荐值 0.3~1.0')
+    parser.add_argument('--window_size', type=int, default=30,
+                        help='速度跟踪损失的滑动平均窗口大小 (帧数)。\n'
+                             '对 v_history 做 window_size 帧的移动平均后再与目标速度比较，\n'
+                             '平滑瞬时速度波动。在 15Hz 下 30 帧 = 2 秒平均。\n'
+                             '过小导致高频抖动被惩罚，过大导致响应迟缓')
     
     # 环境参数 - 渲染
-    parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
-    parser.add_argument('--image_height', type=int, default=48, help='图像高度')
-    parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
+    parser.add_argument('--cam_angle', type=int, default=10,
+                        help='相机安装俱仰角 (度)。正值表示向下倾斜（俸视）。\n'
+                             '训练时会为每个 batch 样本添加 ±1° 的随机偏移，\n'
+                             '模拟真实无人机相机安装角的个体差异。\n'
+                             '10° 适合前方+地面均可见；增大可看到更多地面但丢失远处信息')
+    parser.add_argument('--image_height', type=int, default=48,
+                        help='渲染深度图高度 (像素)。与 image_width 共同决定渲染分辨率。\n'
+                             '48x64 为低分辨率快速训练配置 (Model_bigger)；\n'
+                             '240x320 为中分辨率配置 (Model_adaptive)；\n'
+                             '分辨率越高渲染越慢但感知细节更丰富')
+    parser.add_argument('--image_width', type=int, default=64,
+                        help='渲染深度图宽度 (像素)。宽高比建议保持 4:3 或 16:9。\n'
+                             '模型输入分辨率必须与此一致 (Model_bigger 要求 48x64)')
     parser.add_argument('--hfov', type=float, default=90.0,
                         help='相机水平视场角 (度)，默认90°。焦距由 FOV 和图像宽度自动计算')
-    parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
-    parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
+    parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj',
+                        help='障碍物场景 .obj 网格文件路径。仅在未启用 --random_scene 时使用。\n'
+                             '网格会被加载到 PyTorch3D 渲染器，同时从表面采样点云用于碰撞检测。\n'
+                             'data/sample/ 下有多个预制场景可选')
+    parser.add_argument('--num_samples', type=int, default=100000,
+                        help='从障碍物网格表面采样的点云点数。用于 KNN 最近邻碰撞检测。\n'
+                             '点数越多碰撞检测精度越高，但 KNN 查询更慢。\n'
+                             '简单场景 50000 足够，复杂随机场景建议 100000+')
     parser.add_argument('--subdivide_times', type=int, default=0,
                         help='网格细分次数 (默认0, 配合z_clip无质量损失且渲染快)')
     parser.add_argument('--depth_min', type=float, default=0.3,
@@ -104,20 +174,58 @@ def parse_args():
                         help='出生/目标点最大高度（防止飞高规避）')
     
     # 环境参数 - 无人机物理
-    parser.add_argument('--margin_min', type=float, default=0.3, help='无人机安全半径最小值')
-    parser.add_argument('--margin_max', type=float, default=0.8, help='无人机安全半径最大值')
-    parser.add_argument('--init_p_range', type=float, default=8.0, help='初始位置范围')
-    parser.add_argument('--noise_std', type=float, default=0.04, help='环境扰动噪声标准差')
-    parser.add_argument('--yaw_inertia', type=float, default=5.0, help='偏航惯性')
-    parser.add_argument('--yaw_ctl_delay', type=float, default=12.0, help='偏航控制延迟')
-    parser.add_argument('--pitch_ctl_delay', type=float, default=12.0, help='俯仰控制延迟')
-    parser.add_argument('--airmode_coef', type=float, default=0.5, help='Airmode 系数')
-    parser.add_argument('--enable_airmode', action='store_true', default=True, help='启用 Airmode')
-    parser.add_argument('--disable_airmode', action='store_true', default=False, help='禁用 Airmode')
+    parser.add_argument('--margin_min', type=float, default=0.3,
+                        help='无人机安全碰撞半径区间下界 (米)。每个 batch 样本的 margin\n'
+                             '在 [margin_min, margin_max] 间随机采样。\n'
+                             'margin 用于碰撞检测：distance_to_obstacle - margin < 0 则碰撞。\n'
+                             '随机化 margin 使模型不依赖固定机体大小，增强鲁棒性')
+    parser.add_argument('--margin_max', type=float, default=0.8,
+                        help='无人机安全碰撞半径区间上界 (米)。\n'
+                             '建议设为实际无人机外接球半径的 1.5~2 倍。\n'
+                             '过大会导致狭窄通道无法通过，过小会增加擦碰概率')
+    parser.add_argument('--init_p_range', type=float, default=8.0,
+                        help='无人机初始位置随机范围 (米)。\n'
+                             '出生点 XY 在 [-R, R] 内均匀采样，Z 在 [0.5, R+0.5] 内采样。\n'
+                             '应与场景大小匹配（随机场景时使用 arena_range 代替）')
+    parser.add_argument('--noise_std', type=float, default=0.04,
+                        help='环境扰动加速度噪声标准差 (m/s²)。\n'
+                             '模拟阵风/气流扰动，通过 Ornstein-Uhlenbeck 过程产生\n'
+                             '时间相关的随机扰动。0.04 对应轻微扰动，0.2 对应强扰动')
+    parser.add_argument('--yaw_inertia', type=float, default=5.0,
+                        help='偏航惯性系数。控制机头朝向跟踪速度方向的灵敏度。\n'
+                             '公式: heading_mix = old_heading * yaw_inertia + velocity。\n'
+                             '值越大机头转向越慢（风向标效应更弱），\n'
+                             '低速悬停时因速度小而自然保持当前朝向。参考项目默认 5.0')
+    parser.add_argument('--yaw_ctl_delay', type=float, default=12.0,
+                        help='偏航响应速率系数。控制机头朝向跟踪的指数平滑速度。\n'
+                             '公式: alpha = exp(-delay * dt)，值越大响应越快。\n'
+                             '注意命名容易误导：值越大延迟反而越小。参考项目默认 12.0')
+    parser.add_argument('--pitch_ctl_delay', type=float, default=12.0,
+                        help='姿态/推力响应速率系数。控制执行器（电机）从当前状态\n'
+                             '趋向目标的低通滤波速度。公式: act_next = cmd*(1-α) + curr*α，\n'
+                             '其中 α = exp(-delay * dt)。值越大电机响应越快。\n'
+                             '参考项目默认 12.0。过大会放大高频噪声')
+    parser.add_argument('--airmode_coef', type=float, default=0.5,
+                        help='Airmode 效应系数。模拟真实无人机在快速改变推力方向时\n'
+                             '产生的额外加速度（角速度诱导加速度）。\n'
+                             '公式: a_airmode = thrust_dir * angular_vel * coef。\n'
+                             '参考项目默认 0.5。设为 0 则禁用此效应')
+    parser.add_argument('--enable_airmode', action='store_true', default=True,
+                        help='启用 Airmode 效应模拟。Airmode 使无人机在急转弯时\n'
+                             '产生额外推力方向加速度，更接近真实飞行动力学')
+    parser.add_argument('--disable_airmode', action='store_true', default=False,
+                        help='禁用 Airmode 效应模拟 (覆盖 --enable_airmode)。\n'
+                             '在简化动力学实验或调试时使用')
     
     # 模型参数
-    parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
-    parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
+    parser.add_argument('--no_odom', default=False, action='store_true',
+                        help='不使用里程计速度作为观测输入。启用后 dim_obs 从 10 降为 7，\n'
+                             '模型仅依赖深度图和目标方向，不知道自身速度。\n'
+                             '用于测试纯视觉导航能力或模拟里程计故障场景')
+    parser.add_argument('--yaw_drift', default=False, action='store_true',
+                        help='启用航向漂移数据增强。模拟磁罗盘标定误差导致的\n'
+                             '目标方向持续旋转 (每步约 ±1.2°)。\n'
+                             '使模型学会容忍航向不确定性，增强鲁棒性')
     parser.add_argument('--enable_yaw_control', default=False, action='store_true',
                         help='启用模型自主偏航控制。模型额外输出 yaw_rate，累积为偏航偏移量\n'
                              '旋转目标方向向量，使无人机可以主动转头寻找绕行路径。\n'
@@ -126,18 +234,40 @@ def parse_args():
                         help='偏航探索损失权重 (仅 enable_yaw_control 时生效)。\n'
                              '低速时小角度偏航提供负损失（奖励探索），超过 ~29° 变为惩罚；\n'
                              '高速时任何偏航都是惩罚（抑制危险转向）')
-    parser.add_argument('--yaw_penalty_start_deg', type=float, default=29.0,
+    parser.add_argument('--yaw_penalty_start_deg', type=float, default=120.0,
                         help='偏航探索损失中“开始惩罚”的角度阈值（度）。\n'
                             '低速时 |yaw_offset| 小于该阈值为奖励区间，大于该阈值为惩罚区间')
-    parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
+    parser.add_argument('--enable_panoramic', default=False, action='store_true',
+                        help='启用全向障碍物感知。在水平面上将 360° 分为 N 个扇区，\n'
+                             '每个扇区返回最近障碍物距离。解决纯前视深度图在面对大障碍物时\n'
+                             '"不知道侧方是否有可通行路径"的信息缺失问题')
+    parser.add_argument('--n_panoramic_sectors', type=int, default=8,
+                        help='全向感知扇区数量（默认 8，每 45° 一个）')
+    parser.add_argument('--panoramic_max_range', type=float, default=8.0,
+                        help='全向感知最大探测距离（米）')
+    parser.add_argument('--debug', default=False, action='store_true',
+                        help='启用 PyTorch autograd anomaly detection。\n'
+                             '检测 NaN/Inf 梯度并打印产生异常梯度的前向传播位置。\n'
+                             '会严重降低训练速度 (约 3~5x)，仅在排查梯度问题时使用')
     
     # 保存参数
-    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
-    parser.add_argument('--save_freq', type=int, default=100, help='模型保存频率 (迭代次数)')
-    parser.add_argument('--log_dir', type=str, default='./logs', help='日志保存目录')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                        help='模型 checkpoint 保存目录。还会保存 TrainingMonitor 的\n'
+                             'CSV 日志和损失曲线 PNG。常规 checkpoint 按 save_freq 保存，\n'
+                             'Best AR checkpoint 独立保存为 best_ar.pth')
+    parser.add_argument('--save_freq', type=int, default=100,
+                        help='常规 checkpoint 保存间隔 (迭代次数)。\n'
+                             '文件名格式: checkpoint_NNNNNN.pth。\n'
+                             '另外在前 2000 步每 250 步、之后每 1000 步会保存可视化图到 TensorBoard')
+    parser.add_argument('--log_dir', type=str, default='./logs',
+                        help='TensorBoard 日志目录。每次训练会创建带时间戳的子目录，\n'
+                             '如 logs/drone_train_20260215-143000/。\n'
+                             '使用 tensorboard --logdir=./logs 查看')
     
     # 硬件参数
-    parser.add_argument('--gpu', type=int, default=0, help='GPU ID (default: 0)')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='使用的 GPU 编号。多 GPU 机器上指定训练使用的设备。\n'
+                             '仅支持单 GPU 训练，不支持 DataParallel/DDP')
     
     return parser.parse_args()
 
@@ -150,7 +280,29 @@ def is_save_iter(i):
 
 
 class DroneTrainer:
-    """无人机训练器"""
+    """
+    无人机可微分仿真训练器。
+
+    封装了完整的训练流程：环境初始化、模型创建、episode 仿真循环、
+    损失计算、反向传播、TensorBoard 日志和 checkpoint 保存。
+
+    训练流程:
+        1. 每次迭代运行一个 episode (run_episode)
+        2. episode 内：重置环境 → 采样目标 → 循环 {render → model → step → 记录}
+        3. episode 结束后计算总损失，反向传播更新模型
+        4. 定期保存 checkpoint 和可视化图表
+
+    支持功能:
+        - Model_bigger / Model_bigger_yaw 模型选择
+        - 偏航控制 (--enable_yaw_control)
+        - 全向障碍物感知 (--enable_panoramic)
+        - 随机场景生成 (--random_scene)
+        - 安全出生点/目标点采样 (--safe_spawn)
+        - Best AR checkpoint 自动保存
+
+    Args:
+        args: 命令行参数 (argparse.Namespace)
+    """
     
     def __init__(self, args):
         self.args = args
@@ -238,8 +390,14 @@ class DroneTrainer:
         
         # 初始化模型
         yaw_control = getattr(args, 'enable_yaw_control', False)
+        panoramic = getattr(args, 'enable_panoramic', False)
+        n_panoramic_sectors = getattr(args, 'n_panoramic_sectors', 8)
         # 偏航控制增加 1 维 obs (yaw_offset)
-        obs_extra = 1 if yaw_control else 0
+        obs_extra = 0
+        if yaw_control:
+            obs_extra += 1
+        if panoramic:
+            obs_extra += n_panoramic_sectors
         if args.no_odom:
             dim_obs = 7 + obs_extra
         else:
@@ -252,6 +410,10 @@ class DroneTrainer:
                   f"yaw_penalty_start_deg={getattr(args, 'yaw_penalty_start_deg', 29.0)}")
         else:
             self.model = Model_bigger(dim_obs=dim_obs, dim_action=6).to(self.device)
+        
+        if panoramic:
+            print(f"[Panoramic] 已启用全向障碍物感知, {n_panoramic_sectors} 扇区, "
+                  f"最大探测 {getattr(args, 'panoramic_max_range', 8.0)}m, dim_obs={dim_obs}")
         
         # 加载预训练模型
         if args.resume:
@@ -275,6 +437,7 @@ class DroneTrainer:
             coef_bias=args.coef_bias,
             coef_stall=getattr(args, 'coef_stall', 0.0),
             coef_yaw_explore=getattr(args, 'coef_yaw_explore', 0.5) if getattr(args, 'enable_yaw_control', False) else 0.0,
+            coef_progress=getattr(args, 'coef_progress', 0.0),
             yaw_penalty_start_rad=math.radians(getattr(args, 'yaw_penalty_start_deg', 29.0)),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
@@ -364,7 +527,22 @@ class DroneTrainer:
     
     def run_episode(self, iteration):
         """
-        运行一个 episode 并返回损失
+        运行一个完整的 episode 并返回损失。
+
+        单次 episode 流程:
+            1. 重置环境和模型状态
+            2. 可选：随机场景生成 + 安全出生点采样
+            3. 采样目标点和随机化参数 (max_speed, thr_est_error, cam_pitch)
+            4. timesteps 次循环: render → 构建观测 → 模型推理 → 物理步进
+            5. 堆叠历史记录，调用 DroneLoss 计算总损失
+
+        Args:
+            iteration: 当前训练迭代编号，用于判断是否保存可视化帧
+
+        Returns:
+            loss: 标量总损失 (torch.Tensor)，带梯度
+            metrics: 各项指标字典 (success_rate, avg_speed, ar 等)
+            debug_out: 调试用数据元组 (p_history, v_history, act_buffer, vid)
         """
         args = self.args
         B = args.batch_size
@@ -551,7 +729,18 @@ class DroneTrainer:
                 state_parts.insert(0, local_v)  # 加入局部速度 [3]
             if yaw_control:
                 state_parts.append(yaw_offset[:, None])  # 当前偏航偏移 [1]
-            state = torch.cat(state_parts, dim=-1)  # [7/10] or [8/11] with yaw
+            if getattr(args, 'enable_panoramic', False):
+                # 全向障碍物距离扫描 (body-frame, 不需要梯度)
+                panoramic_raw = self.env.get_panoramic_clearance(
+                    n_sectors=getattr(args, 'n_panoramic_sectors', 8),
+                    max_range=getattr(args, 'panoramic_max_range', 8.0),
+                )  # (B, n_sectors) 单位: 米
+                # 归一化为逆距离特征: 近→高值, 远→低值, 与深度图编码一致
+                panoramic_max = getattr(args, 'panoramic_max_range', 8.0)
+                panoramic_feat = 1.0 / panoramic_raw.clamp(min=0.3) - 1.0 / panoramic_max
+                panoramic_feat = panoramic_feat + torch.randn_like(panoramic_feat) * 0.02
+                state_parts.append(panoramic_feat)  # [n_sectors]
+            state = torch.cat(state_parts, dim=-1)
             
             # 深度图预处理
             # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
@@ -614,7 +803,8 @@ class DroneTrainer:
             v_preds=v_preds,
             env_margin=self.env.margin,
             env_g_std=self.g_std,
-            yaw_history=yaw_history_stacked
+            yaw_history=yaw_history_stacked,
+            p_target=p_target
         )
         
         # 计算额外指标
@@ -638,7 +828,13 @@ class DroneTrainer:
         return loss, metrics, debug_out
     
     def train(self):
-        """主训练循环"""
+        """
+        主训练循环。
+
+        每次迭代调用 run_episode() 获取损失，执行反向传播和参数更新。
+        包含 OOM 容错、NaN 检测、定期保存、Best AR 追踪等机制。
+        训练结束后保存 checkpoint_final.pth 并打印 Best AR 信息。
+        """
         args = self.args
         
         pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
@@ -717,7 +913,16 @@ class DroneTrainer:
         self.writer.close()
     
     def _log_figures(self, iteration, debug_data):
-        """记录可视化图表"""
+        """
+        记录可视化图表到 TensorBoard。
+
+        为第 5 个 batch 样本绘制位置、速度、动作的时序曲线，
+        用于监控训练过程中的飞行行为变化。
+
+        Args:
+            iteration: 当前迭代编号
+            debug_data: run_episode() 返回的调试数据元组
+        """
         p_history, v_history, act_buffer, vid = debug_data
         
         if p_history.shape[1] <= 4:

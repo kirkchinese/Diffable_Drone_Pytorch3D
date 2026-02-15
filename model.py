@@ -3,6 +3,21 @@ from torch import nn
 
 
 class Model(nn.Module):
+    """
+    基础无人机控制模型 (12×16 深度图输入)。
+
+    使用 3 层 CNN 从低分辨率深度图中提取空间特征，与里程计观测加法融合后
+    通过 GRU 进行时序记忆，最终输出控制动作。
+
+    网络结构:
+        深度图 (1, 12, 16) → CNN (3层) → 192-dim
+        里程计 (dim_obs,) → Linear → 192-dim
+        融合 (相加) → GRU (192) → FC → dim_action
+
+    Args:
+        dim_obs: 里程计观测向量维度，默认 9
+        dim_action: 动作输出维度，默认 4
+    """
     def __init__(self, dim_obs=9, dim_action=4) -> None:
         super().__init__()
         self.stem = nn.Sequential(
@@ -24,9 +39,23 @@ class Model(nn.Module):
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
+        """重置模型内部状态（新 episode 时调用）。GRU 隐状态由外部管理，此处无需操作。"""
         pass
 
     def forward(self, x: torch.Tensor, v, hx=None):
+        """
+        前向推理。
+
+        Args:
+            x: 深度图输入 (B, 1, 12, 16)
+            v: 里程计观测向量 (B, dim_obs)
+            hx: GRU 隐状态 (B, 192)，None 则自动初始化为零
+
+        Returns:
+            act: 控制动作 (B, dim_action)
+            aux: 辅助输出（预留，当前为 None）
+            hx: 更新后的 GRU 隐状态 (B, 192)
+        """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
@@ -34,6 +63,21 @@ class Model(nn.Module):
         return act, None, hx
 
 class Model_bigger(nn.Module):
+    """
+    增强版无人机控制模型 (48×64 深度图输入)。
+
+    在 Model 基础上增加一层 CNN 以处理更高分辨率的深度图，
+    隐层维度提升至 256 以增加模型容量。
+
+    网络结构:
+        深度图 (1, 48, 64) → CNN (4层, stride=2) → 256-dim
+        里程计 (dim_obs,) → Linear → 256-dim
+        融合 (相加) → GRU (256) → FC → dim_action
+
+    Args:
+        dim_obs: 里程计观测向量维度，默认 9
+        dim_action: 动作输出维度，默认 4
+    """
     def __init__(self, dim_obs=9, dim_action=4) -> None:
         super().__init__()
         # Input is expected to be 48x64 (original resolution)
@@ -58,9 +102,23 @@ class Model_bigger(nn.Module):
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
+        """重置模型内部状态（新 episode 时调用）。GRU 隐状态由外部管理，此处无需操作。"""
         pass
 
     def forward(self, x: torch.Tensor, v, hx=None):
+        """
+        前向推理。
+
+        Args:
+            x: 深度图输入 (B, 1, 48, 64)
+            v: 里程计观测向量 (B, dim_obs)
+            hx: GRU 隐状态 (B, 256)，None 则自动初始化为零
+
+        Returns:
+            act: 控制动作 (B, dim_action)
+            aux: 辅助输出（预留，当前为 None）
+            hx: 更新后的 GRU 隐状态 (B, 256)
+        """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
@@ -110,9 +168,23 @@ class Model_bigger_yaw(nn.Module):
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
+        """重置模型内部状态（新 episode 时调用）。GRU 隐状态由外部管理，此处无需操作。"""
         pass
 
     def forward(self, x: torch.Tensor, v, hx=None):
+        """
+        前向推理，同时输出飞行动作和偏航角速度。
+
+        Args:
+            x: 深度图输入 (B, 1, 48, 64)
+            v: 里程计观测向量 (B, dim_obs)
+            hx: GRU 隐状态 (B, 256)，None 则自动初始化为零
+
+        Returns:
+            act: 飞行控制动作 (B, dim_action)，包含加速度+速度预测
+            yaw_rate: 偏航角速度标量 (B,)，经过独立头输出
+            hx: 更新后的 GRU 隐状态 (B, 256)
+        """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
@@ -264,9 +336,23 @@ class Model_640x480(nn.Module):
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
+        """重置模型内部状态（新 episode 时调用）。GRU 隐状态由外部管理，此处无需操作。"""
         pass
 
     def forward(self, x: torch.Tensor, v, hx=None):
+        """
+        前向推理。
+
+        Args:
+            x: 深度图输入 (B, 1, 480, 640)
+            v: 里程计观测向量 (B, dim_obs)
+            hx: GRU 隐状态 (B, hidden_dim)，None 则自动初始化为零
+
+        Returns:
+            act: 控制动作 (B, dim_action)
+            aux: 辅助输出（预留，当前为 None）
+            hx: 更新后的 GRU 隐状态 (B, hidden_dim)
+        """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)

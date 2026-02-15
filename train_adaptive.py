@@ -57,6 +57,9 @@ def parse_args():
     parser.add_argument('--coef_stall', type=float, default=0.5,
                         help='停滞惩罚权重，惩罚速度低于 0.3m/s 的状态。'
                              '打破正对障碍物时"原地不动"的局部极小值')
+    parser.add_argument('--coef_progress', type=float, default=0.0,
+                        help='路径进度损失权重。奖励任何缩短与目标距离的运动，\n'
+                             '允许模型绕行而不被强制沿直线飞行。推荐值 0.3~1.0')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     
     # 环境参数 - 渲染
@@ -118,6 +121,13 @@ def parse_args():
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
     parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
+    parser.add_argument('--enable_panoramic', default=False, action='store_true',
+                        help='启用全向障碍物感知。在水平面 360° 分为 N 个扇区，\n'
+                             '解决前视深度图信息缺失问题')
+    parser.add_argument('--n_panoramic_sectors', type=int, default=8,
+                        help='全向感知扇区数量')
+    parser.add_argument('--panoramic_max_range', type=float, default=8.0,
+                        help='全向感知最大探测距离（米）')
     parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
     
     # 保存参数
@@ -139,7 +149,23 @@ def is_save_iter(i):
 
 
 class DroneTrainer:
-    """无人机训练器"""
+    """
+    无人机可微分仿真训练器 (自适应分辨率版)。
+
+    与 train.py 的 DroneTrainer 功能一致，但使用 Model_adaptive 支持任意分辨率输入。
+    封装了环境初始化、episode 仿真循环、损失计算、反向传播、
+    TensorBoard 日志和 checkpoint 保存的完整训练流程。
+
+    支持功能:
+        - Model_adaptive 自适应分辨率模型
+        - 全向障碍物感知 (--enable_panoramic)
+        - 随机场景生成 (--random_scene)
+        - 安全出生点/目标点采样 (--safe_spawn)
+        - Best AR checkpoint 自动保存
+
+    Args:
+        args: 命令行参数 (argparse.Namespace)
+    """
     
     def __init__(self, args):
         self.args = args
@@ -226,10 +252,16 @@ class DroneTrainer:
         )
         
         # 初始化模型
+        panoramic = getattr(args, 'enable_panoramic', False)
+        n_panoramic_sectors = getattr(args, 'n_panoramic_sectors', 8)
+        obs_extra = n_panoramic_sectors if panoramic else 0
         if args.no_odom:
-            self.model = Model_adaptive(dim_obs=7, dim_action=6).to(self.device) # 这里换了个大一点的模型，如果换回去就用 Model
+            dim_obs = 7 + obs_extra
         else:
-            self.model = Model_adaptive(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
+            dim_obs = 10 + obs_extra  # 7 + 3 (local_v) + obs_extra
+        self.model = Model_adaptive(dim_obs=dim_obs, dim_action=6).to(self.device)
+        if panoramic:
+            print(f"[Panoramic] 已启用全向障碍物感知, {n_panoramic_sectors} 扇区, dim_obs={dim_obs}")
         
         # 加载预训练模型
         if args.resume:
@@ -252,6 +284,7 @@ class DroneTrainer:
             coef_ground_affinity=args.coef_ground_affinity,
             coef_bias=args.coef_bias,
             coef_stall=getattr(args, 'coef_stall', 0.0),
+            coef_progress=getattr(args, 'coef_progress', 0.0),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )
@@ -325,7 +358,22 @@ class DroneTrainer:
     
     def run_episode(self, iteration):
         """
-        运行一个 episode 并返回损失
+        运行一个完整的 episode 并返回损失。
+
+        单次 episode 流程:
+            1. 重置环境和模型状态
+            2. 可选：随机场景生成 + 安全出生点采样
+            3. 采样目标点和随机化参数 (max_speed, thr_est_error, cam_pitch)
+            4. timesteps 次循环: render → 构建观测 → 模型推理 → 物理步进
+            5. 堆叠历史记录，调用 DroneLoss 计算总损失
+
+        Args:
+            iteration: 当前训练迭代编号，用于判断是否保存可视化帧
+
+        Returns:
+            loss: 标量总损失 (torch.Tensor)，带梯度
+            metrics: 各项指标字典 (success_rate, avg_speed, ar 等)
+            debug_out: 调试用数据元组 (p_history, v_history, act_buffer, vid)
         """
         args = self.args
         B = args.batch_size
@@ -498,7 +546,16 @@ class DroneTrainer:
             ]
             if not args.no_odom:
                 state_parts.insert(0, local_v)  # 加入局部速度 [3]
-            state = torch.cat(state_parts, dim=-1)  # [7] or [10]
+            if getattr(args, 'enable_panoramic', False):
+                panoramic_raw = self.env.get_panoramic_clearance(
+                    n_sectors=getattr(args, 'n_panoramic_sectors', 8),
+                    max_range=getattr(args, 'panoramic_max_range', 8.0),
+                )
+                panoramic_max = getattr(args, 'panoramic_max_range', 8.0)
+                panoramic_feat = 1.0 / panoramic_raw.clamp(min=0.3) - 1.0 / panoramic_max
+                panoramic_feat = panoramic_feat + torch.randn_like(panoramic_feat) * 0.02
+                state_parts.append(panoramic_feat)
+            state = torch.cat(state_parts, dim=-1)
             
             # 深度图预处理
             # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
@@ -560,7 +617,8 @@ class DroneTrainer:
             vec_to_obj_history=vec_to_pt_history,
             v_preds=v_preds,
             env_margin=self.env.margin,
-            env_g_std=self.g_std
+            env_g_std=self.g_std,
+            p_target=p_target
         )
         
         # 计算额外指标
@@ -584,7 +642,13 @@ class DroneTrainer:
         return loss, metrics, debug_out
     
     def train(self):
-        """主训练循环"""
+        """
+        主训练循环。
+
+        每次迭代调用 run_episode() 获取损失，执行反向传播和参数更新。
+        包含 OOM 容错、NaN 检测、定期保存、Best AR 追踪等机制。
+        训练结束后保存 checkpoint_final.pth 并打印 Best AR 信息。
+        """
         args = self.args
         
         pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
@@ -661,7 +725,16 @@ class DroneTrainer:
         self.writer.close()
     
     def _log_figures(self, iteration, debug_data):
-        """记录可视化图表"""
+        """
+        记录可视化图表到 TensorBoard。
+
+        为第 5 个 batch 样本绘制位置、速度、动作的时序曲线，
+        用于监控训练过程中的飞行行为变化。
+
+        Args:
+            iteration: 当前迭代编号
+            debug_data: run_episode() 返回的调试数据元组
+        """
         p_history, v_history, act_buffer, vid = debug_data
         
         if p_history.shape[1] <= 4:
