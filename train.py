@@ -77,7 +77,7 @@ def parse_args():
                         help='速度预测辅助损失权重。模型同时输出加速度指令和速度预测，\n'
                              '速度预测与实际速度的 MSE 损失作为自监督信号，\n'
                              '帮助模型建立"动作→状态变化"的内部模型。\n'
-                             '参考项目默认 2.0。通常不需要调整')
+                             '默认 2.0。通常不需要调整')
     parser.add_argument('--coef_collide', type=float, default=5.0,
                         help='碰撞损失权重 (参考项目单机配置=7.5, 多机=5.0)')
     parser.add_argument('--coef_obj_avoidance', type=float, default=3.0,
@@ -230,11 +230,11 @@ def parse_args():
                         help='启用模型自主偏航控制。模型额外输出 yaw_rate，累积为偏航偏移量\n'
                              '旋转目标方向向量，使无人机可以主动转头寻找绕行路径。\n'
                              '需要从头训练或从 Model_bigger checkpoint 热启动 (strict=False)')
-    parser.add_argument('--coef_yaw_explore', type=float, default=2.0,
+    parser.add_argument('--coef_yaw_explore', type=float, default=1.0,
                         help='偏航探索损失权重 (仅 enable_yaw_control 时生效)。\n'
-                             '低速时小角度偏航提供负损失（奖励探索），超过 ~29° 变为惩罚；\n'
+                             '低速时小角度偏航提供负损失（奖励探索），超过 X° 变为惩罚；\n'
                              '高速时任何偏航都是惩罚（抑制危险转向）')
-    parser.add_argument('--yaw_penalty_start_deg', type=float, default=120.0,
+    parser.add_argument('--yaw_penalty_start_deg', type=float, default=60.0,
                         help='偏航探索损失中“开始惩罚”的角度阈值（度）。\n'
                             '低速时 |yaw_offset| 小于该阈值为奖励区间，大于该阈值为惩罚区间')
     parser.add_argument('--enable_panoramic', default=False, action='store_true',
