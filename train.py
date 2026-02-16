@@ -39,7 +39,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=16,
                         help='每个 episode 并行仿真的无人机数量。\n'
                              '影响显存占用和梯度估计方差。参考项目默认 16。\n'
-                             '48x64 分辨率下 B=16 约需 4GB 显存，B=32 约需 7GB')
+                             '48x64 分辨率下 B=16 约需 4GB 显存，B=32 约需 7GB'
+                             '存在边际递减效应,B=128只需要9.7G')
     parser.add_argument('--num_iters', type=int, default=50000,
                         help='总训练迭代次数。每次迭代运行一个完整 episode。\n'
                              '通常 5000 步可见初步避障行为，20000+ 步趋于收敛')
@@ -64,6 +65,9 @@ def parse_args():
                         help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)。\n'
                              '强烈不建议设为 >1，隔帧渲染会导致观测严重滞后，\n'
                              '模型性能大幅下降且训练反而更慢（梯度信号更差需要更多步收敛）')
+    parser.add_argument('--arrival_threshold', type=float, default=1.0,
+                        help='到达判定阈值 (米)。当任一时刻到目标距离 <= 该值时判定为到达。\n'
+                            '训练阶段 success_rate 定义为“无碰撞且到达”')
     
     # 损失函数权重
     parser.add_argument('--coef_v', type=float, default=1.0,
@@ -236,7 +240,9 @@ def parse_args():
                              '高速时任何偏航都是惩罚（抑制危险转向）')
     parser.add_argument('--yaw_penalty_start_deg', type=float, default=60.0,
                         help='偏航探索损失中“开始惩罚”的角度阈值（度）。\n'
-                            '低速时 |yaw_offset| 小于该阈值为奖励区间，大于该阈值为惩罚区间')
+                            '低速时 |yaw_offset| 小于该阈值为奖励区间，大于该阈值为惩罚区间'
+                            '不建议设置的过大，模型会希望让偏航一直保持在奖励区间来获得持续负损失，导致过度转头和不稳定行为，会导致严重的训练退化'
+                            '不建议设置的超过FOVX')
     parser.add_argument('--enable_panoramic', default=False, action='store_true',
                         help='启用全向障碍物感知。在水平面上将 360° 分为 N 个扇区，\n'
                              '每个扇区返回最近障碍物距离。解决纯前视深度图在面对大障碍物时\n'
@@ -812,10 +818,19 @@ class DroneTrainer:
             distance = torch.norm(vec_to_pt_history, 2, -1) - self.env.margin
             speed_history = v_history.norm(2, -1)
             avg_speed = speed_history.mean(0)
-            success = torch.all(distance.flatten(0, 1) > 0, 0)
+            if distance.dim() == 3:
+                no_collision = torch.all(distance > 0, dim=(0, 1))
+            else:
+                no_collision = torch.all(distance > 0, dim=0)
+
+            dist_to_target = torch.norm(p_target.unsqueeze(0) - p_history, 2, -1)
+            reached = torch.any(dist_to_target <= args.arrival_threshold, dim=0)
+            success = no_collision & reached
             success_rate = success.float().mean()
             
             metrics['success_rate'] = success_rate
+            metrics['no_collision_rate'] = no_collision.float().mean()
+            metrics['reach_rate'] = reached.float().mean()
             metrics['avg_speed'] = avg_speed.mean()
             metrics['max_speed'] = speed_history.max(0).values.mean()
             metrics['ar'] = (success.float() * avg_speed).mean()  # 成功率 × 平均速度

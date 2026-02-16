@@ -82,6 +82,8 @@ def parse_args():
                         help='要运行的 episode 数量')
     parser.add_argument('--timesteps', type=int, default=200,
                         help='每个 episode 的仿真步数')
+    parser.add_argument('--arrival_threshold', type=float, default=1.0,
+                        help='判定“抵达目标”的距离阈值 (米)。成功定义为：全程无碰撞且任意时刻进入该阈值')
     parser.add_argument('--ctl_dt', type=float, default=1/15,
                         help='控制时间步长 (秒)')
     parser.add_argument('--batch_size', type=int, default=1,
@@ -594,11 +596,13 @@ class EvalRunner:
             avg_spd = float(rec['speed'][:, b].mean())
             min_d = float(rec['dist_to_obs'][:, b].min())
             final_d = float(rec['dist_to_target'][-1, b])
+            reached = bool((rec['dist_to_target'][:, b] <= args.arrival_threshold).any())
+            success = (n_coll == 0) and reached
             avg_depth = float(rec['depth_valid_pct'][:, b].mean())
             max_yaw = float(np.abs(rec['yaw_offset'][:, b]).max())
             print(f"  [Ep{episode_idx} B{b}] Collisions={n_coll}/{args.timesteps} | "
                   f"Avg Speed={avg_spd:.2f} m/s | Min Dist={min_d:.3f} m | "
-                  f"Final->Target={final_d:.2f} m | Avg Depth Valid={avg_depth:.1f}%"
+                f"Final->Target={final_d:.2f} m | Reach={reached} | Success={success} | Avg Depth Valid={avg_depth:.1f}%"
                   f" | Max |yaw|={np.degrees(max_yaw):.1f}°")
 
         return rec
@@ -1191,6 +1195,9 @@ class EvalRunner:
 
         total_steps = 0
         total_collisions = 0
+        total_success = 0
+        total_reached = 0
+        total_no_collision = 0
         speeds = []
         min_dists = []
         final_dists = []
@@ -1208,10 +1215,16 @@ class EvalRunner:
                 min_d = float(rec['dist_to_obs'][:, b].min())
                 final_d = float(rec['dist_to_target'][-1, b])
                 init_d = float(np.linalg.norm(rec['p_start'][b] - rec['p_target'][b]))
+                reached = bool((rec['dist_to_target'][:, b] <= self.args.arrival_threshold).any())
+                no_collision = (n_coll == 0)
+                success = no_collision and reached
                 avg_depth = float(rec['depth_valid_pct'][:, b].mean())
 
                 total_steps += T
                 total_collisions += n_coll
+                total_reached += int(reached)
+                total_no_collision += int(no_collision)
+                total_success += int(success)
                 speeds.append(avg_spd)
                 max_speeds.append(max_spd)
                 min_dists.append(min_d)
@@ -1224,7 +1237,8 @@ class EvalRunner:
                       f"碰撞={n_coll}/{T} | "
                       f"平均/峰值速度={avg_spd:.2f}/{max_spd:.2f} m/s | "
                       f"最小距离={min_d:.3f} m | "
-                      f"终端距离={final_d:.2f} m ({progress:.0f}% 完成) | "
+                        f"终端距离={final_d:.2f} m ({progress:.0f}% 完成) | "
+                        f"到达={reached} | 成功={success} | "
                       f"深度覆盖={avg_depth:.1f}%")
 
         print("-" * 70)
@@ -1241,6 +1255,12 @@ class EvalRunner:
         avg_prog = np.mean([max(0, 1 - fd / max(id_, 0.01))
                             for fd, id_ in zip(final_dists, init_dists)]) * 100
         print(f"  平均完成进度: {avg_prog:.1f}%")
+        print(f"  无碰撞率: {total_no_collision}/{n_eps} "
+              f"({100 * total_no_collision / max(n_eps, 1):.2f}%)")
+        print(f"  到达率: {total_reached}/{n_eps} "
+              f"({100 * total_reached / max(n_eps, 1):.2f}%)")
+        print(f"  成功率(无碰撞且到达): {total_success}/{n_eps} "
+              f"({100 * total_success / max(n_eps, 1):.2f}%)")
         print(f"  深度图平均覆盖率: {np.mean(depth_pcts):.1f}%")
         print("=" * 70)
 
