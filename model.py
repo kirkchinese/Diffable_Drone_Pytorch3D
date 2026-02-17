@@ -99,6 +99,13 @@ class Model_bigger(nn.Module):
         self.gru = nn.GRUCell(256, 256)
         self.fc = nn.Linear(256, dim_action, bias=False)
         self.fc.weight.data.mul_(0.01)
+        
+        # 引导偏转预测头：预测当前深度图对应的引导偏转角 (标量)
+        # 训练时用深度图计算的实际偏转角做监督 (自蒸馏)，
+        # 推理时用模型自己的预测值替代深度图引导计算
+        self.fc_steer = nn.Linear(256, 1, bias=False)
+        self.fc_steer.weight.data.mul_(0.01)
+        
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
@@ -118,12 +125,15 @@ class Model_bigger(nn.Module):
             act: 控制动作 (B, dim_action)
             aux: 辅助输出（预留，当前为 None）
             hx: 更新后的 GRU 隐状态 (B, 256)
+            steer_pred: 引导偏转角预测 (B,)，训练时与实际偏转角做 MSE
         """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
-        act = self.fc(self.act(hx))
-        return act, None, hx
+        features = self.act(hx)
+        act = self.fc(features)
+        steer_pred = self.fc_steer(features).squeeze(-1)  # (B,)
+        return act, None, hx, steer_pred
 
 
 class Model_bigger_yaw(nn.Module):
@@ -165,6 +175,10 @@ class Model_bigger_yaw(nn.Module):
         self.fc_yaw = nn.Linear(256, 1, bias=False)
         self.fc_yaw.weight.data.mul_(0.001)
         
+        # 引导偏转预测头 (与 Model_bigger 一致)
+        self.fc_steer = nn.Linear(256, 1, bias=False)
+        self.fc_steer.weight.data.mul_(0.01)
+        
         self.act = nn.LeakyReLU(0.05)
 
     def reset(self):
@@ -184,6 +198,7 @@ class Model_bigger_yaw(nn.Module):
             act: 飞行控制动作 (B, dim_action)，包含加速度+速度预测
             yaw_rate: 偏航角速度标量 (B,)，经过独立头输出
             hx: 更新后的 GRU 隐状态 (B, 256)
+            steer_pred: 引导偏转角预测 (B,)
         """
         img_feat = self.stem(x)
         x = self.act(img_feat + self.v_proj(v))
@@ -191,7 +206,8 @@ class Model_bigger_yaw(nn.Module):
         features = self.act(hx)
         act = self.fc(features)
         yaw_rate = self.fc_yaw(features).squeeze(-1)  # (B,)
-        return act, yaw_rate, hx
+        steer_pred = self.fc_steer(features).squeeze(-1)  # (B,)
+        return act, yaw_rate, hx, steer_pred
 
 
 class Model_adaptive(nn.Module):

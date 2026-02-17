@@ -164,6 +164,16 @@ def parse_args():
                         help='不使用里程计速度作为输入')
     parser.add_argument('--enable_yaw_control', action='store_true', default=False,
                         help='启用模型自主偏航控制 (需与训练时的 --enable_yaw_control 一致)')
+    parser.add_argument('--enable_guidance', action='store_true', default=False,
+                        help='启用基于深度图的动态引导方向 (需与训练时一致)')
+    parser.add_argument('--guidance_steer_gain', type=float, default=2.0,
+                        help='引导转向增益系数')
+    parser.add_argument('--guidance_gate_threshold', type=float, default=0.35,
+                        help='引导门控阈值')
+    parser.add_argument('--predicted_guidance', action='store_true', default=False,
+                        help='使用模型自己预测的偏转角代替深度图计算的引导方向。\n'
+                             '模型需要在训练时使用 --enable_guidance + --coef_steer_pred > 0 学习过偏转预测。\n'
+                             '启用后推理时不再需要深度图引导计算，完全用模型预测值')
 
     # 目标点设置
     parser.add_argument('--max_speed', type=float, default=2.5,
@@ -385,6 +395,35 @@ class EvalRunner:
         R = torch.stack([fwd, torch.linalg.cross(up, fwd), up], -1)
         return R
 
+    def _compute_guidance_direction(self, depth, target_v_raw,
+                                    steer_gain=2.0, gate_threshold=0.35):
+        """可通行性梯度引导：沿空旷度增加的方向偏转目标航向。与 train.py 中的实现完全一致。"""
+        B, H, W = depth.shape
+        args = self.args
+
+        bg_mask = (depth < 0) | (depth > args.depth_max)
+        d = depth.clone()
+        d[bg_mask] = args.depth_max
+        d = d.clamp(args.depth_min, args.depth_max)
+        col_clear = d.mean(dim=1) / args.depth_max  # (B, W)
+
+        w = torch.linspace(1.0, -1.0, W, device=depth.device)
+        grad_c = (col_clear * w.unsqueeze(0)).sum(dim=1) / (W / 2)
+
+        cs, ce = W // 3, W * 2 // 3
+        blockage = 1.0 - col_clear[:, cs:ce].mean(dim=1)
+        gate = torch.sigmoid(10.0 * (blockage - gate_threshold))
+
+        hfov_rad = math.radians(args.hfov)
+        steer = (steer_gain * gate * grad_c).clamp(-hfov_rad * 0.8, hfov_rad * 0.8)
+
+        cos_s, sin_s = torch.cos(steer), torch.sin(steer)
+        tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+        guided = torch.stack([cos_s * tx - sin_s * ty,
+                            sin_s * tx + cos_s * ty,
+                            target_v_raw[:, 2]], dim=-1)
+        return guided, steer
+
     # ================================================================
     # 运行单个 episode
     # ================================================================
@@ -446,6 +485,10 @@ class EvalRunner:
         act_lag = 1
         act_buffer = [self.env.act_curr.clone() for _ in range(act_lag + 1)]
         h = None
+        
+        # 引导偏转预测: 推理时用上一步的模型预测值
+        use_predicted = getattr(args, 'predicted_guidance', False)
+        prev_steer_pred = torch.zeros(B, device=self.device)  # 第 0 步无偏转
 
         # ---- 记录容器 ----
         rec = {
@@ -521,16 +564,35 @@ class EvalRunner:
                 target_v_raw.norm(2, -1).cpu().numpy().copy()
             )
 
+            # ---------- 动态引导方向 ----------
+            if use_predicted:
+                # 自蒸馏模式: 使用上一步模型预测的偏转角旋转 target_v_raw
+                cos_s = torch.cos(prev_steer_pred)
+                sin_s = torch.sin(prev_steer_pred)
+                tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+                guided_target_v = torch.stack([
+                    cos_s * tx - sin_s * ty,
+                    sin_s * tx + cos_s * ty,
+                    target_v_raw[:, 2]], dim=-1)
+            elif getattr(args, 'enable_guidance', False):
+                guided_target_v, _ = self._compute_guidance_direction(
+                    depth_lo, target_v_raw,
+                    steer_gain=getattr(args, 'guidance_steer_gain', 2.0),
+                    gate_threshold=getattr(args, 'guidance_gate_threshold', 0.35),
+                )
+            else:
+                guided_target_v = target_v_raw
+
             # ---------- 偏航控制: 旋转目标方向 ----------
             if yaw_control and yaw_offset is not None:
                 cos_y = torch.cos(yaw_offset)
                 sin_y = torch.sin(yaw_offset)
-                tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+                tx, ty = guided_target_v[:, 0], guided_target_v[:, 1]
                 rotated_x = cos_y * tx - sin_y * ty
                 rotated_y = sin_y * tx + cos_y * ty
-                heading_vector = torch.stack([rotated_x, rotated_y, target_v_raw[:, 2]], dim=-1)
+                heading_vector = torch.stack([rotated_x, rotated_y, guided_target_v[:, 2]], dim=-1)
             else:
-                heading_vector = target_v_raw
+                heading_vector = guided_target_v
 
             # ---------- 执行动作 ----------
             self.env.step(act_cmd=act_buffer[t], target_pos_vector=heading_vector, dt=current_dt)
@@ -538,9 +600,15 @@ class EvalRunner:
             # ---------- 模型推理 ----------
             R_local = self._compute_local_R()
 
-            target_v_norm = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
-            target_v_unit = target_v_raw / (target_v_norm + 1e-6)
-            target_v = target_v_unit * torch.minimum(target_v_norm, max_speed)
+            # target_v 方向与训练保持一致: 引导开启时用引导方向, 否则用原始方向
+            if use_predicted or getattr(args, 'enable_guidance', False):
+                effective_target_dir = guided_target_v
+            else:
+                effective_target_dir = target_v_raw
+            target_v_norm = torch.norm(effective_target_dir, p=2, dim=-1, keepdim=True)
+            target_v_unit = effective_target_dir / (target_v_norm + 1e-6)
+            dist_to_goal = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
+            target_v = target_v_unit * torch.minimum(dist_to_goal, max_speed)
             target_v_local = torch.squeeze(target_v[:, None] @ R_local, 1)
             local_v = torch.squeeze(self.env.v[:, None] @ R_local, 1)
 
@@ -562,7 +630,11 @@ class EvalRunner:
             x[bg_mask] = 0.0
             x = x.unsqueeze(1)  # (B, 1, H, W)
 
-            act_raw, yaw_rate_raw, h = self.model(x, state, h)
+            act_raw, yaw_rate_raw, h, steer_pred = self.model(x, state, h)
+            
+            # 保存当前预测的偏转角供下一步使用 (自回归)
+            if use_predicted:
+                prev_steer_pred = steer_pred
 
             # 偏航控制: 累积 yaw_rate
             if yaw_control and yaw_rate_raw is not None:

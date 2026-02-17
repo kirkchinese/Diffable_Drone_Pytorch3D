@@ -261,6 +261,10 @@ def parse_args():
     parser.add_argument('--guidance_gate_threshold', type=float, default=0.35,
                         help='引导门控阈值。中央 1/3 区域遮挡程度超过此值时开始偏转。\n'
                              '0.35 表示 35%% 遮挡触发。使用 sigmoid 平滑过渡，无硬切换')
+    parser.add_argument('--coef_steer_pred', type=float, default=0.0,
+                        help='引导偏转预测损失权重。模型预测的偏转角与深度图计算的实际偏转角\n'
+                             '之间的 MSE。启用引导时建议设为 1.0~5.0。\n'
+                             '自蒸馏: 训练时学习预测，推理时用模型预测替代深度图计算')
     parser.add_argument('--debug', default=False, action='store_true',
                         help='启用 PyTorch autograd anomaly detection。\n'
                              '检测 NaN/Inf 梯度并打印产生异常梯度的前向传播位置。\n'
@@ -454,6 +458,7 @@ class DroneTrainer:
             coef_stall=getattr(args, 'coef_stall', 0.0),
             coef_yaw_explore=getattr(args, 'coef_yaw_explore', 0.5) if getattr(args, 'enable_yaw_control', False) else 0.0,
             coef_progress=getattr(args, 'coef_progress', 0.0),
+            coef_steer_pred=getattr(args, 'coef_steer_pred', 0.0),
             yaw_penalty_start_rad=math.radians(getattr(args, 'yaw_penalty_start_deg', 29.0)),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
@@ -575,6 +580,7 @@ class DroneTrainer:
 
         Returns:
             guided_target_v: (B, 3) 引导后的目标方向向量
+            steer: (B,) 原始偏转角 (弧度)，用于 steer prediction 监督
         """
         B, H, W = depth.shape
         args = self.args
@@ -603,9 +609,10 @@ class DroneTrainer:
         # 绕 Z 轴旋转 target_v_raw
         cos_s, sin_s = torch.cos(steer), torch.sin(steer)
         tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
-        return torch.stack([cos_s * tx - sin_s * ty,
+        guided = torch.stack([cos_s * tx - sin_s * ty,
                             sin_s * tx + cos_s * ty,
                             target_v_raw[:, 2]], dim=-1)
+        return guided, steer
     
     def run_episode(self, iteration):
         """
@@ -668,6 +675,8 @@ class DroneTrainer:
         vec_to_pt_history = []
         v_preds = []
         yaw_history = []  # 偏航偏移累积历史 (仅 yaw_control 模式)
+        steer_pred_history = []   # 模型预测的引导偏转角
+        steer_actual_history = [] # 深度图计算的实际引导偏转角
         vid = []
         
         # GRU 隐藏状态
@@ -777,13 +786,14 @@ class DroneTrainer:
             # 使 loss_v 不再惩罚合理的绕行运动，打破"停下来最优"的局部极小值
             guidance_enabled = getattr(args, 'enable_guidance', False)
             if guidance_enabled:
-                guided_target_v = self._compute_guidance_direction(
+                guided_target_v, actual_steer = self._compute_guidance_direction(
                     depth, target_v_raw,
                     steer_gain=getattr(args, 'guidance_steer_gain', 2.0),
                     gate_threshold=getattr(args, 'guidance_gate_threshold', 0.35),
                 )
             else:
                 guided_target_v = target_v_raw
+                actual_steer = torch.zeros(B, device=self.device)
             
             # 偏航控制：将引导后的目标向量按 yaw_offset 旋转
             # 旋转后无人机机头朝向旋转后的方向，而非直接朝向目标
@@ -860,11 +870,16 @@ class DroneTrainer:
             x = x.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
 
             # 模型推理
-            act_raw, yaw_rate_raw, h = self.model(x, state, h) # 增加了yaw_rate_raw 输出。
+            act_raw, yaw_rate_raw, h, steer_pred = self.model(x, state, h)
+            # steer_pred: 模型预测的引导偏转角 (B,)，训练时与 actual_steer 做 MSE
             # 输出yaw的旋转速度，单位 rad/s 
             # 模型通过调整 yaw_rate 来改变无人机的朝向，从而影响后续的 target_v_local 和 state 输入，形成闭环控制。
             # act_raw 的前3维是加速度，后3维是预测的当前速度 
             # h是输出的隐藏状态，用于 GRU 的时间依赖建模，后续会在 Truncated BPTT 中 detach。
+            
+            # 收集引导偏转预测历史 (用于 loss_steer_pred)
+            steer_pred_history.append(steer_pred)
+            steer_actual_history.append(actual_steer)
             
             # 偏航控制：累积 yaw_rate 到 yaw_offset
             if yaw_control and yaw_rate_raw is not None:
@@ -899,6 +914,8 @@ class DroneTrainer:
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
         yaw_history_stacked = torch.stack(yaw_history) if yaw_history else None  # (T, B) or None
+        steer_pred_stacked = torch.stack(steer_pred_history) if steer_pred_history else None  # (T, B) or None
+        steer_actual_stacked = torch.stack(steer_actual_history) if steer_actual_history else None  # (T, B) or None
         
         # 计算损失
         loss, metrics = self.losser.forward(
@@ -911,7 +928,9 @@ class DroneTrainer:
             env_margin=self.env.margin,
             env_g_std=self.g_std,
             yaw_history=yaw_history_stacked,
-            p_target=p_target
+            p_target=p_target,
+            steer_pred_history=steer_pred_stacked,
+            steer_actual_history=steer_actual_stacked
         )
         
         # 计算额外指标

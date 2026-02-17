@@ -35,6 +35,7 @@ class DroneLoss:
                  coef_stall=0.0,
                  coef_yaw_explore=0.0,
                  coef_progress=0.0,
+                 coef_steer_pred=0.0,
                  yaw_penalty_start_rad=0.5,
                  ctl_dt=0.02,
                  window_size=30):
@@ -60,6 +61,9 @@ class DroneLoss:
             coef_progress (float): 路径进度损失权重。奖励任何缩短与目标距离的运动，
                 允许模型绕行而不被强制沿直线飞行。负梯度鼓励模型在面对障碍物时
                 选择绕行路径而非原地停滞。
+            coef_steer_pred (float): 引导偏转预测损失权重。模型预测的偏转角与深度图计算的
+                实际偏转角之间的 MSE 损失。用于自蒸馏：训练时学习预测引导偏转，
+                推理时用模型预测值替代深度图计算。
             yaw_penalty_start_rad (float): 偏航探索损失中"开始由奖励转惩罚"的角度阈值（弧度）。
                 即 |yaw| < alpha 时为奖励区间，|yaw| > alpha 时为惩罚区间。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
@@ -78,7 +82,8 @@ class DroneLoss:
             'bias': coef_bias,
             'stall': coef_stall,
             'yaw_explore': coef_yaw_explore,
-            'progress': coef_progress
+            'progress': coef_progress,
+            'steer_pred': coef_steer_pred
         }
         self.ctl_dt = ctl_dt
         self.window_size = window_size
@@ -109,7 +114,9 @@ class DroneLoss:
                 env_margin,
                 env_g_std=None,
                 yaw_history=None,
-                p_target=None):
+                p_target=None,
+                steer_pred_history=None,
+                steer_actual_history=None):
         """
         计算总损失和各项指标。
 
@@ -126,6 +133,8 @@ class DroneLoss:
                 否则为 None。用于计算 yaw_explore 损失。
             p_target: (B, 3) 目标位置（ROS 坐标系）。用于计算 progress 损失，
                 为 None 则跳过 progress 损失计算。
+            steer_pred_history: (T, B) 模型预测的引导偏转角历史。仅在启用引导时提供。
+            steer_actual_history: (T, B) 深度图计算的实际偏转角历史 (已 detach)。
 
         Returns:
             tuple: (总损失, 指标字典)
@@ -298,6 +307,16 @@ class DroneLoss:
             loss_yaw_explore = torch.tensor(0.0, device=p_history.device)
         metrics['loss_yaw_explore'] = loss_yaw_explore
 
+        # 引导偏转预测损失: 模型预测的偏转角 vs 深度图计算的实际偏转角
+        # 自蒸馏模式: 训练时用深度图计算结果 (teacher) 监督模型预测 (student)
+        if steer_pred_history is not None and steer_actual_history is not None:
+            steer_pred_history = to_tensor(steer_pred_history)    # (T, B)
+            steer_actual_history = to_tensor(steer_actual_history)  # (T, B)
+            loss_steer_pred = F.mse_loss(steer_pred_history, steer_actual_history.detach())
+        else:
+            loss_steer_pred = torch.tensor(0.0, device=p_history.device)
+        metrics['loss_steer_pred'] = loss_steer_pred
+
         # 总损失
         total_loss = (
             self.coefs['v'] * loss_v +
@@ -312,7 +331,8 @@ class DroneLoss:
             self.coefs['bias'] * loss_bias +
             self.coefs['stall'] * loss_stall +
             self.coefs['yaw_explore'] * loss_yaw_explore +
-            self.coefs['progress'] * loss_progress
+            self.coefs['progress'] * loss_progress +
+            self.coefs['steer_pred'] * loss_steer_pred
         )
 
         # 附加指标
