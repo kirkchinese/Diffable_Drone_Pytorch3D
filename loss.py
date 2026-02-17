@@ -116,7 +116,7 @@ class DroneLoss:
         Args:
             p_history: (T, B, 3) 位置历史。
             v_history: (T, B, 3) 速度历史。
-            target_vel_history: (T, B, 3) 目标速度历史。
+            target_vel_history: (T, B, 3) 指向目标的向量历史。
             act_history: (T_act, B, 3) 动作历史。
             vec_to_obj_history: (T, B, 3) 到最近障碍物的向量历史。
             v_preds: (T, B, 3) 模型预测的速度。
@@ -256,7 +256,12 @@ class DroneLoss:
             # step_progress: (T-1, B) 正值 = 靠近目标
             step_progress = -torch.diff(dist_to_target, dim=0)
             # loss = 负的平均进度 → 最小化 loss = 最大化进度
-            loss_progress = -step_progress.mean()
+            # clamp(-0.3, ...): 地板限制, 防止无限负损失——进度奖励有2层含义:
+            #   1. 崩塔防护: 没有地板时, 优化器会无限压低 progress loss,
+            #      等价于无限提高飞行速度 → 碰撞损失被进度奖励淡化 → 莽撞
+            #   2. 梯度平衡: 达到地板后, progress 的梯度为 0,
+            #      让其他损失项 (碰撞/避障) 主导行为, 而不是和 progress 比大小
+            loss_progress = -step_progress.mean().clamp(-0.3, 10.0)
         else:
             loss_progress = torch.tensor(0.0, device=p_history.device)
         metrics['loss_progress'] = loss_progress

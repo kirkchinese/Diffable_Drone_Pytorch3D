@@ -251,6 +251,16 @@ def parse_args():
                         help='全向感知扇区数量（默认 8，每 45° 一个）')
     parser.add_argument('--panoramic_max_range', type=float, default=8.0,
                         help='全向感知最大探测距离（米）')
+    parser.add_argument('--enable_guidance', default=False, action='store_true',
+                        help='启用基于深度图的动态引导方向。当正前方被大面积障碍物遮挡时，\n'
+                             '自动将目标方向偏向深度图中空旷的区域，打破"停下来最优"的局部极小值。\n'
+                             '需要显式传入 --enable_guidance 来启用')
+    parser.add_argument('--guidance_steer_gain', type=float, default=2.0,
+                        help='引导转向增益系数 η。可通行性梯度到偏转角的放大倍率。\n'
+                             '值越大→遮挡时偏转越用力。默认 2.0')
+    parser.add_argument('--guidance_gate_threshold', type=float, default=0.35,
+                        help='引导门控阈值。中央 1/3 区域遮挡程度超过此值时开始偏转。\n'
+                             '0.35 表示 35%% 遮挡触发。使用 sigmoid 平滑过渡，无硬切换')
     parser.add_argument('--debug', default=False, action='store_true',
                         help='启用 PyTorch autograd anomaly detection。\n'
                              '检测 NaN/Inf 梯度并打印产生异常梯度的前向传播位置。\n'
@@ -530,6 +540,72 @@ class DroneTrainer:
         # 构建旋转矩阵：列向量分别为 [fwd, left, up]
         R = torch.stack([fwd, torch.linalg.cross(up, fwd), up], -1)  # (B, 3, 3)
         return R
+
+    @torch.no_grad()
+    def _compute_guidance_direction(self, depth, target_v_raw,
+                                    steer_gain=2.0, gate_threshold=0.35):
+        """
+        可通行性梯度引导：沿“空旷度增加”的方向偏转目标航向。
+
+        数学模型:
+            定义每列可通行性  c_u = D_u / D_max ∈ [0, 1]
+            定义归一化列位置  w_u ∈ [-1, +1] (左=+1, 右=-1)
+
+            可通行性梯度 (清晰度与列位置的相关性):
+                ∇c = (2/W) · Σ_u c_u · w_u
+
+            门控信号 (中央遮挡程度 b → sigmoid 平滑开关):
+                g(b) = σ(10 · (b - b_thresh))
+
+            最终转向角 (单一公式, 无 if/else):
+                Δψ = clamp(η · g(b) · ∇c,  -0.8·HFOV, +0.8·HFOV)
+
+            属性:
+            - ∇c > 0 → 左侧更通畅 → 左偏转
+            - ∇c < 0 → 右侧更通畅 → 右偏转
+            - ∇c = 0 → 对称遮挡 → 不偏转 (两侧等价, 无偏好)
+            - g(b) ≈ 0 → 前方畅通 → 不干预
+            - g(b) ≈ 1 → 前方堵塞 → 强制偏转
+
+        Args:
+            depth: (B, H, W) 原始深度图
+            target_v_raw: (B, 3) 目标方向向量 (世界坐标系)
+            steer_gain: 转向增益系数 η，控制梯度到偏转角的放大倍率
+            gate_threshold: 中央遮挡程度阈值 b_thresh
+
+        Returns:
+            guided_target_v: (B, 3) 引导后的目标方向向量
+        """
+        B, H, W = depth.shape
+        args = self.args
+
+        # 列平均可通行性 c_u ∈ [0, 1]
+        bg_mask = (depth < 0) | (depth > args.depth_max)
+        d = depth.clone()
+        d[bg_mask] = args.depth_max
+        d = d.clamp(args.depth_min, args.depth_max)
+        col_clear = d.mean(dim=1) / args.depth_max  # (B, W)
+
+        # 可通行性梯度: clearance 与归一化列位置的加权和
+        # w_u ∈ [+1, -1]: 左边=+1, 右边=-1
+        w = torch.linspace(1.0, -1.0, W, device=depth.device)  # (W,)
+        grad_c = (col_clear * w.unsqueeze(0)).sum(dim=1) / (W / 2)  # (B,)
+
+        # 门控: 中央 1/3 的遮挡程度 → sigmoid 平滑开关
+        cs, ce = W // 3, W * 2 // 3
+        blockage = 1.0 - col_clear[:, cs:ce].mean(dim=1)  # (B,)
+        gate = torch.sigmoid(10.0 * (blockage - gate_threshold))  # (B,)
+
+        # 转向角 = 增益 × 门控 × 梯度, 限幅于 ±0.8·HFOV
+        hfov_rad = math.radians(args.hfov)
+        steer = (steer_gain * gate * grad_c).clamp(-hfov_rad * 0.8, hfov_rad * 0.8)  # (B,)
+
+        # 绕 Z 轴旋转 target_v_raw
+        cos_s, sin_s = torch.cos(steer), torch.sin(steer)
+        tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+        return torch.stack([cos_s * tx - sin_s * ty,
+                            sin_s * tx + cos_s * ty,
+                            target_v_raw[:, 2]], dim=-1)
     
     def run_episode(self, iteration):
         """
@@ -588,7 +664,7 @@ class DroneTrainer:
         # 历史记录
         p_history = []
         v_history = []
-        target_v_history = []
+        target_vel_history = [] # 记录每步指向目标的向量
         vec_to_pt_history = []
         v_preds = []
         yaw_history = []  # 偏航偏移累积历史 (仅 yaw_control 模式)
@@ -634,7 +710,7 @@ class DroneTrainer:
             
             p_target[:, 2] = p_target[:, 2].clamp(1.5, spawn_z_max)  # 限制 Z 范围
         
-        target_v_raw = p_target - self.env.p
+        target_v_raw = p_target - self.env.p  # 指向目标的原始向量
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
@@ -696,18 +772,31 @@ class DroneTrainer:
             else:
                 target_v_raw = p_target - self.env.p.detach()  # detach 防止通过瞬移优化
             
-            # 偏航控制：将目标向量按 yaw_offset 旋转
+            # ======== 动态引导方向 (方案 A) ========
+            # 当正前方被大面积障碍物遮挡时，将目标方向偏向深度图中空旷的区域，
+            # 使 loss_v 不再惩罚合理的绕行运动，打破"停下来最优"的局部极小值
+            guidance_enabled = getattr(args, 'enable_guidance', False)
+            if guidance_enabled:
+                guided_target_v = self._compute_guidance_direction(
+                    depth, target_v_raw,
+                    steer_gain=getattr(args, 'guidance_steer_gain', 2.0),
+                    gate_threshold=getattr(args, 'guidance_gate_threshold', 0.35),
+                )
+            else:
+                guided_target_v = target_v_raw
+            
+            # 偏航控制：将引导后的目标向量按 yaw_offset 旋转
             # 旋转后无人机机头朝向旋转后的方向，而非直接朝向目标
             if yaw_control:
                 cos_y = torch.cos(yaw_offset)  # (B,)
                 sin_y = torch.sin(yaw_offset)
-                # 绕 Z 轴旋转 target_v_raw 的 XY 分量
-                tx, ty = target_v_raw[:, 0], target_v_raw[:, 1]
+                # 绕 Z 轴旋转 guided_target_v 的 XY 分量
+                tx, ty = guided_target_v[:, 0], guided_target_v[:, 1]
                 rotated_x = cos_y * tx - sin_y * ty
                 rotated_y = sin_y * tx + cos_y * ty
-                heading_vector = torch.stack([rotated_x, rotated_y, target_v_raw[:, 2]], dim=-1)
+                heading_vector = torch.stack([rotated_x, rotated_y, guided_target_v[:, 2]], dim=-1)
             else:
-                heading_vector = target_v_raw
+                heading_vector = guided_target_v
             
             # 执行动作 (使用延迟缓冲中的动作)
             # 关键：使用 act_buffer[t] 而不是取模，参考项目的实现方式
@@ -718,10 +807,23 @@ class DroneTrainer:
             # 计算局部坐标系
             R_local = self._compute_local_R()
             
-            # 计算目标速度向量
-            target_v_norm = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
-            target_v_unit = target_v_raw / (target_v_norm + 1e-6)
-            target_v = target_v_unit * torch.minimum(target_v_norm, max_speed)
+            # ======== target_v 计算 ========
+            # 引导开启时: target_v 方向跟随 guided_target_v (含引导偏转)
+            #   → loss_v 惩罚"偏离引导方向"而非偏离终点, 使绕行不被惩罚
+            # 引导关闭时: target_v 方向指向终点 (与原始行为一致)
+            #
+            # 注意: 引导只改变 target_v 方向, 不改变速度大小。
+            # 速度大小始终用 min(到终点距离, max_speed), 确保接近终点时减速。
+            # 这不会让模型“自己给自己定方向”，因为引导的偏转角度由深度图中客观的
+            # 可通行性梯度决定，不受模型输出影响，且前方畅通时偏转角 = 0。
+            if guidance_enabled:
+                effective_target_dir = guided_target_v  # 引导偏转后的方向
+            else:
+                effective_target_dir = target_v_raw     # 原始终点方向
+            target_v_norm = torch.norm(effective_target_dir, p=2, dim=-1, keepdim=True)
+            target_v_unit = effective_target_dir / (target_v_norm + 1e-6)
+            dist_to_goal = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
+            target_v = target_v_unit * torch.minimum(dist_to_goal, max_speed)
             target_v_local = torch.squeeze(target_v[:, None] @ R_local, 1)
             local_v = torch.squeeze(self.env.v[:, None] @ R_local, 1)
             
@@ -756,14 +858,13 @@ class DroneTrainer:
             x[bg_mask] = 0.0    # 空像素设为 0（无障碍物）
             x = x + torch.randn_like(x) * 0.02  # 添加噪声
             x = x.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
-            # 可选: stride=1 max_pool 膨胀障碍物，类似 C-space expansion。
-            # 默认禁用；仅在擦碰问题严重时通过 --depth_dilate 5 开启。
-            # if args.depth_dilate > 1:
-            #     pad = args.depth_dilate // 2
-            #     x = F.max_pool2d(x, kernel_size=args.depth_dilate, stride=1, padding=pad)
 
             # 模型推理
-            act_raw, yaw_rate_raw, h = self.model(x, state, h)
+            act_raw, yaw_rate_raw, h = self.model(x, state, h) # 增加了yaw_rate_raw 输出。
+            # 输出yaw的旋转速度，单位 rad/s 
+            # 模型通过调整 yaw_rate 来改变无人机的朝向，从而影响后续的 target_v_local 和 state 输入，形成闭环控制。
+            # act_raw 的前3维是加速度，后3维是预测的当前速度 
+            # h是输出的隐藏状态，用于 GRU 的时间依赖建模，后续会在 Truncated BPTT 中 detach。
             
             # 偏航控制：累积 yaw_rate 到 yaw_offset
             if yaw_control and yaw_rate_raw is not None:
@@ -778,7 +879,7 @@ class DroneTrainer:
             if t > 0 and t % 30 == 0:
                 h = h.detach()
             
-            act_reshaped = act_raw.reshape(B, 3, 2)  # 关键修复！直接 reshape 为 (B, 3, 2)
+            act_reshaped = act_raw.reshape(B, 3, 2)  # reshape 为 (B, 3, 2)
             act_world = R_local @ act_reshaped  # 转换到世界坐标系 (B, 3, 2)
             a_pred, v_pred = act_world.unbind(-1)  # 分离加速度和速度预测
             
@@ -789,11 +890,11 @@ class DroneTrainer:
             act_buffer.append(act)
             
             v_history.append(self.env.v)
-            target_v_history.append(target_v)
+            target_vel_history.append(target_v)
 
         p_history = torch.stack(p_history)          # (T, B, 3)
         v_history = torch.stack(v_history)          # (T, B, 3)
-        target_v_history = torch.stack(target_v_history)  # (T, B, 3)
+        target_vel_history = torch.stack(target_vel_history)  # (T, B, 3)
         vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
@@ -803,7 +904,7 @@ class DroneTrainer:
         loss, metrics = self.losser.forward(
             p_history=p_history,
             v_history=v_history,
-            target_vel_history=target_v_history,
+            target_vel_history=target_vel_history, # 传入指向目标的向量历史，不是速度历史 我自己都乱了...
             act_history=act_buffer_stacked,
             vec_to_obj_history=vec_to_pt_history,
             v_preds=v_preds,
