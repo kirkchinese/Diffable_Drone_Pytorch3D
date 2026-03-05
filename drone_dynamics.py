@@ -407,7 +407,12 @@ def simulate_position_step(
     # [New] 计算梯度衰减参数 (decay per step)
     # 必须 **dt 以保证时间一致性：即无论 dt 大小如何，单位时间内的总衰减量恒定。
     # 对应参考项目 CUDA 源码 dynamics_kernel.cu 中的 `pow(grad_decay, ctl_dt)`
-    decay_factor = grad_decay ** dt
+    # 支持 per-sample tensor 输入 (CMA-ES adaptive decay) 或标量输入 (原有模式)
+    if isinstance(grad_decay, torch.Tensor):
+        # per-sample decay: (B,) → (B, 1) 以便与 (B, 3) 的 p, v 广播
+        decay_factor = grad_decay.pow(dt).unsqueeze(-1)
+    else:
+        decay_factor = grad_decay ** dt
 
     # 使用 g_decay 包裹上一时刻的状态变量 p 和 v
     # 这样在反向传播时，流经 p 和 v 的梯度会被衰减，防止长序列梯度爆炸

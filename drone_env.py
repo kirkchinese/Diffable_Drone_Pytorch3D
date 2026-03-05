@@ -289,7 +289,7 @@ class DroneSimulator:
 
         return self._get_state(), obj_to_ros(target_obj)
 
-    def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None):
+    def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None, override_grad_decay=None):
         """
         执行一步模拟并更新状态
         
@@ -333,7 +333,7 @@ class DroneSimulator:
             enable_induced_drag=self.enable_induced_drag,
             dg=self.dg,
             v_wind=v_wind,
-            grad_decay=self.grad_decay,
+            grad_decay=override_grad_decay if override_grad_decay is not None else self.grad_decay,
             # 完整暴露参数
             pitch_ctl_delay=self.pitch_ctl_delay,
             drag_coef_lin=self.drag_coef_lin,

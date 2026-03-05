@@ -65,7 +65,7 @@ class Model_bigger(nn.Module):
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
         act = self.fc(self.act(hx))
-        return act, None, hx
+        return act, img_feat, hx
 
 
 class Model_adaptive(nn.Module):
@@ -218,6 +218,54 @@ class Model_640x480(nn.Module):
         hx = self.gru(x, hx)
         act = self.fc(self.act(hx))
         return act, None, hx
+
+
+class DecayController(nn.Module):
+    """
+    CMA-ES 优化的梯度衰减控制器。
+    
+    接收主网络 CNN 提取的图像特征（detach），输出 per-sample 的梯度衰减因子。
+    参数由 CMA-ES 进化搜索，不参与梯度训练。
+    
+    输出范围: [decay_min, decay_min + decay_range] 通过 sigmoid 映射。
+    默认 [0.2, 1.0]。
+    """
+    def __init__(self, feat_dim=256, decay_min=0.2, decay_range=0.8):
+        super().__init__()
+        self.decay_min = decay_min
+        self.decay_range = decay_range
+        self.linear = nn.Linear(feat_dim, 1)
+        # 零初始化: sigmoid(0)=0.5 → decay=0.6
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+    
+    def forward(self, img_feat):
+        """
+        Args:
+            img_feat: (B, feat_dim), 从主网络 CNN detach 后的特征
+        Returns:
+            decay: (B,), 每个 sample 的梯度衰减因子 ∈ [decay_min, decay_min+decay_range]
+        """
+        raw = self.linear(img_feat)
+        decay = self.decay_min + self.decay_range * torch.sigmoid(raw)
+        return decay.squeeze(-1)
+    
+    def get_params_vector(self):
+        """将所有参数展平为一维向量（CMA-ES 接口）"""
+        return torch.cat([p.data.flatten() for p in self.parameters()])
+    
+    def set_params_vector(self, vector):
+        """从一维向量恢复参数（CMA-ES 接口）"""
+        offset = 0
+        for p in self.parameters():
+            numel = p.numel()
+            p.data.copy_(vector[offset:offset + numel].reshape(p.shape))
+            offset += numel
+    
+    @property
+    def num_params(self):
+        """CMA-ES 搜索空间维度"""
+        return sum(p.numel() for p in self.parameters())
 
 
 if __name__ == '__main__':
