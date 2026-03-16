@@ -59,9 +59,19 @@ try:
 except ImportError:
     HAS_IMAGEIO = False
 
-from drone_env import DroneSimulator
-from model import Model, Model_bigger
-from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
+# Heavy imports moved to runtime paths to allow --help without pytorch3d
+# from drone_env import DroneSimulator
+# from model import Model, Model_bigger
+# from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
+from testscript.navigation_metrics import (
+    classify_episode,
+    detect_stagnation,
+    detect_spinning,
+)
+from testscript.freeze_signals import (
+    center_edge_clearance_ratio,
+    idle_ratio,
+)
 
 
 # ================================================================
@@ -165,6 +175,20 @@ def parse_args():
     parser.add_argument('--max_speed', type=float, default=2.5,
                         help='目标最大速度 (m/s)，固定值用于评估一致性')
 
+    # 导航评估参数 (Task 2: 修正goal/stagnation/spin评估)
+    parser.add_argument('--goal_radius', type=float, default=0.5,
+                        help='目标达成距离阈值 (m)')
+    parser.add_argument('--stagnation_window', type=int, default=30,
+                        help='停滞检测时间窗口 (步数)')
+    parser.add_argument('--stagnation_progress', type=float, default=0.1,
+                        help='停滞检测最小进步距离 (m)')
+    parser.add_argument('--stagnation_speed', type=float, default=0.1,
+                        help='停滞检测速度阈值 (m/s)')
+    parser.add_argument('--spin_near_goal_radius', type=float, default=1.0,
+                        help='近目标旋转检测半径 (m)')
+    parser.add_argument('--spin_yaw_thresh', type=float, default=2 * 3.14159,
+                        help='旋转检测偏航角阈值 (rad)')
+
     # 输出控制
     parser.add_argument('--save_video', action='store_true', default=True,
                         help='保存 RGB/Depth 视频 (需要 imageio)')
@@ -259,6 +283,10 @@ class EvalRunner:
     """可视化评估运行器"""
 
     def __init__(self, args):
+        from drone_env import DroneSimulator
+        from model import Model_bigger
+        from scene_generator import SceneGenerator
+
         self.args = args
         self.device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
         print(f"[EvalRunner] 设备: {self.device}")
@@ -427,6 +455,12 @@ class EvalRunner:
             'margin': self.env.margin.cpu().numpy().copy(),  # (B,)
             'p_start': self.env.p.clone().cpu().numpy(),
             'p_target': p_target.clone().cpu().numpy(),
+            # Task 2: 额外导航评估数据
+            'yaw': [],             # (T, B)     偏航角 (rad)
+            'action_norm': [],     # (T, B)     动作范数
+            'v_pred_norm': [],     # (T, B)     预测速度范数
+            # Task 4: freeze diagnostics
+            'center_edge_ratio': [],  # (T, B)  center/edge clearance ratio per batch
         }
 
         for t in tqdm(range(args.timesteps), desc=f'Episode {episode_idx}', leave=False):
@@ -519,9 +553,26 @@ class EvalRunner:
 
             rec['target_v'].append(target_v.cpu().numpy().copy())
 
+            # Task 2: 记录额外导航评估数据
+            # yaw from heading vector (atan2 of heading y, x components)
+            heading_vec = self.env.R[:, :, 0]  # (B, 3)
+            yaw = torch.atan2(heading_vec[:, 1], heading_vec[:, 0])  # (B,)
+            rec['yaw'].append(yaw.cpu().numpy().copy())
+            # action norm
+            rec['action_norm'].append(act.norm(2, -1).cpu().numpy().copy())
+            # predicted speed norm (from model output)
+            rec['v_pred_norm'].append(v_pred.norm(2, -1).cpu().numpy().copy())
+            
+            # Task 4: 记录 center-edge clearance ratio (per-sample, per-batch)
+            # Compute from model depth input (depth_lo) for ALL samples in batch
+            depth_batch = depth_lo.cpu().numpy()  # (B, H, W)
+            center_edges = np.array([center_edge_clearance_ratio(depth_batch[b]) for b in range(B)])
+            rec['center_edge_ratio'].append(center_edges)
+
         # 堆叠
         for key in ['p', 'v', 'a', 'speed', 'dist_to_obs', 'dist_to_target',
-                    'target_v', 'heading', 'attitude_z', 'depth_valid_pct', 'collision']:
+                    'target_v', 'heading', 'attitude_z', 'depth_valid_pct', 'collision',
+                    'yaw', 'action_norm', 'v_pred_norm', 'center_edge_ratio']:
             rec[key] = np.stack(rec[key], axis=0)
 
         # 打印 episode 摘要
@@ -534,6 +585,52 @@ class EvalRunner:
             print(f"  [Ep{episode_idx} B{b}] Collisions={n_coll}/{args.timesteps} | "
                   f"Avg Speed={avg_spd:.2f} m/s | Min Dist={min_d:.3f} m | "
                   f"Final->Target={final_d:.2f} m | Avg Depth Valid={avg_depth:.1f}%")
+
+        # Task 2: 使用 navigation_metrics 进行轨迹分类
+        rec['verdicts'] = []
+        for b in range(B):
+            init_dist = float(np.linalg.norm(rec['p_start'][b] - rec['p_target'][b]))
+            final_dist = float(rec['dist_to_target'][-1, b])
+            min_clearance = float(rec['dist_to_obs'][:, b].min())
+            collided = bool(rec['collision'][:, b].any())
+            timed_out = True  # 评估总是有时限
+
+            # 检测停滞
+            stagnated = detect_stagnation(
+                rec['dist_to_target'][:, b].tolist(),
+                rec['speed'][:, b].tolist(),
+                min_progress=args.stagnation_progress,
+                speed_thresh=args.stagnation_speed,
+                window=args.stagnation_window,
+            )
+
+            # 检测旋转
+            spun = detect_spinning(
+                rec['yaw'][:, b].tolist(),
+                rec['dist_to_target'][:, b].tolist(),
+                near_goal_radius=args.spin_near_goal_radius,
+                yaw_thresh=args.spin_yaw_thresh,
+            )
+
+            # Task 4: 计算 idle ratio (低速度比例)
+            idle = idle_ratio(rec['speed'][:, b], args.stagnation_speed)
+
+            # 分类
+            verdict = classify_episode(
+                init_dist=init_dist,
+                final_dist=final_dist,
+                min_clearance=min_clearance,
+                collided=collided,
+                timed_out=timed_out,
+                stagnated=stagnated,
+                spun=spun,
+                goal_radius=args.goal_radius,
+            )
+            # Task 4: 添加额外诊断数据到 verdict
+            verdict['idle_ratio'] = idle
+            verdict['mean_center_edge_ratio'] = float(rec['center_edge_ratio'][:, b].mean())
+            verdict['min_center_edge_ratio'] = float(rec['center_edge_ratio'][:, b].min())
+            rec['verdicts'].append(verdict)
 
         return rec
 
@@ -947,6 +1044,9 @@ class EvalRunner:
         p_target = rec['p_target'][sample_idx]
         margin = rec['margin'][sample_idx]
 
+        # Task 2: 获取verdict
+        verdict = rec['verdicts'][sample_idx]
+
         csv_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_log.csv')
         with open(csv_path, 'w') as f:
             f.write('step,time_s,'
@@ -954,9 +1054,11 @@ class EvalRunner:
                     'vel_x,vel_y,vel_z,speed,'
                     'acc_x,acc_y,acc_z,'
                     'heading_x,heading_y,heading_z,'
+                    'yaw,action_norm,v_pred_norm,'
                     'dist_to_obs,margin,collision,'
                     'dist_to_target,progress_pct,'
-                    'depth_valid_pct\n')
+                    'depth_valid_pct,'
+                    'verdict_success,verdict_reason\n')
             init_d2t = float(np.linalg.norm(rec['p_start'][sample_idx] - p_target))
             for t in range(T):
                 p = rec['p'][t, sample_idx]
@@ -964,6 +1066,9 @@ class EvalRunner:
                 a = rec['a'][t, sample_idx]
                 h = rec['heading'][t, sample_idx]
                 spd = rec['speed'][t, sample_idx]
+                yaw = rec['yaw'][t, sample_idx]
+                act_norm = rec['action_norm'][t, sample_idx]
+                v_pred = rec['v_pred_norm'][t, sample_idx]
                 dst = rec['dist_to_obs'][t, sample_idx]
                 coll = int(rec['collision'][t, sample_idx])
                 d2t = rec['dist_to_target'][t, sample_idx]
@@ -974,9 +1079,11 @@ class EvalRunner:
                         f'{v[0]:.4f},{v[1]:.4f},{v[2]:.4f},{spd:.4f},'
                         f'{a[0]:.4f},{a[1]:.4f},{a[2]:.4f},'
                         f'{h[0]:.4f},{h[1]:.4f},{h[2]:.4f},'
+                        f'{yaw:.4f},{act_norm:.4f},{v_pred:.4f},'
                         f'{dst:.4f},{margin:.4f},{coll},'
                         f'{d2t:.4f},{prog:.2f},'
-                        f'{dpct:.2f}\n')
+                        f'{dpct:.2f},'
+                        f'{int(verdict["success"])},{verdict["failure_reason"]}\n')
         print(f"  [Saved] CSV 日志: {csv_path}")
         return csv_path
 
@@ -997,6 +1104,15 @@ class EvalRunner:
         depth_pcts = []
         max_speeds = []
         init_dists = []
+        # Task 2: 新增评估统计
+        n_success = 0
+        n_stagnation = 0
+        n_spin = 0
+        n_collision_fail = 0
+        n_timeout = 0
+        # Task 4: freeze diagnostics
+        idle_ratios = []
+        center_edge_ratios = []
 
         for i, rec in enumerate(all_records):
             T = rec['p'].shape[0]
@@ -1019,8 +1135,27 @@ class EvalRunner:
                 init_dists.append(init_d)
                 depth_pcts.append(avg_depth)
 
+                # Task 2: 分类统计
+                verdict = rec['verdicts'][b]
+                if verdict['success']:
+                    n_success += 1
+                elif verdict['failure_reason'] == 'stagnation':
+                    n_stagnation += 1
+                elif verdict['failure_reason'] == 'spinning':
+                    n_spin += 1
+                elif verdict['failure_reason'] == 'collision':
+                    n_collision_fail += 1
+                elif verdict['failure_reason'] == 'timeout':
+                    n_timeout += 1
+
+                # Task 4: collect freeze diagnostics
+                idle_ratios.append(verdict.get('idle_ratio', 0.0))
+                center_edge_ratios.append(verdict.get('mean_center_edge_ratio', 1.0))
+
                 progress = max(0, (1 - final_d / max(init_d, 0.01))) * 100
+                status = "成功" if verdict['success'] else verdict['failure_reason']
                 print(f"  Episode {i}, Drone {b}: "
+                      f"状态={status} | "
                       f"碰撞={n_coll}/{T} | "
                       f"平均/峰值速度={avg_spd:.2f}/{max_spd:.2f} m/s | "
                       f"最小距离={min_d:.3f} m | "
@@ -1042,6 +1177,21 @@ class EvalRunner:
                             for fd, id_ in zip(final_dists, init_dists)]) * 100
         print(f"  平均完成进度: {avg_prog:.1f}%")
         print(f"  深度图平均覆盖率: {np.mean(depth_pcts):.1f}%")
+        # Task 2: 导航分类摘要
+        print("-" * 70)
+        print(f"  导航分类统计:")
+        print(f"    成功 (goal):     {n_success}/{n_eps} ({100*n_success/max(n_eps,1):.1f}%)")
+        print(f"    停滞 (stagnation): {n_stagnation}/{n_eps} ({100*n_stagnation/max(n_eps,1):.1f}%)")
+        print(f"    旋转 (spinning):  {n_spin}/{n_eps} ({100*n_spin/max(n_eps,1):.1f}%)")
+        print(f"    碰撞 (collision): {n_collision_fail}/{n_eps} ({100*n_collision_fail/max(n_eps,1):.1f}%)")
+        print(f"    超时 (timeout):   {n_timeout}/{n_eps} ({100*n_timeout/max(n_eps,1):.1f}%)")
+        if idle_ratios:
+            print(f"  Freeze 诊断:")
+            print(f"    Idle 比率 (speed < {self.args.stagnation_speed}): "
+                  f"{np.mean(idle_ratios):.2%} (均值)")
+            print(f"    Center/Edge 开口比: "
+                  f"{np.mean(center_edge_ratios):.3f} (均值), "
+                  f"{np.min(center_edge_ratios):.3f} (最小)")
         print("=" * 70)
 
 
@@ -1095,4 +1245,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    # Early exit for help to avoid loading heavy imports (pytorch3d)
+    if '--help' in sys.argv or '-h' in sys.argv:
+        parse_args()  # Just parse and show help
+    else:
+        main()
