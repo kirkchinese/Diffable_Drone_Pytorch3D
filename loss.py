@@ -32,6 +32,7 @@ class DroneLoss:
                  coef_d_snap=0.0,
                  coef_ground_affinity=0.0,
                  coef_bias=0.0,
+                 coef_lateral=0.0,
                  ctl_dt=0.02,
                  window_size=30):
         """
@@ -48,6 +49,8 @@ class DroneLoss:
             coef_d_snap (float): 快照（snap）平滑损失权重。
             coef_ground_affinity (float): 地面亲和损失权重。
             coef_bias (float): 偏向损失权重。
+            coef_lateral (float): 横向运动惩罚权重。0.0=横向完全免罚（推荐），
+                >0时轻微惩罚横向分量以防止绕圈。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
         """
@@ -61,7 +64,8 @@ class DroneLoss:
             'd_jerk': coef_d_jerk,
             'd_snap': coef_d_snap,
             'ground_affinity': coef_ground_affinity,
-            'bias': coef_bias
+            'bias': coef_bias,
+            'lateral': coef_lateral
         }
         self.ctl_dt = ctl_dt
         self.window_size = window_size
@@ -133,7 +137,25 @@ class DroneLoss:
         loss_ground_affinity = p_history[..., 2].relu().pow(2).mean()
         metrics['loss_ground_affinity'] = loss_ground_affinity
 
-        # 速度跟踪损失：平均速度与目标速度的平滑L1损失
+        # 速度跟踪损失：速度分解法（Velocity Decomposition）
+        # 将速度分解为前向分量（朝目标方向）和横向分量（垂直于目标方向）
+        # 只惩罚前向速度不足（shortfall），横向运动不额外惩罚
+        # 
+        # 数学原理：
+        #   target_unit = target_v / ||target_v||
+        #   v_fwd = dot(v_avg, target_unit)           → 前向速度标量
+        #   shortfall = relu(target_speed - v_fwd)    → 只惩罚比目标慢
+        #   loss_v = smooth_l1(shortfall)
+        #
+        # 关键性质：
+        #   - v=0: loss = smooth_l1(target_speed) （静止被惩罚）
+        #   - v=横向: loss = smooth_l1(target_speed) （与静止相同，横向免罚）
+        #   - v=45°绕行: loss = smooth_l1(target_speed - ||v||*cos45°) （优于静止）
+        #   - v=满速前进: loss ≈ 0 （最优）
+        #   
+        # 这打破了旧 loss 中的 APF 局部最小值：
+        #   旧 loss: ||v_lateral - target_v||² = max_speed² + v_lat² > max_speed²
+        #   → 横向运动比静止损失更高 → 无人机在障碍物前停滞
         if T > self.window_size:
             v_history_cum = v_history.cumsum(0)
             v_history_avg = (v_history_cum[self.window_size:] - v_history_cum[:-self.window_size]) / self.window_size
@@ -145,11 +167,29 @@ class DroneLoss:
                 v_history_avg = v_history_avg[:min_len]
                 target_slice = target_slice[:min_len]
 
-            delta_v = torch.norm(v_history_avg - target_slice, 2, -1)
-            loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
+            # 速度分解
+            target_speed = torch.norm(target_slice, p=2, dim=-1)  # (T', B)
+            target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)  # (T', B, 3)
+            
+            # 前向分量：v 在 target 方向上的投影
+            v_fwd = torch.sum(v_history_avg * target_unit, dim=-1)  # (T', B)
+            
+            # 前向损失：只惩罚速度不足（不惩罚超速）
+            shortfall = F.relu(target_speed - v_fwd)  # (T', B)
+            loss_v = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
+            
+            # 可选：横向分量惩罚（防止绕圈，默认关闭）
+            if self.coefs['lateral'] > 0:
+                v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit  # (T', B, 3)
+                v_perp_norm = torch.norm(v_perp, p=2, dim=-1)  # (T', B)
+                loss_lateral = F.smooth_l1_loss(v_perp_norm, torch.zeros_like(v_perp_norm))
+            else:
+                loss_lateral = torch.tensor(0.0, device=p_history.device)
         else:
             loss_v = torch.tensor(0.0, device=p_history.device)
+            loss_lateral = torch.tensor(0.0, device=p_history.device)
         metrics['loss_v'] = loss_v
+        metrics['loss_lateral'] = loss_lateral
 
         # 预测速度损失：模型预测与实际速度的MSE损失
         loss_v_pred = F.mse_loss(v_preds, v_history.detach())
@@ -174,7 +214,7 @@ class DroneLoss:
         # snap 计算：参考项目用 F.normalize 而不是手动归一化
         # snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)
         thrust_vec = act_history - env_g_std
-        thrust_dir = F.normalize(thrust_vec, dim=-1)  # 使用 F.normalize 更稳定
+        thrust_dir = F.normalize(thrust_vec, dim=-1, eps=1e-6)  # 避免零向量导致 NaN
         snap_history = thrust_dir.diff(1, 0).diff(1, 0).mul((1.0 / self.ctl_dt) ** 2)
         loss_d_snap = snap_history.pow(2).sum(-1).mean()
 
@@ -219,6 +259,7 @@ class DroneLoss:
         # 总损失
         total_loss = (
             self.coefs['v'] * loss_v +
+            self.coefs['lateral'] * loss_lateral +
             self.coefs['speed'] * loss_speed +
             self.coefs['v_pred'] * loss_v_pred +
             self.coefs['collide'] * loss_collide +

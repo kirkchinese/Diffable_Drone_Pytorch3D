@@ -58,7 +58,7 @@ class TrainingMonitor:
         
         self.key_metrics = key_metrics or [
             'loss', 'loss_v', 'loss_collide', 'loss_obj_avoidance',
-            'success_rate', 'avg_speed', 'ar'
+            'success_rate', 'reach_rate', 'collision_free_rate', 'goal_progress', 'avg_speed', 'ar', 'task_score'
         ]
         
         # 滑动窗口存储（用于实时平滑显示）
@@ -256,7 +256,9 @@ class TrainingMonitor:
             '# 损失': ['loss', 'loss_v', 'loss_v_pred', 'loss_collide',
                         'loss_obj_avoidance', 'loss_d_acc', 'loss_d_jerk',
                         'loss_speed', 'loss_ground_affinity', 'loss_bias'],
-            '# 模型性能': ['success_rate', 'avg_speed', 'max_speed', 'ar'],
+            '# 模型性能': ['success_rate', 'reach_rate', 'collision_free_rate',
+                        'goal_progress', 'goal_distance_best', 'goal_distance_final',
+                        'avg_speed', 'max_speed', 'ar', 'task_score'],
             '# 迭代速度': ['step_time', 'lr'],
         }
         
@@ -268,7 +270,7 @@ class TrainingMonitor:
                     continue
                 val = sum(w) / len(w)
                 # 格式化
-                if k == 'success_rate':
+                if k in {'success_rate', 'reach_rate', 'collision_free_rate', 'goal_progress'}:
                     displayed.append(f"  {k:25s}  {val:>10.1%}")
                 elif k == 'lr':
                     displayed.append(f"  {k:25s}  {val:>10.2e}")
@@ -326,9 +328,13 @@ class TrainingMonitor:
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         
-        # 1c: 成功率 + AR
+        # 1c: 严格成功率/抵达率/任务分数
         ax = axes[1, 0]
-        for key, label, color in [('success_rate', 'Success Rate', 'C2'), ('ar', 'AR (SR×Speed)', 'C3')]:
+        for key, label, color in [
+            ('success_rate', 'Strict Success Rate', 'C2'),
+            ('reach_rate', 'Reach Rate', 'C6'),
+            ('task_score', 'Task Score', 'C3'),
+        ]:
             if key in self._history and len(self._history[key]) > 0:
                 vals = np.array(self._history[key])
                 ax.plot(steps[:len(vals)], vals, alpha=0.2, color=color, linewidth=0.5)
@@ -336,7 +342,7 @@ class TrainingMonitor:
                     smoothed = self._moving_average(vals, min(50, len(vals) // 3))
                     ax.plot(steps[len(steps)-len(smoothed):], smoothed,
                             color=color, linewidth=2, label=label)
-        ax.set_title('Success Rate & AR')
+        ax.set_title('Strict Success / Reach / Task Score')
         ax.set_xlabel('Iteration')
         ax.legend()
         ax.grid(True, alpha=0.3)

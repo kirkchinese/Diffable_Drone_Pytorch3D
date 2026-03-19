@@ -112,6 +112,7 @@ class DroneRenderer:
             
         self.image_size = image_size  # (H, W)
         self.H, self.W = image_size
+        self.mesh_path = mesh_path
         
         # 处理焦距参数 — 预计算为 Tensor，避免每帧重复 tuple→tensor 转换
         if isinstance(focal_length, (float, int)) or (torch.is_tensor(focal_length) and focal_length.dim() == 0):
@@ -227,6 +228,7 @@ class DroneRenderer:
         """
         if subdivide_times is None:
             subdivide_times = self.subdivide_times
+        self.mesh_path = mesh_path
         self.mesh = self._load_mesh(mesh_path, subdivide_times=subdivide_times)
         # 重新采样障碍物点云
         self.obstacle_pcd = sample_points_from_meshes(self.mesh, num_samples=num_samples).to(self.device)

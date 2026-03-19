@@ -61,6 +61,11 @@ except ImportError:
 
 from drone_env import DroneSimulator
 from model import Model, Model_bigger
+from navigation_utils import (
+    compute_local_frame,
+    compute_navigation_metrics_np,
+    preprocess_depth_for_model,
+)
 from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
 
 
@@ -176,6 +181,10 @@ def parse_args():
 
     # 硬件
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
+    parser.add_argument('--reach_radius', type=float, default=0.5,
+                        help='判定到达目标点的半径阈值 (米)')
+    parser.add_argument('--random_init_yaw', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否在 reset 时随机化无人机初始偏航角')
 
     return parser.parse_args()
 
@@ -311,6 +320,7 @@ class EvalRunner:
             enable_random_scene=args.random_scene,
             scene_generator=self.scene_generator,
             safe_spawn_clearance=args.safe_clearance,
+            random_init_yaw=args.random_init_yaw,
         )
 
         # ---------- 高分辨率广角渲染器 ----------
@@ -340,15 +350,7 @@ class EvalRunner:
 
     # ---- 局部坐标系 (复用训练逻辑) ----
     def _compute_local_R(self):
-        fwd = self.env.R[:, :, 0].clone()
-        up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0
-        up[:, 2] = 1
-        fwd_norm = torch.norm(fwd, p=2, dim=-1, keepdim=True)
-        fwd = torch.where(fwd_norm > 1e-6, fwd / (fwd_norm + 1e-8),
-                          torch.tensor([1.0, 0.0, 0.0], device=fwd.device).expand_as(fwd))
-        R = torch.stack([fwd, torch.linalg.cross(up, fwd), up], -1)
-        return R
+        return compute_local_frame(self.env.R)
 
     # ================================================================
     # 运行单个 episode
@@ -469,7 +471,7 @@ class EvalRunner:
                 (dist < self.env.margin).cpu().numpy().copy()
             )
             # 模型深度图有效像素比例
-            depth_valid = (depth_lo > 0).float().mean(dim=(-1, -2)).cpu().numpy() * 100
+            depth_valid = ((depth_lo > 0) & (depth_lo <= args.depth_max)).float().mean(dim=(-1, -2)).cpu().numpy() * 100
             rec['depth_valid_pct'].append(depth_valid.copy())
             # 保存模型输入深度图 (低分辨率)
             rec['model_depth_frames'].append(depth_lo.cpu().numpy().copy())
@@ -502,11 +504,12 @@ class EvalRunner:
             state = torch.cat(state_parts, dim=-1)
 
             # 深度图预处理（与 train.py 完全一致）
-            bg_mask = (depth_lo < 0)
-            x = depth_lo.clamp(args.depth_min, args.depth_max)
-            x = 3.0 / x - 0.6
-            x[bg_mask] = 0.0
-            x = x.unsqueeze(1)  # (B, 1, H, W)
+            x = preprocess_depth_for_model(
+                depth_lo,
+                depth_min=args.depth_min,
+                depth_max=args.depth_max,
+                noise_std=0.0,
+            )
 
             act_raw, _, h = self.model(x, state, h)
 
@@ -529,11 +532,17 @@ class EvalRunner:
             n_coll = int(rec['collision'][:, b].sum())
             avg_spd = float(rec['speed'][:, b].mean())
             min_d = float(rec['dist_to_obs'][:, b].min())
-            final_d = float(rec['dist_to_target'][-1, b])
+            nav = compute_navigation_metrics_np(
+                rec['dist_to_target'][:, b],
+                rec['collision'][:, b],
+                reach_radius=args.reach_radius,
+            )
             avg_depth = float(rec['depth_valid_pct'][:, b].mean())
-            print(f"  [Ep{episode_idx} B{b}] Collisions={n_coll}/{args.timesteps} | "
-                  f"Avg Speed={avg_spd:.2f} m/s | Min Dist={min_d:.3f} m | "
-                  f"Final->Target={final_d:.2f} m | Avg Depth Valid={avg_depth:.1f}%")
+            print(f"  [Ep{episode_idx} B{b}] Success={int(nav['success'])} | "
+                  f"Reached={int(nav['reached_target'])} | CollisionFree={int(nav['collision_free'])} | "
+                  f"Collisions={n_coll}/{args.timesteps} | Avg Speed={avg_spd:.2f} m/s | "
+                  f"Min Obs Dist={min_d:.3f} m | Best/Final->Target={nav['best_dist']:.2f}/{nav['final_dist']:.2f} m | "
+                  f"Avg Depth Valid={avg_depth:.1f}%")
 
         return rec
 
@@ -557,6 +566,11 @@ class EvalRunner:
         p_target = rec['p_target'][sample_idx]
         T = p.shape[0]
         t_axis = np.arange(T) * self.ctl_dt
+        nav = compute_navigation_metrics_np(
+            d2t,
+            collision,
+            reach_radius=self.args.reach_radius,
+        )
 
         fig = plt.figure(figsize=(24, 20))
         gs = GridSpec(4, 3, figure=fig, hspace=0.35, wspace=0.30)
@@ -683,15 +697,16 @@ class EvalRunner:
         n_collisions = int(coll_mask.sum())
         avg_speed_val = float(speed.mean())
         min_dist_val = float(dist.min())
-        final_dist = float(d2t[-1])
-        init_dist = float(np.linalg.norm(p_start - p_target))
-        progress = max(0, (1 - final_dist / max(init_dist, 0.01))) * 100
+        final_dist = nav['final_dist']
+        best_dist = nav['best_dist']
+        progress = nav['progress'] * 100
         fig.suptitle(
             f'Episode {episode_idx} | '
+            f'Success: {int(nav["success"])} | '
             f'Coll: {n_collisions}/{T} | '
             f'Speed: {avg_speed_val:.2f} m/s | '
             f'Min Obs: {min_dist_val:.3f} m | '
-            f'Target: {final_dist:.1f} m ({progress:.0f}%)',
+            f'Target best/final: {best_dist:.1f}/{final_dist:.1f} m ({progress:.0f}%)',
             fontsize=13, y=0.99
         )
 
@@ -944,8 +959,12 @@ class EvalRunner:
             save_dir = self.args.output_dir
 
         T = rec['p'].shape[0]
-        p_target = rec['p_target'][sample_idx]
         margin = rec['margin'][sample_idx]
+        nav = compute_navigation_metrics_np(
+            rec['dist_to_target'][:, sample_idx],
+            rec['collision'][:, sample_idx],
+            reach_radius=self.args.reach_radius,
+        )
 
         csv_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_log.csv')
         with open(csv_path, 'w') as f:
@@ -955,9 +974,8 @@ class EvalRunner:
                     'acc_x,acc_y,acc_z,'
                     'heading_x,heading_y,heading_z,'
                     'dist_to_obs,margin,collision,'
-                    'dist_to_target,progress_pct,'
+                    'dist_to_target,reached_target,progress_pct,'
                     'depth_valid_pct\n')
-            init_d2t = float(np.linalg.norm(rec['p_start'][sample_idx] - p_target))
             for t in range(T):
                 p = rec['p'][t, sample_idx]
                 v = rec['v'][t, sample_idx]
@@ -967,7 +985,8 @@ class EvalRunner:
                 dst = rec['dist_to_obs'][t, sample_idx]
                 coll = int(rec['collision'][t, sample_idx])
                 d2t = rec['dist_to_target'][t, sample_idx]
-                prog = max(0, (1.0 - d2t / max(init_d2t, 0.01))) * 100
+                reached = int(d2t <= self.args.reach_radius)
+                prog = max(0.0, min(100.0, nav['progress'] * 100))
                 dpct = rec['depth_valid_pct'][t, sample_idx]
                 f.write(f'{t},{t * self.ctl_dt:.4f},'
                         f'{p[0]:.4f},{p[1]:.4f},{p[2]:.4f},'
@@ -975,7 +994,7 @@ class EvalRunner:
                         f'{a[0]:.4f},{a[1]:.4f},{a[2]:.4f},'
                         f'{h[0]:.4f},{h[1]:.4f},{h[2]:.4f},'
                         f'{dst:.4f},{margin:.4f},{coll},'
-                        f'{d2t:.4f},{prog:.2f},'
+                    f'{d2t:.4f},{reached},{prog:.2f},'
                         f'{dpct:.2f}\n')
         print(f"  [Saved] CSV 日志: {csv_path}")
         return csv_path
@@ -991,9 +1010,13 @@ class EvalRunner:
 
         total_steps = 0
         total_collisions = 0
+        success_count = 0
+        reach_count = 0
+        collision_free_count = 0
         speeds = []
         min_dists = []
         final_dists = []
+        best_dists = []
         depth_pcts = []
         max_speeds = []
         init_dists = []
@@ -1006,40 +1029,52 @@ class EvalRunner:
                 avg_spd = float(rec['speed'][:, b].mean())
                 max_spd = float(rec['speed'][:, b].max())
                 min_d = float(rec['dist_to_obs'][:, b].min())
-                final_d = float(rec['dist_to_target'][-1, b])
-                init_d = float(np.linalg.norm(rec['p_start'][b] - rec['p_target'][b]))
+                nav = compute_navigation_metrics_np(
+                    rec['dist_to_target'][:, b],
+                    rec['collision'][:, b],
+                    reach_radius=self.args.reach_radius,
+                )
                 avg_depth = float(rec['depth_valid_pct'][:, b].mean())
 
                 total_steps += T
                 total_collisions += n_coll
+                success_count += int(nav['success'])
+                reach_count += int(nav['reached_target'])
+                collision_free_count += int(nav['collision_free'])
                 speeds.append(avg_spd)
                 max_speeds.append(max_spd)
                 min_dists.append(min_d)
-                final_dists.append(final_d)
-                init_dists.append(init_d)
+                final_dists.append(nav['final_dist'])
+                best_dists.append(nav['best_dist'])
+                init_dists.append(nav['initial_dist'])
                 depth_pcts.append(avg_depth)
 
-                progress = max(0, (1 - final_d / max(init_d, 0.01))) * 100
+                progress = nav['progress'] * 100
                 print(f"  Episode {i}, Drone {b}: "
+                      f"成功={int(nav['success'])} | 抵达={int(nav['reached_target'])} | 无碰撞={int(nav['collision_free'])} | "
                       f"碰撞={n_coll}/{T} | "
                       f"平均/峰值速度={avg_spd:.2f}/{max_spd:.2f} m/s | "
                       f"最小距离={min_d:.3f} m | "
-                      f"终端距离={final_d:.2f} m ({progress:.0f}% 完成) | "
+                      f"最佳/终端距离={nav['best_dist']:.2f}/{nav['final_dist']:.2f} m ({progress:.0f}% 完成) | "
                       f"深度覆盖={avg_depth:.1f}%")
 
         print("-" * 70)
         n_eps = len(speeds)
         print(f"  总 Episode 数: {len(all_records)} ({n_eps} 个轨迹)")
+        print(f"  严格成功率 SR: {success_count}/{max(n_eps, 1)} ({100 * success_count / max(n_eps, 1):.2f}%)")
+        print(f"  抵达率: {reach_count}/{max(n_eps, 1)} ({100 * reach_count / max(n_eps, 1):.2f}%)")
+        print(f"  全程无碰撞率: {collision_free_count}/{max(n_eps, 1)} ({100 * collision_free_count / max(n_eps, 1):.2f}%)")
         print(f"  碰撞率: {total_collisions}/{total_steps} "
               f"({100 * total_collisions / max(total_steps, 1):.2f}%)")
         print(f"  平均速度: {np.mean(speeds):.2f} ± {np.std(speeds):.2f} m/s"
               f" (峰值 {np.max(max_speeds):.2f} m/s)")
         print(f"  最小障碍距离: {np.min(min_dists):.3f} m"
               f" (均值 {np.mean(min_dists):.3f} m)")
+        print(f"  最佳到目标距离: {np.mean(best_dists):.2f} ± {np.std(best_dists):.2f} m")
         print(f"  终端到目标距离: {np.mean(final_dists):.2f} ± {np.std(final_dists):.2f} m"
               f" (初始 {np.mean(init_dists):.1f} m)")
-        avg_prog = np.mean([max(0, 1 - fd / max(id_, 0.01))
-                            for fd, id_ in zip(final_dists, init_dists)]) * 100
+        avg_prog = np.mean([max(0, 1 - bd / max(id_, 0.01))
+                            for bd, id_ in zip(best_dists, init_dists)]) * 100
         print(f"  平均完成进度: {avg_prog:.1f}%")
         print(f"  深度图平均覆盖率: {np.mean(depth_pcts):.1f}%")
         print("=" * 70)

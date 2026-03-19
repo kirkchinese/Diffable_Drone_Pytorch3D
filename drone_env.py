@@ -1,3 +1,4 @@
+import math
 import torch
 import os
 import sys
@@ -60,6 +61,7 @@ class DroneSimulator:
                  enable_random_scene=False,
                  scene_generator=None,
                  safe_spawn_clearance=1.0,
+                 random_init_yaw=True,
                  ):
         
         self.B = batch_size
@@ -96,6 +98,7 @@ class DroneSimulator:
         self.enable_random_scene = enable_random_scene
         self.scene_generator = scene_generator
         self.safe_spawn_clearance = safe_spawn_clearance
+        self.random_init_yaw = random_init_yaw
         
         # 渲染器初始化
         if not os.path.exists(mesh_path) and not mesh_path.startswith("/"):
@@ -129,11 +132,24 @@ class DroneSimulator:
         #   Z: uniform(0.5, range + 0.5)
         self.p = (torch.rand(self.B, 3, device=self.device) - 0.5) * 2 * self.init_p_range
         self.p[:, 2] = torch.rand(self.B, device=self.device) * self.init_p_range + 0.5
+
+        self.gravity_vec = torch.tensor([0, 0, -self.gravity], device=self.device).unsqueeze(0).repeat(self.B, 1)
         
         self.v = torch.randn(self.B, 3, device=self.device) * self.init_v_range  # 速度
         self.a = torch.zeros(self.B, 3, device=self.device)       # 加速度
         self.act_curr = torch.zeros(self.B, 3, device=self.device)     # 实际推力状态 (Internal actuation state)
         self.R = torch.eye(3, device=self.device).unsqueeze(0).repeat(self.B, 1, 1) # 姿态
+        if self.random_init_yaw:
+            yaw = (torch.rand(self.B, device=self.device) * 2.0 - 1.0) * math.pi
+            c = torch.cos(yaw)
+            s = torch.sin(yaw)
+            o = torch.zeros_like(yaw)
+            l = torch.ones_like(yaw)
+            self.R = torch.stack([
+                c, -s, o,
+                s, c, o,
+                o, o, l,
+            ], -1).reshape(self.B, 3, 3)
         
         # 环境扰动
         self.dg = torch.randn((self.B, 3), device=self.device) * self.init_dg_range
