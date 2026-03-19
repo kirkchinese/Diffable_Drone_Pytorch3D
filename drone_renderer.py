@@ -174,6 +174,58 @@ class DroneRenderer:
         self._extended_mesh_cache = None
         self._extended_mesh_bs = 0
 
+        # 动态场景合成：额外网格（无人机机体、动态障碍物等）在渲染时与静态场景合并
+        self._dynamic_meshes = []
+        self._dynamic_pcds = []
+
+    # ================================================================
+    # 动态场景合成 API
+    # ================================================================
+
+    def set_dynamic_meshes(self, meshes, pcds=None):
+        """
+        设置渲染时需要额外合成的动态网格（如无人机机体、动态障碍物）。
+
+        调用后下一次 render() 会将这些网格与静态场景合并渲染。
+        pcds 用于碰撞检测：动态障碍物的点云会被纳入 full_obstacle_pcd。
+
+        Args:
+            meshes: list[Meshes]，需要合成的额外网格。
+            pcds: list[Tensor(1, N, 3)]，可选，额外网格对应的点云（OBJ 坐标系）。
+        """
+        self._dynamic_meshes = meshes if meshes else []
+        self._dynamic_pcds = pcds if pcds else []
+        # 使 extend 缓存失效
+        self._extended_mesh_cache = None
+        self._extended_mesh_bs = 0
+
+    def clear_dynamic_meshes(self):
+        """清除所有动态合成网格。"""
+        self.set_dynamic_meshes([], [])
+
+    @property
+    def render_mesh(self):
+        """
+        渲染用网格：静态场景 + 动态额外网格。
+
+        无动态网格时直接返回 self.mesh，避免多余的 join 开销。
+        """
+        if not self._dynamic_meshes:
+            return self.mesh
+        from pytorch3d.structures import join_meshes_as_scene
+        return join_meshes_as_scene([self.mesh] + self._dynamic_meshes)
+
+    @property
+    def full_obstacle_pcd(self):
+        """
+        碰撞检测用点云：静态障碍物 + 动态障碍物点云。
+
+        不包含无人机机体点云（无人机间碰撞由 inter_drone_distances 单独处理）。
+        """
+        if not self._dynamic_pcds:
+            return self.obstacle_pcd
+        return torch.cat([self.obstacle_pcd] + self._dynamic_pcds, dim=1)
+
     def create_variant(self, image_size=None, hfov_deg=None, focal_length=None,
                        z_clip_value=0.3, max_faces_per_bin=50000):
         """
@@ -338,7 +390,7 @@ class DroneRenderer:
         # 扩展网格以匹配批量大小（缓存复用，避免每帧重建）
         bs = len(cameras)
         if self._extended_mesh_bs != bs or self._extended_mesh_cache is None:
-            self._extended_mesh_cache = self.mesh.extend(bs)
+            self._extended_mesh_cache = self.render_mesh.extend(bs)
             self._extended_mesh_bs = bs
         meshes = self._extended_mesh_cache
         fragments = self.rasterizer(meshes, cameras=cameras)
@@ -531,8 +583,16 @@ class DroneRendererVariant:
         return self.parent.mesh
 
     @property
+    def render_mesh(self):
+        return self.parent.render_mesh
+
+    @property
     def obstacle_pcd(self):
         return self.parent.obstacle_pcd
+
+    @property
+    def full_obstacle_pcd(self):
+        return self.parent.full_obstacle_pcd
 
     @property
     def lights(self):
@@ -560,7 +620,7 @@ class DroneRendererVariant:
             image_size=self.image_size_tensor,
             in_ndc=False, R=R, T=T, device=self.device,
         )
-        mesh = self.parent.mesh.extend(len(cameras))
+        mesh = self.parent.render_mesh.extend(len(cameras))
         fragments = self.rasterizer(mesh, cameras=cameras)
 
         rgb_images = None

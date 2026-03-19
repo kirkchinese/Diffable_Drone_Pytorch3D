@@ -7,16 +7,21 @@ from pytorch3d.ops import knn_points, sample_points_from_meshes
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
-                                load_drone_mesh, transform_pos_ros2pt3d)
+                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 except ImportError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
-                                load_drone_mesh, transform_pos_ros2pt3d)
+                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
+
+try:
+    from drone_renderer_dynamic import DynamicObstacle
+except ImportError:
+    DynamicObstacle = None
 
 class DroneSimulator:
     def __init__(self, 
@@ -66,6 +71,11 @@ class DroneSimulator:
                  aero_margin=0.05,
                  # 多无人机交互参数
                  n_drones_per_group=1,
+                 # 动态障碍物参数
+                 enable_dynamic_obstacles=False,
+                 num_dynamic_obstacles_range=(2, 5),
+                 dynamic_obstacle_speed_range=(-0.5, 0.5),
+                 dynamic_obstacle_scale_range=(0.2, 0.8),
                  ):
         
         self.B = batch_size
@@ -106,6 +116,13 @@ class DroneSimulator:
         
         # 多无人机交互配置
         self.n_drones_per_group = n_drones_per_group
+
+        # 动态障碍物配置
+        self.enable_dynamic_obstacles = enable_dynamic_obstacles
+        self.num_dynamic_obstacles_range = num_dynamic_obstacles_range
+        self.dynamic_obstacle_speed_range = dynamic_obstacle_speed_range
+        self.dynamic_obstacle_scale_range = dynamic_obstacle_scale_range
+        self._dynamic_obstacles = []
         
         # 无人机网格加载
         self.drone_mesh = None
@@ -408,8 +425,150 @@ class DroneSimulator:
             dt=current_dt,
             yaw_ctl_delay=self.yaw_ctl_delay
         )
-        
+
+        # 更新动态障碍物位置
+        if self._dynamic_obstacles:
+            self._step_dynamic_obstacles(current_dt)
+
         return self._get_state()
+
+    # ================================================================
+    # 动态场景合成（无人机机体渲染 + 动态障碍物）
+    # ================================================================
+
+    def _update_render_scene(self):
+        """
+        更新渲染器的动态网格：将当前所有无人机机体和动态障碍物合成到渲染场景中。
+
+        在每次 render() 调用前自动执行，确保相机视角中能看到其他无人机和动态障碍物。
+        """
+        extra_meshes = []
+        extra_pcds = []
+
+        # 无人机机体网格（所有无人机对所有相机可见，自身机体在相机后方不会遮挡）
+        if self.drone_mesh is not None and self.n_drones_per_group > 1:
+            drone_meshes = self._compose_drone_meshes()
+            extra_meshes.extend(drone_meshes)
+
+        # 动态障碍物网格 + 点云
+        for obs in self._dynamic_obstacles:
+            extra_meshes.append(obs.get_transformed_mesh())
+            extra_pcds.append(obs.get_transformed_pcd())
+
+        if extra_meshes:
+            self.renderer.set_dynamic_meshes(extra_meshes, extra_pcds if extra_pcds else None)
+        else:
+            self.renderer.clear_dynamic_meshes()
+
+    @torch.no_grad()
+    def _compose_drone_meshes(self):
+        """
+        在所有无人机当前位置生成变换后的无人机网格（PyTorch3D 坐标系）。
+
+        Returns:
+            list[Meshes]: B 个变换后的无人机网格。
+        """
+        from pytorch3d.structures import Meshes
+
+        meshes = []
+        base_verts = self.drone_mesh.verts_packed()  # (V, 3)
+        base_faces = self.drone_mesh.faces_packed()  # (F, 3)
+        base_tex = self.drone_mesh.textures
+
+        for b in range(self.B):
+            # 中心化 → 旋转 → 平移（全部在 PyTorch3D/OBJ 坐标系）
+            verts_centered = base_verts - self._drone_centroid
+            R_pt3d = transform_rot_ros2pt3d(self.R[b])
+            verts_rotated = verts_centered @ R_pt3d.T
+            p_pt3d = transform_pos_ros2pt3d(self.p[b:b+1]).squeeze(0)
+            verts_world = verts_rotated + p_pt3d
+
+            meshes.append(Meshes(verts=[verts_world], faces=[base_faces], textures=base_tex))
+        return meshes
+
+    def _step_dynamic_obstacles(self, dt):
+        """推进所有动态障碍物一步。"""
+        for obs in self._dynamic_obstacles:
+            obs.step(dt)
+
+    @torch.no_grad()
+    def randomize_dynamic_obstacles(self, arena_range=None):
+        """
+        随机生成动态障碍物（球体/立方体），在每个 episode 开始时调用。
+
+        障碍物的位置和速度在 PyTorch3D/OBJ 坐标系中指定（与渲染网格一致）。
+        """
+        if DynamicObstacle is None:
+            print("[DroneSimulator] 警告: 无法导入 DynamicObstacle，跳过动态障碍物")
+            return
+        self.clear_dynamic_obstacles()
+
+        if arena_range is None:
+            arena_range = self.init_p_range
+
+        from pytorch3d.utils import ico_sphere
+        from pytorch3d.renderer import TexturesVertex
+        import numpy as np
+
+        lo, hi = self.num_dynamic_obstacles_range
+        num = np.random.randint(lo, hi + 1)
+        speed_lo, speed_hi = self.dynamic_obstacle_speed_range
+        scale_lo, scale_hi = self.dynamic_obstacle_scale_range
+
+        for _ in range(num):
+            # 随机形状
+            ptype = np.random.choice(['sphere', 'cube'])
+            if ptype == 'sphere':
+                mesh = ico_sphere(level=2, device=self.device)
+            else:
+                mesh = self._make_cube_mesh()
+
+            # 随机颜色纹理
+            verts = mesh.verts_list()[0]
+            color = torch.rand(3, device=self.device)
+            mesh.textures = TexturesVertex(verts_features=color.expand(verts.shape[0], 3)[None])
+
+            # OBJ 坐标系中的随机位置: X ∈ [-arena, arena], Y (高度) ∈ [0.3, arena], Z ∈ [-arena, arena]
+            pos = torch.zeros(3, device=self.device)
+            pos[0] = (torch.rand(1, device=self.device).item() * 2 - 1) * arena_range
+            pos[1] = torch.rand(1, device=self.device).item() * arena_range * 0.8 + 0.3
+            pos[2] = (torch.rand(1, device=self.device).item() * 2 - 1) * arena_range
+
+            # 随机速度
+            vel = torch.zeros(3, device=self.device)
+            for d in range(3):
+                vel[d] = torch.rand(1, device=self.device).item() * (speed_hi - speed_lo) + speed_lo
+
+            scale = torch.rand(1, device=self.device).item() * (scale_hi - scale_lo) + scale_lo
+
+            obs = DynamicObstacle(
+                mesh=mesh, position=pos, velocity=vel, scale=scale,
+                num_pcd_samples=500, device=self.device,
+            )
+            self._dynamic_obstacles.append(obs)
+
+        if num > 0:
+            print(f"[DynamicObs] 已生成 {num} 个动态障碍物 (速度 [{speed_lo}, {speed_hi}] m/s)")
+
+    def clear_dynamic_obstacles(self):
+        """清除所有动态障碍物并重置渲染器合成。"""
+        self._dynamic_obstacles = []
+        self.renderer.clear_dynamic_meshes()
+
+    def _make_cube_mesh(self):
+        """创建单位立方体 Meshes（无纹理）。"""
+        device = self.device
+        verts = torch.tensor([
+            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+            [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5], [0.5, 0.5,  0.5], [-0.5, 0.5,  0.5],
+        ], dtype=torch.float32, device=device)
+        faces = torch.tensor([
+            [0,1,2],[0,2,3],[4,6,5],[4,7,6],
+            [0,4,5],[0,5,1],[2,6,7],[2,7,3],
+            [0,3,7],[0,7,4],[1,5,6],[1,6,2],
+        ], dtype=torch.int64, device=device)
+        from pytorch3d.structures import Meshes
+        return Meshes(verts=[verts], faces=[faces])
 
     def render(self, camera_pitch=10.0, return_tensor=True, return_rgb=True, return_depth=True, dt=None):
         """
@@ -422,6 +581,9 @@ class DroneSimulator:
             return_depth (bool): 是否返回 Depth
             dt (float, optional): 仿真时间步长，用于特定渲染效果（如运动模糊、流计算），可选。
         """
+        # 更新动态场景合成（无人机机体网格 + 动态障碍物网格）
+        self._update_render_scene()
+
         R_camera, T_camera = self.renderer.compute_view_matrix(
             p_ros=self.p, 
             R_ros=self.R, 
@@ -459,7 +621,7 @@ class DroneSimulator:
         p1 = pos_obj.unsqueeze(1)
         B_size = p1.shape[0]
 
-        obstacle_pcd = self.renderer.obstacle_pcd
+        obstacle_pcd = self.renderer.full_obstacle_pcd
         if obstacle_pcd.shape[0] != B_size:
             obstacle_pcd_expanded = obstacle_pcd.expand(B_size, -1, -1)
         else:
@@ -540,7 +702,7 @@ class DroneSimulator:
 
         # 单次批量 KNN 查询: (1, S*B, 3) vs (1, N, 3)
         p_query = p_flat_obj.unsqueeze(0)  # (1, S*B, 3)
-        obstacle_pcd = self.renderer.obstacle_pcd  # (1, N, 3)
+        obstacle_pcd = self.renderer.full_obstacle_pcd  # (1, N, 3)
 
         result = knn_points(p_query, obstacle_pcd, K=1, return_nn=True)
         nearest_obj = result.knn.squeeze(0).squeeze(1)  # (S*B, 3)

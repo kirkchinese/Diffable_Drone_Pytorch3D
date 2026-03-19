@@ -165,10 +165,26 @@ def parse_args():
     # 无人机网格与多机交互
     parser.add_argument('--drone_mesh_path', type=str, default=None,
                         help='无人机网格路径 (如 ./data/base_model/drone.obj)')
-    parser.add_argument('--n_drones_per_group', type=int, default=1,
-                        help='多机分组大小 (1=单机, >1 启用组内碰撞检测)')
+    parser.add_argument('--n_drones_per_group', type=int, default=None,
+                        help='多机分组大小 (默认=batch_size, 即组内全部交互; 1=禁用碰撞检测)')
     parser.add_argument('--aero_margin', type=float, default=0.05,
                         help='无人机包围球之外的气动安全余量 (m)')
+
+    # 动态障碍物
+    parser.add_argument('--enable_dynamic_obstacles', action='store_true', default=False,
+                        help='启用动态障碍物（每个 episode 随机生成移动的球体/立方体）')
+    parser.add_argument('--num_dynamic_obstacles_min', type=int, default=2,
+                        help='动态障碍物最小数量')
+    parser.add_argument('--num_dynamic_obstacles_max', type=int, default=5,
+                        help='动态障碍物最大数量')
+    parser.add_argument('--dynamic_obs_speed_min', type=float, default=-0.5,
+                        help='动态障碍物最小速度')
+    parser.add_argument('--dynamic_obs_speed_max', type=float, default=0.5,
+                        help='动态障碍物最大速度')
+    parser.add_argument('--dynamic_obs_scale_min', type=float, default=0.2,
+                        help='动态障碍物最小缩放')
+    parser.add_argument('--dynamic_obs_scale_max', type=float, default=0.8,
+                        help='动态障碍物最大缩放')
 
     # 模型参数
     parser.add_argument('--no_odom', action='store_true', default=False,
@@ -329,7 +345,21 @@ class EvalRunner:
             # 无人机网格与多机交互
             drone_mesh_path=getattr(args, 'drone_mesh_path', None),
             aero_margin=getattr(args, 'aero_margin', 0.05),
-            n_drones_per_group=getattr(args, 'n_drones_per_group', 1),
+            n_drones_per_group=args.n_drones_per_group if args.n_drones_per_group is not None else args.batch_size,
+            # 动态障碍物
+            enable_dynamic_obstacles=getattr(args, 'enable_dynamic_obstacles', False),
+            num_dynamic_obstacles_range=(
+                getattr(args, 'num_dynamic_obstacles_min', 2),
+                getattr(args, 'num_dynamic_obstacles_max', 5),
+            ),
+            dynamic_obstacle_speed_range=(
+                getattr(args, 'dynamic_obs_speed_min', -0.5),
+                getattr(args, 'dynamic_obs_speed_max', 0.5),
+            ),
+            dynamic_obstacle_scale_range=(
+                getattr(args, 'dynamic_obs_scale_min', 0.2),
+                getattr(args, 'dynamic_obs_scale_max', 0.8),
+            ),
         )
 
         # ---------- 高分辨率广角渲染器 (使用 create_variant 共享 mesh/lights) ----------
@@ -381,6 +411,12 @@ class EvalRunner:
         if self.env.enable_random_scene and self.env.scene_generator is not None:
             self.env.randomize_scene()
             # 随机场景后 create_variant 自动共享 parent mesh，无需手动更新
+
+        # 动态障碍物随机化
+        if self.env.enable_dynamic_obstacles:
+            self.env.randomize_dynamic_obstacles(
+                arena_range=args.arena_range if args.random_scene else args.init_p_range,
+            )
 
         # 安全出生点 + 目标点
         spawn_z_max = getattr(args, 'spawn_z_max', 3.0)
@@ -717,7 +753,8 @@ class EvalRunner:
             fontsize=13, y=0.99
         )
 
-        path = os.path.join(save_dir, f'episode_{episode_idx:03d}_trajectory.png')
+        drone_tag = f'_drone{sample_idx:02d}' if self.args.batch_size > 1 else ''
+        path = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_trajectory.png')
         fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  [Saved] 轨迹图: {path}")
@@ -739,7 +776,8 @@ class EvalRunner:
             return None, None
 
         # ---- RGB 视频 ----
-        rgb_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_rgb.mp4')
+        drone_tag = f'_drone{sample_idx:02d}' if self.args.batch_size > 1 else ''
+        rgb_path = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_rgb.mp4')
         writer = imageio.get_writer(rgb_path, fps=fps, codec='libx264', quality=8)
         for t in range(T):
             frame = rec['rgb_frames'][t][sample_idx]  # (H, W, 3) uint8
@@ -748,7 +786,7 @@ class EvalRunner:
         print(f"  [Saved] RGB 视频: {rgb_path}")
 
         # ---- Depth 可视化视频 ----
-        depth_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_depth.mp4')
+        depth_path = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_depth.mp4')
         writer = imageio.get_writer(depth_path, fps=fps, codec='libx264', quality=8)
         for t in range(T):
             d = rec['depth_frames'][t][sample_idx]  # (H, W)
@@ -781,7 +819,8 @@ class EvalRunner:
         if save_dir is None:
             save_dir = self.args.output_dir
 
-        frame_dir = os.path.join(save_dir, f'episode_{episode_idx:03d}_frames')
+        drone_tag = f'_drone{sample_idx:02d}' if self.args.batch_size > 1 else ''
+        frame_dir = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_frames')
         os.makedirs(frame_dir, exist_ok=True)
 
         T = len(rec['rgb_frames'])
@@ -818,7 +857,8 @@ class EvalRunner:
 
         T = len(rec['rgb_frames'])
         fps = self.args.fps
-        comp_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_composite.mp4')
+        drone_tag = f'_drone{sample_idx:02d}' if self.args.batch_size > 1 else ''
+        comp_path = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_composite.mp4')
         writer = imageio.get_writer(comp_path, fps=fps, codec='libx264', quality=8,
                                     macro_block_size=1)
 
@@ -973,7 +1013,8 @@ class EvalRunner:
             reach_radius=self.args.reach_radius,
         )
 
-        csv_path = os.path.join(save_dir, f'episode_{episode_idx:03d}_log.csv')
+        drone_tag = f'_drone{sample_idx:02d}' if self.args.batch_size > 1 else ''
+        csv_path = os.path.join(save_dir, f'episode_{episode_idx:03d}{drone_tag}_log.csv')
         with open(csv_path, 'w') as f:
             f.write('step,time_s,'
                     'pos_x,pos_y,pos_z,'

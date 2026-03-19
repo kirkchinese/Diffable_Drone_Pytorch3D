@@ -122,10 +122,26 @@ def parse_args():
     parser.add_argument('--drone_mesh_path', type=str, default=None,
                         help='无人机网格路径 (如 ./data/base_model/drone.obj)，'
                              '用于计算安全半径和未来的无人机间渲染')
-    parser.add_argument('--n_drones_per_group', type=int, default=1,
-                        help='多机分组大小 (1=单机, >1 启用组内碰撞检测)')
+    parser.add_argument('--n_drones_per_group', type=int, default=None,
+                        help='多机分组大小 (默认=batch_size, 即组内全部交互; 1=禁用碰撞检测)')
     parser.add_argument('--aero_margin', type=float, default=0.05,
                         help='无人机包围球之外的气动安全余量 (m)')
+
+    # 动态障碍物
+    parser.add_argument('--enable_dynamic_obstacles', action='store_true', default=False,
+                        help='启用动态障碍物（每个 episode 随机生成移动的球体/立方体）')
+    parser.add_argument('--num_dynamic_obstacles_min', type=int, default=2,
+                        help='动态障碍物最小数量')
+    parser.add_argument('--num_dynamic_obstacles_max', type=int, default=5,
+                        help='动态障碍物最大数量')
+    parser.add_argument('--dynamic_obs_speed_min', type=float, default=-0.5,
+                        help='动态障碍物最小速度')
+    parser.add_argument('--dynamic_obs_speed_max', type=float, default=0.5,
+                        help='动态障碍物最大速度')
+    parser.add_argument('--dynamic_obs_scale_min', type=float, default=0.2,
+                        help='动态障碍物最小缩放')
+    parser.add_argument('--dynamic_obs_scale_max', type=float, default=0.8,
+                        help='动态障碍物最大缩放')
     
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
@@ -242,7 +258,21 @@ class DroneTrainer:
             # 无人机网格与多机交互
             drone_mesh_path=getattr(args, 'drone_mesh_path', None),
             aero_margin=getattr(args, 'aero_margin', 0.05),
-            n_drones_per_group=getattr(args, 'n_drones_per_group', 1),
+            n_drones_per_group=args.n_drones_per_group if args.n_drones_per_group is not None else args.batch_size,
+            # 动态障碍物
+            enable_dynamic_obstacles=getattr(args, 'enable_dynamic_obstacles', False),
+            num_dynamic_obstacles_range=(
+                getattr(args, 'num_dynamic_obstacles_min', 2),
+                getattr(args, 'num_dynamic_obstacles_max', 5),
+            ),
+            dynamic_obstacle_speed_range=(
+                getattr(args, 'dynamic_obs_speed_min', -0.5),
+                getattr(args, 'dynamic_obs_speed_max', 0.5),
+            ),
+            dynamic_obstacle_scale_range=(
+                getattr(args, 'dynamic_obs_scale_min', 0.2),
+                getattr(args, 'dynamic_obs_scale_max', 0.8),
+            ),
         )
         
         # 初始化模型
@@ -352,6 +382,12 @@ class DroneTrainer:
         # 随机场景生成 (如果启用)
         if self.env.enable_random_scene and self.env.scene_generator is not None:
             self.env.randomize_scene()
+
+        # 动态障碍物随机化 (如果启用)
+        if self.env.enable_dynamic_obstacles:
+            self.env.randomize_dynamic_obstacles(
+                arena_range=getattr(self.args, 'arena_range', 6.0),
+            )
         
         # 安全出生点采样 (如果启用)
         # 随机场景时自动启用跨地图模式，确保飞行路径穿越障碍区域
@@ -383,6 +419,7 @@ class DroneTrainer:
         target_v_history = []
         target_dist_history = []
         vec_to_pt_history = []
+        inter_drone_dist_list = []
         v_preds = []
         vid = []
         
@@ -472,7 +509,12 @@ class DroneTrainer:
             
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
-            vec_to_pt_history.append(self.env.vec_to_obj_subdivided(dt=current_dt))
+            vec_to_pt_history.append(self.env.combined_vec_to_nearest(dt=current_dt))
+
+            # 无人机间碰撞距离（用于专用的无人机碰撞损失）
+            if self.env.n_drones_per_group > 1:
+                drone_dist, _ = self.env.inter_drone_distances()
+                inter_drone_dist_list.append(drone_dist)
             
             # 保存可视化帧 (第5个样本)
             if is_save_iter(iteration) and B > 4:
@@ -552,6 +594,9 @@ class DroneTrainer:
         vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
+
+        # 无人机间碰撞距离历史
+        inter_drone_dist_history = torch.stack(inter_drone_dist_list) if inter_drone_dist_list else None
         
         # 计算损失
         loss, metrics = self.losser.forward(
@@ -562,7 +607,8 @@ class DroneTrainer:
             vec_to_obj_history=vec_to_pt_history,
             v_preds=v_preds,
             env_margin=self.env.margin,
-            env_g_std=self.g_std
+            env_g_std=self.g_std,
+            inter_drone_dist_history=inter_drone_dist_history,
         )
         
         # 计算额外指标
