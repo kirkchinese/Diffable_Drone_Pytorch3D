@@ -21,7 +21,6 @@
 """
 
 import os
-import math
 import argparse
 from datetime import datetime
 
@@ -67,6 +66,7 @@ from navigation_utils import (
     preprocess_depth_for_model,
 )
 from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
+from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
 
 
 # ================================================================
@@ -162,6 +162,14 @@ def parse_args():
     parser.add_argument('--pitch_ctl_delay', type=float, default=12.0)
     parser.add_argument('--airmode_coef', type=float, default=0.5)
 
+    # 无人机网格与多机交互
+    parser.add_argument('--drone_mesh_path', type=str, default=None,
+                        help='无人机网格路径 (如 ./data/base_model/drone.obj)')
+    parser.add_argument('--n_drones_per_group', type=int, default=1,
+                        help='多机分组大小 (1=单机, >1 启用组内碰撞检测)')
+    parser.add_argument('--aero_margin', type=float, default=0.05,
+                        help='无人机包围球之外的气动安全余量 (m)')
+
     # 模型参数
     parser.add_argument('--no_odom', action='store_true', default=False,
                         help='不使用里程计速度作为输入')
@@ -201,21 +209,17 @@ class HighResRenderer:
     这里犯了个错误，训练时模型使用极窄 FOV (焦距500 / 48x64 → ~7°)，这是不正常的，
     对可视化来说太窄了——用户需要看到周围环境来验证飞行行为。
     因此可视化渲染器使用独立的广角 FOV (默认 ~90°)。
+
+    注意: 推荐使用 DroneRenderer.create_variant() 代替本类。
     """
     def __init__(self, env_renderer, viz_size=(480, 640), hfov_deg=90.0):
-        from pytorch3d.renderer import (
-            RasterizationSettings, MeshRasterizer,
-            SoftPhongShader, PerspectiveCameras, PointLights
-        )
         self.device = env_renderer.device
         self.viz_H, self.viz_W = viz_size
         self.env_renderer = env_renderer
 
-        # 根据目标水平 FOV 计算焦距: f = (W/2) / tan(hfov/2)
-        hfov_rad = math.radians(hfov_deg)
-        focal = (self.viz_W / 2.0) / math.tan(hfov_rad / 2.0)
-        actual_hfov = 2 * math.degrees(math.atan(self.viz_W / 2.0 / focal))
-        actual_vfov = 2 * math.degrees(math.atan(self.viz_H / 2.0 / focal))
+        focal = hfov_to_focal(hfov_deg, self.viz_W)
+        actual_hfov = focal_to_hfov(focal, self.viz_W)
+        actual_vfov = focal_to_vfov(focal, self.viz_H)
         print(f"[HighResRenderer] {self.viz_W}x{self.viz_H}, "
               f"focal={focal:.1f}, FOV={actual_hfov:.0f}°x{actual_vfov:.0f}°")
 
@@ -229,6 +233,7 @@ class HighResRenderer:
 
         # 高分辨率下使用 coarse-to-fine 但增大 bin 容量，
         # 避免随机场景面片数多时 "Bin size was too small" 溢出
+        from pytorch3d.renderer import RasterizationSettings, MeshRasterizer, SoftPhongShader
         self.raster_settings = RasterizationSettings(
             image_size=(self.viz_H, self.viz_W),
             blur_radius=0.0,
@@ -291,9 +296,9 @@ class EvalRunner:
                   f"接地率: {args.ground_ratio:.0%}, 簇生率: {args.cluster_ratio:.0%}")
 
         # ---------- 根据 FOV 计算焦距 ----------
-        focal_length = (args.image_width / 2.0) / math.tan(math.radians(args.hfov / 2.0))
-        hfov_actual = 2 * math.degrees(math.atan(args.image_width / 2.0 / focal_length))
-        vfov_actual = 2 * math.degrees(math.atan(args.image_height / 2.0 / focal_length))
+        focal_length = hfov_to_focal(args.hfov, args.image_width)
+        hfov_actual = focal_to_hfov(focal_length, args.image_width)
+        vfov_actual = focal_to_vfov(focal_length, args.image_height)
         print(f"[Camera] 模型相机 HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
@@ -321,13 +326,16 @@ class EvalRunner:
             scene_generator=self.scene_generator,
             safe_spawn_clearance=args.safe_clearance,
             random_init_yaw=args.random_init_yaw,
+            # 无人机网格与多机交互
+            drone_mesh_path=getattr(args, 'drone_mesh_path', None),
+            aero_margin=getattr(args, 'aero_margin', 0.05),
+            n_drones_per_group=getattr(args, 'n_drones_per_group', 1),
         )
 
-        # ---------- 高分辨率广角渲染器 ----------
-        self.hires_renderer = HighResRenderer(
-            self.env.renderer,
-            viz_size=(args.viz_height, args.viz_width),
+        # ---------- 高分辨率广角渲染器 (使用 create_variant 共享 mesh/lights) ----------
+        self.hires_renderer = self.env.renderer.create_variant(
             hfov_deg=args.viz_fov,
+            image_size=(args.viz_height, args.viz_width),
         )
 
         # ---------- 模型 ----------
@@ -372,8 +380,7 @@ class EvalRunner:
 
         if self.env.enable_random_scene and self.env.scene_generator is not None:
             self.env.randomize_scene()
-            # 随机场景后需要更新高分辨率渲染器的mesh缓存
-            self.hires_renderer.env_renderer = self.env.renderer
+            # 随机场景后 create_variant 自动共享 parent mesh，无需手动更新
 
         # 安全出生点 + 目标点
         spawn_z_max = getattr(args, 'spawn_z_max', 3.0)

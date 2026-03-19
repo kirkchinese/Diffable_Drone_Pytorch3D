@@ -1,21 +1,20 @@
-import math
 import torch
 import os
 import sys
 from pytorch3d.ops import knn_points, sample_points_from_meshes
 
 # 尝试导入同目录下的模块
-# 如果在 notebooks 中运行，确保父目录在 sys.path 中
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
-    from drone_renderer import DroneRenderer
+    from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
+                                load_drone_mesh, transform_pos_ros2pt3d)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 except ImportError:
-    # 简单的 Fallback，防止直接运行此文件时找不到模块
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
-    from drone_renderer import DroneRenderer
+    from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
+                                load_drone_mesh, transform_pos_ros2pt3d)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 
@@ -24,20 +23,20 @@ class DroneSimulator:
                  batch_size=4, 
                  dt=0.02, 
                  device=None,
-                 mesh_path="data/sample/sample.obj", # 默认假设从根目录运行，可在外部覆盖
+                 mesh_path="data/sample/sample.obj",
                  image_size=(480, 640),
                  focal_length=500.0,
-                 principal_point=None,           # New
-                 lights_location=[[0.0, 0.0, -3.0]], # New
+                 principal_point=None,
+                 lights_location=[[0.0, 0.0, -3.0]],
                  num_samples=20000,
-                 subdivide_times=0,              # 网格细分次数 (0=不细分, 降低可大幅提升批量渲染性能)
+                 subdivide_times=0,
                  # 动力学参数
                  enable_airmode=True,
                  enable_induced_drag=False,
                  noise_std=0.04,
                  grad_decay=0.8,
                  yaw_inertia=5.0,
-                 yaw_ctl_delay=12.0,            # 更新默认值
+                 yaw_ctl_delay=12.0,
                  pitch_ctl_delay=12.0,
                  drag_coef_lin=0.375,
                  drag_coef_quad=0.0,
@@ -62,6 +61,11 @@ class DroneSimulator:
                  scene_generator=None,
                  safe_spawn_clearance=1.0,
                  random_init_yaw=True,
+                 # 无人机网格参数
+                 drone_mesh_path=None,
+                 aero_margin=0.05,
+                 # 多无人机交互参数
+                 n_drones_per_group=1,
                  ):
         
         self.B = batch_size
@@ -100,12 +104,26 @@ class DroneSimulator:
         self.safe_spawn_clearance = safe_spawn_clearance
         self.random_init_yaw = random_init_yaw
         
-        # 渲染器初始化
-        if not os.path.exists(mesh_path) and not mesh_path.startswith("/"):
-             potential_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), mesh_path)
-             if os.path.exists(potential_path):
-                 mesh_path = potential_path
+        # 多无人机交互配置
+        self.n_drones_per_group = n_drones_per_group
+        
+        # 无人机网格加载
+        self.drone_mesh = None
+        self.drone_bounding_radius = 0.15  # 默认值
+        self.aero_margin = aero_margin
+        if drone_mesh_path is not None:
+            drone_mesh_path = self._resolve_path(drone_mesh_path)
+            if os.path.exists(drone_mesh_path):
+                self.drone_mesh, self._drone_centroid, self.drone_bounding_radius = \
+                    load_drone_mesh(drone_mesh_path, device=self.device)
+                print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
+                      f"包围球半径={self.drone_bounding_radius:.3f}m, "
+                      f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m")
+            else:
+                print(f"[DroneSimulator] 警告: 无人机网格文件不存在: {drone_mesh_path}")
 
+        # 渲染器初始化
+        mesh_path = self._resolve_path(mesh_path)
         print(f"Loading mesh from: {mesh_path}")
         self.renderer = DroneRenderer(
             mesh_path=mesh_path,
@@ -122,25 +140,28 @@ class DroneSimulator:
         # 内部状态初始化
         self.reset()
 
+    @staticmethod
+    def _resolve_path(path):
+        """将相对路径解析为绝对路径。"""
+        if not os.path.exists(path) and not path.startswith("/"):
+            potential = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+            if os.path.exists(potential):
+                return potential
+        return path
+
     def reset(self):
         """重置无人机状态"""
-        # 运动学状态
-        # 位置随机化：X/Y 使用 randn 分布在 0 附近，Z 使用 rand 分布在 [0.5, 2.5] 之间 (假设 init_p_range=2.0)
-        # 原逻辑: torch.rand * range -> [0, range] (X,Y,Z 都是正的，且 Z 可能为 0)
-        # 新逻辑: 
-        #   X, Y: uniform(-range, range)
-        #   Z: uniform(0.5, range + 0.5)
         self.p = (torch.rand(self.B, 3, device=self.device) - 0.5) * 2 * self.init_p_range
         self.p[:, 2] = torch.rand(self.B, device=self.device) * self.init_p_range + 0.5
 
         self.gravity_vec = torch.tensor([0, 0, -self.gravity], device=self.device).unsqueeze(0).repeat(self.B, 1)
         
-        self.v = torch.randn(self.B, 3, device=self.device) * self.init_v_range  # 速度
-        self.a = torch.zeros(self.B, 3, device=self.device)       # 加速度
-        self.act_curr = torch.zeros(self.B, 3, device=self.device)     # 实际推力状态 (Internal actuation state)
-        self.R = torch.eye(3, device=self.device).unsqueeze(0).repeat(self.B, 1, 1) # 姿态
+        self.v = torch.randn(self.B, 3, device=self.device) * self.init_v_range
+        self.a = torch.zeros(self.B, 3, device=self.device)
+        self.act_curr = torch.zeros(self.B, 3, device=self.device)
+        self.R = torch.eye(3, device=self.device).unsqueeze(0).repeat(self.B, 1, 1)
         if self.random_init_yaw:
-            yaw = (torch.rand(self.B, device=self.device) * 2.0 - 1.0) * math.pi
+            yaw = (torch.rand(self.B, device=self.device) * 2.0 - 1.0) * torch.pi
             c = torch.cos(yaw)
             s = torch.sin(yaw)
             o = torch.zeros_like(yaw)
@@ -157,9 +178,14 @@ class DroneSimulator:
         # 模拟控制延迟的队列
         self.act_queue = [torch.zeros(self.B, 3, device=self.device) for _ in range(self.act_queue_len)]
         
-        # 安全边距
-        low, high = self.init_margin_range
-        self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
+        # 安全边距：基于无人机网格包围球 + 空气动力学边距 + 随机化
+        if self.drone_mesh is not None:
+            base_radius = self.drone_bounding_radius + self.aero_margin
+            # 在 base_radius 附近小范围随机化 (±10%)
+            self.margin = base_radius * (0.9 + 0.2 * torch.rand((self.B,), device=self.device))
+        else:
+            low, high = self.init_margin_range
+            self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
 
         return self._get_state()
 
@@ -526,29 +552,133 @@ class DroneSimulator:
         return vecs_ros.reshape(S, B, 3)  # (S, B, 3)
 
     def update_mesh(self, mesh_path, num_samples=None):
-        """
-        更换无人机的可视化网格模型
-        
-        Args:
-            mesh_path (str): 新的 .obj 文件路径
-            num_samples (int, optional): 重新采样点云的点数。如果为 None，使用 initialization 时的值。
-        """
-        # 路径预处理 (复用 __init__ 中的逻辑)
-        if not os.path.exists(mesh_path) and not mesh_path.startswith("/"):
-             potential_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), mesh_path)
-             if os.path.exists(potential_path):
-                 mesh_path = potential_path
-
+        """更换障碍物网格模型"""
+        mesh_path = self._resolve_path(mesh_path)
         print(f"Updating mesh to: {mesh_path}")
         samples = num_samples if num_samples is not None else self.num_samples
         self.renderer.update_mesh(mesh_path, num_samples=samples)
 
     @staticmethod
     def clean_depth_map(depth, min_dist=0.2, max_dist=10.0):
-        """
-        清洗深度图 (调用 DroneRenderer 的实现)
-        """
         return DroneRenderer.clean_depth_map(depth, min_dist=min_dist, max_dist=max_dist)
+
+    # ================================================================
+    # 无人机间交互
+    # ================================================================
+
+    def inter_drone_distances(self, p=None):
+        """
+        计算同组无人机之间的距离（使用椭球模型，参考项目 Z 轴 2x 缩放）。
+
+        参考项目在 CUDA kernel 中使用 4*(oz-cz)^2 (即 Z 轴距离权重 4x)，
+        等效于 Z 轴方向缩放 2x 的椭球碰撞模型。
+
+        Args:
+            p: (B, 3) 位置，默认使用 self.p。
+
+        Returns:
+            min_dist: (B,) 每架无人机到同组最近其他无人机的椭球距离。
+            min_vec: (B, 3) 到最近同组无人机的向量 (ROS 坐标系)。
+        """
+        if self.n_drones_per_group <= 1:
+            # 单机模式：无交互
+            return (torch.full((self.B,), 1e6, device=self.device),
+                    torch.zeros(self.B, 3, device=self.device))
+
+        pos = p if p is not None else self.p
+        B = pos.shape[0]
+        G = self.n_drones_per_group
+
+        # 将批量按组重排 (n_groups, G, 3)
+        n_groups = B // G
+        p_grouped = pos[:n_groups * G].view(n_groups, G, 3)
+
+        # 计算组内所有两两距离（椭球距离：Z 轴权重 2x）
+        # diff: (n_groups, G, G, 3)
+        diff = p_grouped.unsqueeze(2) - p_grouped.unsqueeze(1)
+        # 椭球距离：sqrt(dx^2 + dy^2 + 4*dz^2)
+        ellipsoid_dist_sq = diff[..., 0]**2 + diff[..., 1]**2 + 4 * diff[..., 2]**2
+        ellipsoid_dist = torch.sqrt(ellipsoid_dist_sq + 1e-8)
+
+        # 自身距离置为极大值
+        eye_mask = torch.eye(G, device=self.device, dtype=torch.bool).unsqueeze(0)
+        ellipsoid_dist = ellipsoid_dist.masked_fill(eye_mask, 1e6)
+
+        # 每架无人机的最近同组无人机
+        min_dist_grouped, min_idx = ellipsoid_dist.min(dim=2)  # (n_groups, G)
+
+        # 对应向量
+        min_idx_exp = min_idx.unsqueeze(-1).expand(-1, -1, 3)
+        min_vec_grouped = diff.gather(2, min_idx_exp.unsqueeze(2)).squeeze(2)
+
+        # 展平回 (B,)
+        min_dist = min_dist_grouped.view(-1)
+        min_vec = min_vec_grouped.view(-1, 3)
+
+        # 处理 B 不能整除 G 的剩余部分
+        if B > n_groups * G:
+            pad_n = B - n_groups * G
+            min_dist = torch.cat([min_dist,
+                                  torch.full((pad_n,), 1e6, device=self.device)])
+            min_vec = torch.cat([min_vec,
+                                 torch.zeros(pad_n, 3, device=self.device)])
+
+        return min_dist, min_vec
+
+    def inter_drone_vec_subdivided(self, n_subdiv=10, dt=None):
+        """
+        子步细分版本的无人机间距离计算。
+
+        沿轨迹 p + v * t 均匀采样 n_subdiv 个点，
+        计算每个子步位置处到同组最近无人机的向量。
+
+        Returns:
+            vecs: (S, B, 3) 各子步位置到最近同组无人机的向量。
+        """
+        if self.n_drones_per_group <= 1:
+            current_dt = dt if dt is not None else self.dt
+            S = n_subdiv
+            return torch.zeros(S, self.B, 3, device=self.device)
+
+        current_dt = dt if dt is not None else self.dt
+        sub_div = torch.linspace(0, current_dt, n_subdiv, device=self.device)
+        p_all = self.p.unsqueeze(0) + self.v.unsqueeze(0) * sub_div[:, None, None]
+        S, B, _ = p_all.shape
+
+        vecs_list = []
+        for s in range(S):
+            _, vec = self.inter_drone_distances(p_all[s])
+            vecs_list.append(vec)
+
+        return torch.stack(vecs_list, dim=0)  # (S, B, 3)
+
+    def combined_vec_to_nearest(self, n_subdiv=10, dt=None):
+        """
+        计算到最近障碍物（包括其他无人机）的向量 (子步细分)。
+
+        融合静态障碍物和动态无人机的最近点查询：
+        对每个子步取两者中距离更近者。
+
+        Returns:
+            vecs: (S, B, 3) 到最近物体（障碍物或无人机）的向量。
+        """
+        # 静态障碍物的子步查询
+        vecs_obs = self.vec_to_obj_subdivided(n_subdiv=n_subdiv, dt=dt)  # (S, B, 3)
+
+        if self.n_drones_per_group <= 1:
+            return vecs_obs
+
+        # 其他无人机的子步查询
+        vecs_drone = self.inter_drone_vec_subdivided(n_subdiv=n_subdiv, dt=dt)
+
+        # 取距离更近者
+        dist_obs = vecs_obs.norm(dim=-1)      # (S, B)
+        dist_drone = vecs_drone.norm(dim=-1)  # (S, B)
+
+        use_drone = dist_drone < dist_obs     # (S, B)
+        use_drone_exp = use_drone.unsqueeze(-1)  # (S, B, 1)
+
+        return torch.where(use_drone_exp, vecs_drone, vecs_obs)
 
     def _get_state(self):
         """

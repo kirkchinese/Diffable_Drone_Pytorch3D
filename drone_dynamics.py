@@ -15,7 +15,6 @@
 """
 
 import torch
-import math
 
 class GDecay(torch.autograd.Function):
     """
@@ -138,7 +137,10 @@ def solve_attitude_from_thrust_and_goal_vec(
     # [二级平滑] Exponential Smoothing (参考项目逻辑)
     # alpha = exp(-delay * dt). delay 越大 (响应越快), alpha 越小, 结果越接近 target.
     # f_temp = target * (1 - alpha) + old * alpha
-    alpha = math.exp(-yaw_ctl_delay * dt)
+    if isinstance(yaw_ctl_delay, torch.Tensor):
+        alpha = torch.exp(-yaw_ctl_delay * dt)
+    else:
+        alpha = torch.tensor(-yaw_ctl_delay * dt).exp().item()
     f_temp = target_heading * (1 - alpha) + x_old * alpha
     
     # 正交化 (Orthogonalization)
@@ -269,7 +271,7 @@ def simulate_position_step(
     if isinstance(pitch_ctl_delay, torch.Tensor):
         alpha = torch.exp(-pitch_ctl_delay * dt)
     else:
-        alpha = math.exp(-pitch_ctl_delay * dt)
+        alpha = torch.tensor(-pitch_ctl_delay * dt).exp().item()
         
     act_next = act_cmd * (1 - alpha) + act_curr * alpha
     
@@ -445,8 +447,8 @@ def update_dg(dg_curr: torch.Tensor, dt: float, noise_std: float = 0.2) -> torch
     # 参考项目公式: dg = dg * sqrt(1 - dt/4) + noise * std * sqrt(dt/4)
     # 这是一种保持方差恒定的随机游走更新
     
-    decay_factor = math.sqrt(1 - dt / 4.0)
-    noise_factor = noise_std * math.sqrt(dt / 4.0)
+    decay_factor = (1 - dt / 4.0) ** 0.5
+    noise_factor = noise_std * (dt / 4.0) ** 0.5
     
     # 生成随机噪声
     noise = torch.randn_like(dg_curr)

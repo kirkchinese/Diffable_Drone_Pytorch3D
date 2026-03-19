@@ -6,7 +6,6 @@
 
 import os
 import gc
-import math
 import argparse
 from collections import defaultdict
 from random import normalvariate
@@ -30,6 +29,7 @@ from navigation_utils import (
 )
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
+from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
 
 
 def parse_args():
@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度惩罚损失权重 (防止飞高规避)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
     parser.add_argument('--coef_lateral', type=float, default=0.0, help='横向运动惩罚权重 (速度分解loss中的横向分量，0=横向免罚)')
+    parser.add_argument('--coef_drone_collide', type=float, default=5.0,
+                        help='无人机间碰撞损失权重 (仅多机模式生效，参考项目使用5.0)')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     
     # 环境参数 - 渲染
@@ -115,6 +117,15 @@ def parse_args():
     parser.add_argument('--airmode_coef', type=float, default=0.5, help='Airmode 系数')
     parser.add_argument('--enable_airmode', action='store_true', default=True, help='启用 Airmode')
     parser.add_argument('--disable_airmode', action='store_true', default=False, help='禁用 Airmode')
+    
+    # 无人机网格与多机交互
+    parser.add_argument('--drone_mesh_path', type=str, default=None,
+                        help='无人机网格路径 (如 ./data/base_model/drone.obj)，'
+                             '用于计算安全半径和未来的无人机间渲染')
+    parser.add_argument('--n_drones_per_group', type=int, default=1,
+                        help='多机分组大小 (1=单机, >1 启用组内碰撞检测)')
+    parser.add_argument('--aero_margin', type=float, default=0.05,
+                        help='无人机包围球之外的气动安全余量 (m)')
     
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
@@ -190,11 +201,10 @@ class DroneTrainer:
         if self.safe_spawn:
             print(f"[SafeSpawn] 已启用安全出生点/目标点, 最小安全距离: {getattr(args, 'safe_clearance', 1.0)}")
         
-        # 根据 FOV 计算焦距: f = (W/2) / tan(hfov/2)
-        import math
-        focal_length = (args.image_width / 2.0) / math.tan(math.radians(args.hfov / 2.0))
-        hfov_actual = 2 * math.degrees(math.atan(args.image_width / 2.0 / focal_length))
-        vfov_actual = 2 * math.degrees(math.atan(args.image_height / 2.0 / focal_length))
+        # 根据 FOV 计算焦距: 使用公共工具函数
+        focal_length = hfov_to_focal(args.hfov, args.image_width)
+        hfov_actual = focal_to_hfov(focal_length, args.image_width)
+        vfov_actual = focal_to_vfov(focal_length, args.image_height)
         print(f"[Camera] HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
@@ -229,6 +239,10 @@ class DroneTrainer:
             scene_generator=self.scene_generator,
             safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
             random_init_yaw=getattr(args, 'random_init_yaw', True),
+            # 无人机网格与多机交互
+            drone_mesh_path=getattr(args, 'drone_mesh_path', None),
+            aero_margin=getattr(args, 'aero_margin', 0.05),
+            n_drones_per_group=getattr(args, 'n_drones_per_group', 1),
         )
         
         # 初始化模型
@@ -258,6 +272,7 @@ class DroneTrainer:
             coef_ground_affinity=args.coef_ground_affinity,
             coef_bias=args.coef_bias,
             coef_lateral=getattr(args, 'coef_lateral', 0.0),
+            coef_drone_collide=getattr(args, 'coef_drone_collide', 5.0),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )
@@ -397,7 +412,7 @@ class DroneTrainer:
             )
         else:
             # 原始方式：基于角度/距离偏移，不检查碰撞
-            angle = torch.rand(B, device=self.device) * 2 * math.pi
+            angle = torch.rand(B, device=self.device) * 2 * torch.pi
             dist = torch.rand(B, device=self.device) * 5.0 + 3.0 # 距离 3m ~ 8m
             
             offset_x = torch.cos(angle) * dist
@@ -427,7 +442,7 @@ class DroneTrainer:
         
         # 航向漂移 (可选)
         if args.yaw_drift:
-            drift_av = torch.randn(B, device=self.device) * (5 * math.pi / 180 / 15)
+            drift_av = torch.randn(B, device=self.device) * (5 * torch.pi / 180 / 15)
             zeros = torch.zeros_like(drift_av)
             ones = torch.ones_like(drift_av)
             R_drift = torch.stack([

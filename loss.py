@@ -33,6 +33,7 @@ class DroneLoss:
                  coef_ground_affinity=0.0,
                  coef_bias=0.0,
                  coef_lateral=0.0,
+                 coef_drone_collide=5.0,
                  ctl_dt=0.02,
                  window_size=30):
         """
@@ -51,6 +52,8 @@ class DroneLoss:
             coef_bias (float): 偏向损失权重。
             coef_lateral (float): 横向运动惩罚权重。0.0=横向完全免罚（推荐），
                 >0时轻微惩罚横向分量以防止绕圈。
+            coef_drone_collide (float): 无人机间碰撞损失权重。多机场景默认使用 5.0。
+                仅在 forward 传入 inter_drone_dist_history 时生效。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
         """
@@ -65,7 +68,8 @@ class DroneLoss:
             'd_snap': coef_d_snap,
             'ground_affinity': coef_ground_affinity,
             'bias': coef_bias,
-            'lateral': coef_lateral
+            'lateral': coef_lateral,
+            'drone_collide': coef_drone_collide,
         }
         self.ctl_dt = ctl_dt
         self.window_size = window_size
@@ -93,7 +97,8 @@ class DroneLoss:
                 vec_to_obj_history,
                 v_preds,
                 env_margin,
-                env_g_std=None):
+                env_g_std=None,
+                inter_drone_dist_history=None):
         """
         计算总损失和各项指标。
 
@@ -106,6 +111,8 @@ class DroneLoss:
             v_preds: (T, B, 3) 模型预测的速度。
             env_margin: (B,) 或标量。安全边距。
             env_g_std: (3,) 重力向量。默认为 [0, 0, -9.80665]。
+            inter_drone_dist_history: 可选，(T, B) 或 (T, S, B) 无人机间最近椭球距离历史。
+                仅在 n_drones_per_group > 1 时由训练循环传入。
 
         Returns:
             tuple: (总损失, 指标字典)
@@ -252,6 +259,15 @@ class DroneLoss:
         loss_collide = F.softplus(dist_slice.mul(-32)).mul(v_to_pt).mean()
         metrics['loss_collide'] = loss_collide
 
+        # 无人机间碰撞损失 (多机场景)
+        if inter_drone_dist_history is not None:
+            drone_dist = to_tensor(inter_drone_dist_history)
+            # softplus(-32 * d) 在 d<0 时急剧增长, 惩罚碰撞
+            loss_drone_collide = F.softplus(drone_dist.mul(-32)).mean()
+        else:
+            loss_drone_collide = torch.tensor(0.0, device=p_history.device)
+        metrics['loss_drone_collide'] = loss_drone_collide
+
         # 整体速度损失
         loss_speed = F.smooth_l1_loss(fwd_v, target_v_norm)
         metrics['loss_speed'] = loss_speed
@@ -268,7 +284,8 @@ class DroneLoss:
             self.coefs['d_jerk'] * loss_d_jerk +
             self.coefs['d_snap'] * loss_d_snap +
             self.coefs['ground_affinity'] * loss_ground_affinity +
-            self.coefs['bias'] * loss_bias
+            self.coefs['bias'] * loss_bias +
+            self.coefs['drone_collide'] * loss_drone_collide
         )
 
         # 附加指标
