@@ -19,9 +19,14 @@ except ImportError:
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 
 try:
-    from drone_renderer_dynamic import DynamicObstacle
+    from drone_renderer_dynamic import DynamicObstacle, MOTION_MODES
 except ImportError:
     DynamicObstacle = None
+    MOTION_MODES = ('linear',)
+
+# 基础几何体目录和可用形状
+_BASE_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'base_model')
+_OBSTACLE_SHAPES = ('圆柱体2_2_2', '圆环5_5_1', '方块', '椎体2_2_2', '球1_1')
 
 class DroneSimulator:
     def __init__(self, 
@@ -116,6 +121,7 @@ class DroneSimulator:
         
         # 多无人机交互配置
         self.n_drones_per_group = n_drones_per_group
+        self._inter_drone_eye_mask = None  # 延迟初始化，依赖 n_drones_per_group
 
         # 动态障碍物配置
         self.enable_dynamic_obstacles = enable_dynamic_obstacles
@@ -123,6 +129,7 @@ class DroneSimulator:
         self.dynamic_obstacle_speed_range = dynamic_obstacle_speed_range
         self.dynamic_obstacle_scale_range = dynamic_obstacle_scale_range
         self._dynamic_obstacles = []
+        self._base_mesh_cache = {}  # 缓存已加载的基础几何体网格
         
         # 无人机网格加载
         self.drone_mesh = None
@@ -133,6 +140,7 @@ class DroneSimulator:
             if os.path.exists(drone_mesh_path):
                 self.drone_mesh, self._drone_centroid, self.drone_bounding_radius = \
                     load_drone_mesh(drone_mesh_path, device=self.device)
+                self._drone_verts_centered = self.drone_mesh.verts_packed() - self._drone_centroid
                 print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
                       f"包围球半径={self.drone_bounding_radius:.3f}m, "
                       f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m")
@@ -171,7 +179,7 @@ class DroneSimulator:
         self.p = (torch.rand(self.B, 3, device=self.device) - 0.5) * 2 * self.init_p_range
         self.p[:, 2] = torch.rand(self.B, device=self.device) * self.init_p_range + 0.5
 
-        self.gravity_vec = torch.tensor([0, 0, -self.gravity], device=self.device).unsqueeze(0).repeat(self.B, 1)
+        # gravity_vec 已在 __init__ 中创建，batch size 不变无需重建
         
         self.v = torch.randn(self.B, 3, device=self.device) * self.init_v_range
         self.a = torch.zeros(self.B, 3, device=self.device)
@@ -470,19 +478,15 @@ class DroneSimulator:
         """
         from pytorch3d.structures import Meshes
 
-        meshes = []
-        base_verts = self.drone_mesh.verts_packed()  # (V, 3)
-        base_faces = self.drone_mesh.faces_packed()  # (F, 3)
+        base_verts = self._drone_verts_centered  # 已在 __init__ 中预计算
+        base_faces = self.drone_mesh.faces_packed()
         base_tex = self.drone_mesh.textures
+        p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3) 批量转换
 
+        meshes = []
         for b in range(self.B):
-            # 中心化 → 旋转 → 平移（全部在 PyTorch3D/OBJ 坐标系）
-            verts_centered = base_verts - self._drone_centroid
             R_pt3d = transform_rot_ros2pt3d(self.R[b])
-            verts_rotated = verts_centered @ R_pt3d.T
-            p_pt3d = transform_pos_ros2pt3d(self.p[b:b+1]).squeeze(0)
-            verts_world = verts_rotated + p_pt3d
-
+            verts_world = base_verts @ R_pt3d.T + p_pt3d[b]
             meshes.append(Meshes(verts=[verts_world], faces=[base_faces], textures=base_tex))
         return meshes
 
@@ -492,11 +496,39 @@ class DroneSimulator:
             obs.step(dt)
 
     @torch.no_grad()
+    def _load_base_mesh(self, name):
+        """加载并缓存基础几何体网格，居中并归一化到单位包围球半径，避免每 episode 重复 IO。"""
+        if name in self._base_mesh_cache:
+            return self._base_mesh_cache[name]
+
+        from pytorch3d.io import load_obj
+        from pytorch3d.structures import Meshes
+        from pytorch3d.renderer import TexturesVertex
+
+        obj_path = os.path.join(_BASE_MODEL_DIR, f'{name}.obj')
+        verts, faces_data, _ = load_obj(obj_path, load_textures=False)
+        verts = verts.to(self.device)
+        faces = faces_data.verts_idx.to(self.device)
+
+        # 居中 + 归一化到单位包围球（scale 参数直接控制实际大小）
+        centroid = verts.mean(dim=0)
+        verts = verts - centroid
+        radius = verts.norm(dim=1).max().item()
+        if radius > 1e-6:
+            verts = verts / radius
+
+        tex = TexturesVertex(verts_features=torch.ones(1, verts.shape[0], 3, device=self.device))
+        mesh = Meshes(verts=[verts], faces=[faces], textures=tex)
+        self._base_mesh_cache[name] = mesh
+        return mesh
+
+    @torch.no_grad()
     def randomize_dynamic_obstacles(self, arena_range=None):
         """
-        随机生成动态障碍物（球体/立方体），在每个 episode 开始时调用。
+        随机生成动态障碍物（多种几何体 + 多种运动模式），每 episode 开始时调用。
 
-        障碍物的位置和速度在 PyTorch3D/OBJ 坐标系中指定（与渲染网格一致）。
+        从 data/base_model/ 加载真实 OBJ 几何体（方块、球、圆柱、锥体、圆环），
+        并为每个障碍物随机分配运动模式（linear/sinusoidal/circular/figure8/pendulum/static）。
         """
         if DynamicObstacle is None:
             print("[DroneSimulator] 警告: 无法导入 DynamicObstacle，跳过动态障碍物")
@@ -506,8 +538,8 @@ class DroneSimulator:
         if arena_range is None:
             arena_range = self.init_p_range
 
-        from pytorch3d.utils import ico_sphere
         from pytorch3d.renderer import TexturesVertex
+        from pytorch3d.structures import Meshes
         import numpy as np
 
         lo, hi = self.num_dynamic_obstacles_range
@@ -516,59 +548,79 @@ class DroneSimulator:
         scale_lo, scale_hi = self.dynamic_obstacle_scale_range
 
         for _ in range(num):
-            # 随机形状
-            ptype = np.random.choice(['sphere', 'cube'])
-            if ptype == 'sphere':
-                mesh = ico_sphere(level=2, device=self.device)
-            else:
-                mesh = self._make_cube_mesh()
+            # 随机几何体（从 data/base_model/ 缓存加载）
+            shape_name = np.random.choice(_OBSTACLE_SHAPES)
+            base_mesh = self._load_base_mesh(shape_name)
+            base_verts = base_mesh.verts_list()[0]
 
             # 随机颜色纹理
-            verts = mesh.verts_list()[0]
             color = torch.rand(3, device=self.device)
-            mesh.textures = TexturesVertex(verts_features=color.expand(verts.shape[0], 3)[None])
+            mesh = Meshes(
+                verts=[base_verts], faces=[base_mesh.faces_packed()],
+                textures=TexturesVertex(verts_features=color.expand(base_verts.shape[0], 3)[None]),
+            )
 
-            # OBJ 坐标系中的随机位置: X ∈ [-arena, arena], Y (高度) ∈ [0.3, arena], Z ∈ [-arena, arena]
-            pos = torch.zeros(3, device=self.device)
-            pos[0] = (torch.rand(1, device=self.device).item() * 2 - 1) * arena_range
-            pos[1] = torch.rand(1, device=self.device).item() * arena_range * 0.8 + 0.3
-            pos[2] = (torch.rand(1, device=self.device).item() * 2 - 1) * arena_range
+            # OBJ 坐标系随机位置
+            pos = torch.rand(3, device=self.device)
+            pos[0] = pos[0] * 2 * arena_range - arena_range
+            pos[1] = pos[1] * arena_range * 0.8 + 0.3
+            pos[2] = pos[2] * 2 * arena_range - arena_range
 
             # 随机速度
-            vel = torch.zeros(3, device=self.device)
-            for d in range(3):
-                vel[d] = torch.rand(1, device=self.device).item() * (speed_hi - speed_lo) + speed_lo
+            vel = torch.rand(3, device=self.device) * (speed_hi - speed_lo) + speed_lo
+            scale = (torch.rand(1, device=self.device) * (scale_hi - scale_lo) + scale_lo).item()
 
-            scale = torch.rand(1, device=self.device).item() * (scale_hi - scale_lo) + scale_lo
+            # 随机角速度
+            angular_vel = torch.randn(3, device=self.device) * 0.5
+
+            # 随机运动模式 + 参数
+            motion_mode = np.random.choice(MOTION_MODES)
+            motion_params = self._random_motion_params(motion_mode, arena_range)
 
             obs = DynamicObstacle(
-                mesh=mesh, position=pos, velocity=vel, scale=scale,
+                mesh=mesh, position=pos, velocity=vel,
+                angular_velocity=angular_vel, scale=scale,
                 num_pcd_samples=500, device=self.device,
+                motion_mode=motion_mode, motion_params=motion_params,
             )
             self._dynamic_obstacles.append(obs)
 
         if num > 0:
-            print(f"[DynamicObs] 已生成 {num} 个动态障碍物 (速度 [{speed_lo}, {speed_hi}] m/s)")
+            modes = [o.motion_mode for o in self._dynamic_obstacles]
+            print(f"[DynamicObs] 已生成 {num} 个动态障碍物, 运动模式: {modes}")
+
+    def _random_motion_params(self, mode, arena_range):
+        """为给定运动模式生成随机参数。"""
+        import numpy as np
+        params = {}
+        if mode in ('sinusoidal', 'pendulum'):
+            params['amplitude'] = float(np.random.uniform(0.5, min(2.0, arena_range * 0.5)))
+            params['frequency'] = float(np.random.uniform(0.2, 0.8))
+            params['phase'] = float(np.random.uniform(0, 6.2832))
+        elif mode in ('circular', 'figure8'):
+            r = float(np.random.uniform(0.5, min(2.0, arena_range * 0.4)))
+            params['frequency'] = float(np.random.uniform(0.1, 0.5))
+            # 随机轨道平面 (Gram-Schmidt 正交化)
+            u = torch.randn(3, device=self.device)
+            u = u / u.norm()
+            ref = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+            if torch.dot(u, ref).abs().item() > 0.9:
+                ref = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            v = ref - torch.dot(ref, u) * u
+            v = v / v.norm()
+            params['plane_u'] = u
+            params['plane_v'] = v
+            if mode == 'circular':
+                params['radius'] = r
+            else:
+                params['amplitude_u'] = r
+                params['amplitude_v'] = r * float(np.random.uniform(0.3, 0.7))
+        return params
 
     def clear_dynamic_obstacles(self):
         """清除所有动态障碍物并重置渲染器合成。"""
         self._dynamic_obstacles = []
         self.renderer.clear_dynamic_meshes()
-
-    def _make_cube_mesh(self):
-        """创建单位立方体 Meshes（无纹理）。"""
-        device = self.device
-        verts = torch.tensor([
-            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
-            [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5], [0.5, 0.5,  0.5], [-0.5, 0.5,  0.5],
-        ], dtype=torch.float32, device=device)
-        faces = torch.tensor([
-            [0,1,2],[0,2,3],[4,6,5],[4,7,6],
-            [0,4,5],[0,5,1],[2,6,7],[2,7,3],
-            [0,3,7],[0,7,4],[1,5,6],[1,6,2],
-        ], dtype=torch.int64, device=device)
-        from pytorch3d.structures import Meshes
-        return Meshes(verts=[verts], faces=[faces])
 
     def render(self, camera_pitch=10.0, return_tensor=True, return_rgb=True, return_depth=True, dt=None):
         """
@@ -762,9 +814,10 @@ class DroneSimulator:
         ellipsoid_dist_sq = diff[..., 0]**2 + diff[..., 1]**2 + 4 * diff[..., 2]**2
         ellipsoid_dist = torch.sqrt(ellipsoid_dist_sq + 1e-8)
 
-        # 自身距离置为极大值
-        eye_mask = torch.eye(G, device=self.device, dtype=torch.bool).unsqueeze(0)
-        ellipsoid_dist = ellipsoid_dist.masked_fill(eye_mask, 1e6)
+        # 自身距离置为极大值（缓存 eye_mask 避免每步重建）
+        if self._inter_drone_eye_mask is None or self._inter_drone_eye_mask.shape[-1] != G:
+            self._inter_drone_eye_mask = torch.eye(G, device=self.device, dtype=torch.bool).unsqueeze(0)
+        ellipsoid_dist = ellipsoid_dist.masked_fill(self._inter_drone_eye_mask, 1e6)
 
         # 每架无人机的最近同组无人机
         min_dist_grouped, min_idx = ellipsoid_dist.min(dim=2)  # (n_groups, G)

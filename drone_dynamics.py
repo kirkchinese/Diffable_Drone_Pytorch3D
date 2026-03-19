@@ -140,7 +140,8 @@ def solve_attitude_from_thrust_and_goal_vec(
     if isinstance(yaw_ctl_delay, torch.Tensor):
         alpha = torch.exp(-yaw_ctl_delay * dt)
     else:
-        alpha = torch.tensor(-yaw_ctl_delay * dt).exp().item()
+        import math as _m
+        alpha = _m.exp(-yaw_ctl_delay * dt)
     f_temp = target_heading * (1 - alpha) + x_old * alpha
     
     # 正交化 (Orthogonalization)
@@ -271,7 +272,8 @@ def simulate_position_step(
     if isinstance(pitch_ctl_delay, torch.Tensor):
         alpha = torch.exp(-pitch_ctl_delay * dt)
     else:
-        alpha = torch.tensor(-pitch_ctl_delay * dt).exp().item()
+        import math as _m
+        alpha = _m.exp(-pitch_ctl_delay * dt)
         
     act_next = act_cmd * (1 - alpha) + act_curr * alpha
     
@@ -334,7 +336,7 @@ def simulate_position_step(
         # act_next = Thrust + Disturbance + Gravity. 
         # 这里近似认为 act_next 代表了当前的合力状态，从中提取 Thrust magnitude
         # 假设标准重力
-        g_vec = torch.tensor([0.0, 0.0, -9.80665], device=act_curr.device)
+        g_vec = act_next.new_tensor([0.0, 0.0, -9.80665])
         thrust_acc_vec = act_next - g_vec # [B, 3]
         thrust_mag = torch.norm(thrust_acc_vec, dim=1) # [B]
         
@@ -367,7 +369,7 @@ def simulate_position_step(
         
         # 补全重力，计算推力向量的变化 (Thrust Vector Change) 
         # 参考项目逻辑：dot product 和 norm 都是基于 (act_curr + g) 计算的
-        g_correction = torch.tensor([0.0, 0.0, 9.80665], device=act_curr.device)
+        g_correction = act_curr.new_tensor([0.0, 0.0, 9.80665])
         thrust_vec_curr = act_curr + g_correction
         thrust_vec_next = act_next + g_correction
 
