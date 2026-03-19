@@ -156,7 +156,7 @@ def parse_args():
                         help='初始位置范围')
     parser.add_argument('--margin_min', type=float, default=0.3,
                         help='无人机安全半径最小值')
-    parser.add_argument('--margin_max', type=float, default=0.7,
+    parser.add_argument('--margin_max', type=float, default=0.8,
                         help='无人机安全半径最大值')
     parser.add_argument('--noise_std', type=float, default=0.04,
                         help='环境扰动噪声标准差')
