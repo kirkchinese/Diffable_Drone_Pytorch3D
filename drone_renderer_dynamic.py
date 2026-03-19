@@ -93,6 +93,11 @@ from pytorch3d.transforms import Transform3d, Rotate, Translate
 
 from drone_renderer import DroneRenderer
 
+import math as _math
+
+# 动态障碍物支持的运动模式
+MOTION_MODES = ('linear', 'sinusoidal', 'circular', 'figure8', 'pendulum', 'static')
+
 
 class DynamicObstacle:
     """
@@ -108,7 +113,9 @@ class DynamicObstacle:
                  angular_velocity: torch.Tensor = None,
                  scale: float = 1.0,
                  num_pcd_samples: int = 500,
-                 device: torch.device = None):
+                 device: torch.device = None,
+                 motion_mode: str = 'linear',
+                 motion_params: dict = None):
         """
         Args:
             mesh: PyTorch3D Meshes 对象
@@ -119,6 +126,8 @@ class DynamicObstacle:
             scale: 缩放比例
             num_pcd_samples: 点云采样数（初始化时一次性采样，之后复用）
             device: 计算设备
+            motion_mode: 运动模式，可选值见 MOTION_MODES
+            motion_params: 运动参数字典，各模式参数见 _precompute_motion
         """
         self.device = device or mesh.device
         self.original_mesh = mesh
@@ -138,32 +147,104 @@ class DynamicObstacle:
         self._local_pcd = sample_points_from_meshes(
             mesh, num_samples=num_pcd_samples
         ).squeeze(0) * self.scale  # (N, 3)，已含缩放
-        
+
+        # 运动模式（解析式位置计算，无累积误差）
+        self.motion_mode = motion_mode
+        self.motion_params = motion_params if motion_params is not None else {}
+        self._initial_position = self.position.clone()
+        self._initial_rotation = self.rotation.clone()
+        self._elapsed_time = 0.0
+        self._precompute_motion()
+        self._precompute_rotation()
+        self._I3 = torch.eye(3, device=self.device)  # 缓存单位矩阵避免每步重建
+
+    # ----------------------------------------------------------------
+    # 运动模式预计算
+    # ----------------------------------------------------------------
+
+    def _precompute_motion(self):
+        """预计算各运动模式默认参数，避免每步查表。"""
+        p = self.motion_params
+        mode = self.motion_mode
+        if mode in ('sinusoidal', 'pendulum'):
+            if 'axis' not in p:
+                v_n = self.velocity.norm().item()
+                p['axis'] = (self.velocity / v_n) if v_n > 1e-6 else \
+                    torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            p.setdefault('amplitude', 1.0)
+            p.setdefault('frequency', 0.5)
+            p.setdefault('phase', 0.0)
+        elif mode in ('circular', 'figure8'):
+            if 'plane_u' not in p:
+                p['plane_u'] = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+                p['plane_v'] = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+            if mode == 'circular':
+                p.setdefault('radius', 1.0)
+            else:
+                p.setdefault('amplitude_u', 1.0)
+                p.setdefault('amplitude_v', 0.5)
+            p.setdefault('frequency', 0.3)
+
+    def _precompute_rotation(self):
+        """预计算角速度 Rodrigues 辅助矩阵，避免每步重建。"""
+        omega = self.angular_velocity.norm().item()
+        if omega > 1e-6:
+            self._has_angular_vel = True
+            self._rot_omega = omega
+            ax = self.angular_velocity / omega
+            K = torch.zeros(3, 3, device=self.device)
+            K[0, 1], K[0, 2] = -ax[2], ax[1]
+            K[1, 0], K[1, 2] = ax[2], -ax[0]
+            K[2, 0], K[2, 1] = -ax[1], ax[0]
+            self._rot_K = K
+            self._rot_KK = K @ K
+        else:
+            self._has_angular_vel = False
+
+    # ----------------------------------------------------------------
+    # step
+    # ----------------------------------------------------------------
+
     def step(self, dt: float):
-        """
-        更新障碍物状态
-        
-        Args:
-            dt: 时间步长
-        """
-        # 更新位置
-        self.position = self.position + self.velocity * dt
-        
-        # 更新旋转 (简化的欧拉积分)
-        if self.angular_velocity.norm() > 1e-6:
-            angle = self.angular_velocity.norm() * dt
-            axis = self.angular_velocity / (self.angular_velocity.norm() + 1e-8)
-            # Rodrigues 公式
-            K = torch.tensor([
-                [0, -axis[2], axis[1]],
-                [axis[2], 0, -axis[0]],
-                [-axis[1], axis[0], 0]
-            ], device=self.device)
-            delta_R = torch.eye(3, device=self.device) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
-            self.rotation = delta_R @ self.rotation
-            
+        """更新障碍物状态（解析式位置计算，无累积误差）。"""
+        self._elapsed_time += dt
+        t = self._elapsed_time
+        mode = self.motion_mode
+        p = self.motion_params
+        _TWO_PI = 6.283185307179586
+
+        if mode == 'static' and not self._has_angular_vel:
+            return  # 完全静止，跳过
+
+        if mode == 'linear':
+            self.position = self._initial_position + self.velocity * t
+        elif mode == 'sinusoidal':
+            val = p['amplitude'] * _math.sin(p['frequency'] * _TWO_PI * t + p['phase'])
+            self.position = self._initial_position + p['axis'] * val
+        elif mode == 'circular':
+            angle = p['frequency'] * _TWO_PI * t
+            self.position = (self._initial_position
+                             + p['radius'] * (_math.cos(angle) * p['plane_u']
+                                              + _math.sin(angle) * p['plane_v']))
+        elif mode == 'figure8':
+            angle = p['frequency'] * _TWO_PI * t
+            self.position = (self._initial_position
+                             + p['amplitude_u'] * _math.sin(angle) * p['plane_u']
+                             + p['amplitude_v'] * _math.sin(2.0 * angle) * p['plane_v'])
+        elif mode == 'pendulum':
+            val = p['amplitude'] * abs(_math.sin(p['frequency'] * _TWO_PI * t + p['phase']))
+            self.position = self._initial_position + p['axis'] * val
+        # 'static' → position unchanged
+
+        # 解析式旋转（Rodrigues，从初始旋转出发，无累积误差）
+        if self._has_angular_vel:
+            a = self._rot_omega * t
+            sa, ca = _math.sin(a), _math.cos(a)
+            delta_R = self._I3 + sa * self._rot_K + (1.0 - ca) * self._rot_KK
+            self.rotation = delta_R @ self._initial_rotation
+
         self._needs_update = True
-        
+
     def get_transformed_mesh(self) -> Meshes:
         """获取变换后的网格"""
         if self._needs_update or self._transformed_mesh is None:
@@ -196,8 +277,10 @@ class DynamicObstacle:
         return new_mesh
     
     def set_position(self, position: torch.Tensor):
-        """设置位置"""
+        """设置位置（同时重置运动基准）"""
         self.position = position.to(self.device)
+        self._initial_position = self.position.clone()
+        self._elapsed_time = 0.0
         self._needs_update = True
         
     def set_velocity(self, velocity: torch.Tensor):

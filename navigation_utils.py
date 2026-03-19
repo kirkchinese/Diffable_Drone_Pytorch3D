@@ -1,14 +1,19 @@
 import numpy as np
 import torch
 
+_FALLBACK_FWD = None  # 缓存的 fallback 向量（延迟初始化，第一次调用时创建）
+
 
 def compute_local_frame(R: torch.Tensor) -> torch.Tensor:
     """根据机体姿态构造与训练一致的局部水平坐标系。"""
+    global _FALLBACK_FWD
     fwd = R[:, :, 0].clone()
     up = torch.zeros_like(fwd)
     fwd[:, 2] = 0
     up[:, 2] = 1
-    fallback = torch.tensor([1.0, 0.0, 0.0], device=fwd.device, dtype=fwd.dtype).expand_as(fwd)
+    if _FALLBACK_FWD is None or _FALLBACK_FWD.device != fwd.device or _FALLBACK_FWD.dtype != fwd.dtype:
+        _FALLBACK_FWD = torch.tensor([1.0, 0.0, 0.0], device=fwd.device, dtype=fwd.dtype)
+    fallback = _FALLBACK_FWD.expand_as(fwd)
     fwd_norm = torch.norm(fwd, p=2, dim=-1, keepdim=True)
     fwd = torch.where(fwd_norm > 1e-6, fwd / (fwd_norm + 1e-8), fallback)
     left = torch.linalg.cross(up, fwd)

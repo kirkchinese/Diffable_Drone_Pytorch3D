@@ -491,8 +491,8 @@ class DroneRenderer:
         ], dim=-1).reshape(B, 3, 3)
         
         # 计算 Look At 指向向量和 Up 向量 (在机体坐标系下)
-        forward_canonical = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 3, 1).repeat(B, 1, 1)
-        up_canonical = torch.tensor([0.0, 0.0, 1.0], device=device).view(1, 3, 1).repeat(B, 1, 1)
+        forward_canonical = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 3, 1).expand(B, -1, -1)
+        up_canonical = torch.tensor([0.0, 0.0, 1.0], device=device).view(1, 3, 1).expand(B, -1, -1)
         
         # 应用安装旋转
         look_dir_body = torch.bmm(R_mount, forward_canonical)

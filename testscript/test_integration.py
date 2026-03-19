@@ -310,6 +310,144 @@ def test_loss_inter_drone(device):
     print("  ✓ PASS")
 
 
+def test_base_model_loading(device):
+    """测试从 data/base_model/ 加载所有基础几何体"""
+    print("\n=== Test 7: 基础几何体加载 ===")
+    from drone_env import DroneSimulator, _OBSTACLE_SHAPES
+
+    env = DroneSimulator(
+        batch_size=2, dt=1/15,
+        mesh_path='./data/sample/sample.obj',
+        image_size=(48, 64), focal_length=50.0,
+        device=device, num_samples=1000, subdivide_times=0,
+    )
+
+    for name in _OBSTACLE_SHAPES:
+        mesh = env._load_base_mesh(name)
+        verts = mesh.verts_packed()
+        # 应居中且归一化
+        centroid = verts.mean(dim=0)
+        assert centroid.abs().max().item() < 0.05, f"{name}: 质心应接近原点, 得到{centroid}"
+        max_r = verts.norm(dim=1).max().item()
+        assert abs(max_r - 1.0) < 0.01, f"{name}: 包围球半径应归一化到1.0, 得到{max_r}"
+        print(f"  {name}: {verts.shape[0]} verts, 半径={max_r:.3f}")
+
+    # 缓存命中
+    m1 = env._load_base_mesh('方块')
+    m2 = env._load_base_mesh('方块')
+    assert m1 is m2, "缓存应返回同一对象"
+    print("  ✓ 缓存命中验证通过")
+    print("  ✓ PASS")
+
+
+def test_motion_patterns(device):
+    """测试所有动态障碍物运动模式"""
+    print("\n=== Test 8: 运动模式 ===")
+    from drone_renderer_dynamic import DynamicObstacle, MOTION_MODES
+    from pytorch3d.utils import ico_sphere
+    from pytorch3d.renderer import TexturesVertex
+
+    sphere = ico_sphere(level=1, device=device)
+    verts = sphere.verts_list()[0]
+    sphere.textures = TexturesVertex(verts_features=torch.ones(1, verts.shape[0], 3, device=device))
+
+    dt = 1/30
+    n_steps = 60  # 2 秒
+
+    for mode in MOTION_MODES:
+        params = {}
+        vel = torch.tensor([0.5, 0.0, 0.3], device=device)
+        ang_vel = torch.tensor([0.0, 1.0, 0.0], device=device)
+
+        if mode in ('sinusoidal', 'pendulum'):
+            params = {'amplitude': 1.5, 'frequency': 0.5, 'phase': 0.0}
+        elif mode in ('circular', 'figure8'):
+            params = {
+                'plane_u': torch.tensor([1.0, 0.0, 0.0], device=device),
+                'plane_v': torch.tensor([0.0, 0.0, 1.0], device=device),
+                'frequency': 0.3,
+            }
+            if mode == 'circular':
+                params['radius'] = 1.0
+            else:
+                params['amplitude_u'] = 1.0
+                params['amplitude_v'] = 0.5
+
+        obs = DynamicObstacle(
+            mesh=sphere, position=torch.zeros(3, device=device),
+            velocity=vel, angular_velocity=ang_vel, scale=0.5,
+            num_pcd_samples=100, device=device,
+            motion_mode=mode, motion_params=params,
+        )
+
+        positions = [obs.position.clone()]
+        for _ in range(n_steps):
+            obs.step(dt)
+            positions.append(obs.position.clone())
+
+        p_start = positions[0]
+        # 检查最大偏移（避免周期运动恰好回到起点导致误判）
+        max_disp = max((p - p_start).norm().item() for p in positions[1:])
+
+        if mode == 'static':
+            assert max_disp < 1e-5, f"static 模式不应移动, 最大偏移{max_disp}"
+        else:
+            assert max_disp > 0.01, f"{mode} 模式应有明显位移, 最大偏移仅{max_disp}"
+
+        # 网格变换应有效
+        m = obs.get_transformed_mesh()
+        assert m.verts_packed().shape[0] > 0
+        pcd = obs.get_transformed_pcd()
+        assert pcd.shape == (1, 100, 3)
+
+        print(f"  {mode:12s}: 最大偏移={max_disp:.3f}m, mesh verts={m.verts_packed().shape[0]}")
+
+    print("  ✓ PASS")
+
+
+def test_randomize_with_all_shapes(device):
+    """测试 randomize_dynamic_obstacles 使用所有几何体和运动模式"""
+    print("\n=== Test 9: 随机化全形状+全模式 ===")
+    from drone_env import DroneSimulator
+
+    env = DroneSimulator(
+        batch_size=2, dt=1/15,
+        mesh_path='./data/sample/sample.obj',
+        image_size=(48, 64), focal_length=50.0,
+        device=device, num_samples=1000, subdivide_times=0,
+        enable_dynamic_obstacles=True,
+        num_dynamic_obstacles_range=(8, 8),
+        dynamic_obstacle_speed_range=(-1.0, 1.0),
+        dynamic_obstacle_scale_range=(0.2, 0.6),
+    )
+    env.reset()
+
+    # 多次随机化，验证缓存和多样性
+    all_modes_seen = set()
+    for ep in range(5):
+        env.randomize_dynamic_obstacles(arena_range=5.0)
+        assert len(env._dynamic_obstacles) == 8
+        for obs in env._dynamic_obstacles:
+            all_modes_seen.add(obs.motion_mode)
+
+        # 渲染应正常
+        _, depth = env.render(camera_pitch=10.0, return_tensor=True, return_rgb=False, return_depth=True)
+        assert depth.shape == (2, 48, 64)
+
+        # 步进多步
+        for _ in range(10):
+            env.step(
+                act_cmd=torch.zeros(2, 3, device=device),
+                target_pos_vector=torch.ones(2, 3, device=device),
+                dt=1/15,
+            )
+
+    print(f"  5 episodes, 观察到运动模式: {all_modes_seen}")
+    assert len(all_modes_seen) >= 3, f"应至少观察到3种运动模式, 仅观察到{len(all_modes_seen)}"
+    print(f"  基础几何体缓存: {len(env._base_mesh_cache)} 种")
+    print("  ✓ PASS")
+
+
 def main():
     args = parse_args()
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -321,6 +459,9 @@ def main():
     test_dynamic_obstacles(device)
     test_combined_vec_to_nearest(device)
     test_loss_inter_drone(device)
+    test_base_model_loading(device)
+    test_motion_patterns(device)
+    test_randomize_with_all_shapes(device)
 
     print("\n" + "=" * 50)
     print("  所有测试通过 ✓")
