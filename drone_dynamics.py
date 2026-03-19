@@ -140,8 +140,7 @@ def solve_attitude_from_thrust_and_goal_vec(
     if isinstance(yaw_ctl_delay, torch.Tensor):
         alpha = torch.exp(-yaw_ctl_delay * dt)
     else:
-        import math as _m
-        alpha = _m.exp(-yaw_ctl_delay * dt)
+        alpha = R_old.new_tensor(-yaw_ctl_delay * dt).exp_()
     f_temp = target_heading * (1 - alpha) + x_old * alpha
     
     # 正交化 (Orthogonalization)
@@ -272,8 +271,7 @@ def simulate_position_step(
     if isinstance(pitch_ctl_delay, torch.Tensor):
         alpha = torch.exp(-pitch_ctl_delay * dt)
     else:
-        import math as _m
-        alpha = _m.exp(-pitch_ctl_delay * dt)
+        alpha = act_curr.new_tensor(-pitch_ctl_delay * dt).exp_()
         
     act_next = act_cmd * (1 - alpha) + act_curr * alpha
     

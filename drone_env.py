@@ -140,7 +140,11 @@ class DroneSimulator:
             if os.path.exists(drone_mesh_path):
                 self.drone_mesh, self._drone_centroid, self.drone_bounding_radius = \
                     load_drone_mesh(drone_mesh_path, device=self.device)
-                self._drone_verts_centered = self.drone_mesh.verts_packed() - self._drone_centroid
+                centered = self.drone_mesh.verts_packed() - self._drone_centroid
+                # OBJ 文件使用 Y-up 约定（薄轴=Y），ROS 机体坐标使用 Z-up，
+                # 交换 Y↔Z 将网格从 OBJ 机体坐标转换到 ROS 机体坐标，
+                # 之后 transform_rot_ros2pt3d 才能正确将机体旋转映射到 PT3D 世界坐标。
+                self._drone_verts_centered = centered[:, [0, 2, 1]]
                 print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
                       f"包围球半径={self.drone_bounding_radius:.3f}m, "
                       f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m")
@@ -478,15 +482,18 @@ class DroneSimulator:
         """
         from pytorch3d.structures import Meshes
 
-        base_verts = self._drone_verts_centered  # 已在 __init__ 中预计算
+        base_verts = self._drone_verts_centered  # 已在 __init__ 中预计算并做 Y↔Z 换轴
         base_faces = self.drone_mesh.faces_packed()
         base_tex = self.drone_mesh.textures
         p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3) 批量转换
+        base_safety = self.drone_bounding_radius + self.aero_margin
 
         meshes = []
         for b in range(self.B):
             R_pt3d = transform_rot_ros2pt3d(self.R[b])
-            verts_world = base_verts @ R_pt3d.T + p_pt3d[b]
+            # 按该无人机的安全半径缩放网格，使渲染大小与碰撞判定一致
+            scale = self.margin[b] / base_safety
+            verts_world = (base_verts * scale) @ R_pt3d.T + p_pt3d[b]
             meshes.append(Meshes(verts=[verts_world], faces=[base_faces], textures=base_tex))
         return meshes
 
