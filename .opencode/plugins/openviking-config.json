@@ -1,0 +1,10 @@
+{
+  "endpoint": "http://localhost:1933",
+  "apiKey": "sk-657b06e29e4f48bf8c2369a1d23b01cc",
+  "enabled": true,
+  "timeoutMs": 30000,
+  "autoCommit": {
+    "enabled": true,
+    "intervalMinutes": 10
+  }
+}

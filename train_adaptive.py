@@ -23,6 +23,11 @@ import matplotlib.pyplot as plt
 from drone_env import DroneSimulator
 from model import Model, Model_bigger,Model_adaptive
 from loss import DroneLoss
+from navigation_utils import (
+    compute_local_frame,
+    compute_navigation_metrics_torch,
+    preprocess_depth_for_model,
+)
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
 
@@ -122,6 +127,10 @@ def parse_args():
     
     # 硬件参数
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID (default: 0)')
+    parser.add_argument('--reach_radius', type=float, default=0.5,
+                        help='判定到达目标点的半径阈值 (米)')
+    parser.add_argument('--random_init_yaw', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否在 reset 时随机化无人机初始偏航角')
     
     return parser.parse_args()
 
@@ -218,6 +227,7 @@ class DroneTrainer:
             enable_random_scene=getattr(args, 'random_scene', False),
             scene_generator=self.scene_generator,
             safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
+            random_init_yaw=getattr(args, 'random_init_yaw', True),
         )
         
         # 初始化模型
@@ -246,6 +256,7 @@ class DroneTrainer:
             coef_d_snap=args.coef_d_snap,
             coef_ground_affinity=args.coef_ground_affinity,
             coef_bias=args.coef_bias,
+            coef_lateral=getattr(args, 'coef_lateral', 0.0),
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )
@@ -280,9 +291,12 @@ class DroneTrainer:
         self.best_ar_iter = -1
         self.ar_ema = 0.0           # 指数移动平均，减少单次波动
         self.ar_ema_alpha = 0.05    # EMA 平滑系数
+        self.best_task_score = -1.0
+        self.best_task_iter = -1
+        self.task_score_ema = 0.0
     def _load_model(self, path):
         """加载模型"""
-        state_dict = torch.load(path, map_location=self.device)
+        state_dict = torch.load(path, map_location=self.device, weights_only=True)
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
@@ -305,17 +319,7 @@ class DroneTrainer:
         
         注意：这里返回的矩阵列向量是局部坐标系的基向量在世界坐标系中的表示
         """
-        fwd = self.env.R[:, :, 0].clone()  # 机体 X 轴 (前向)
-        up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0  # 水平投影
-        up[:, 2] = 1   # 世界 Z 轴作为上方向
-        # 添加数值稳定性：如果 fwd 太小，使用默认前向方向
-        fwd_norm = torch.norm(fwd, p=2, dim=-1, keepdim=True)
-        fwd = torch.where(fwd_norm > 1e-6, fwd / (fwd_norm + 1e-8), 
-                          torch.tensor([1.0, 0.0, 0.0], device=fwd.device).expand_as(fwd))
-        # 构建旋转矩阵：列向量分别为 [fwd, left, up]
-        R = torch.stack([fwd, torch.linalg.cross(up, fwd), up], -1)  # (B, 3, 3)
-        return R
+        return compute_local_frame(self.env.R)
     
     def run_episode(self, iteration):
         """
@@ -360,6 +364,7 @@ class DroneTrainer:
         p_history = []
         v_history = []
         target_v_history = []
+        target_dist_history = []
         vec_to_pt_history = []
         v_preds = []
         vid = []
@@ -453,13 +458,14 @@ class DroneTrainer:
             
             # 保存可视化帧 (第5个样本)
             if is_save_iter(iteration) and B > 4:
-                vid.append(depth[4])
+                vid.append(depth[4].detach().cpu().clone())
             
             # 更新目标向量 (可选航向漂移)
             if args.yaw_drift:
                 target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
             else:
                 target_v_raw = p_target - self.env.p.detach()  # detach 防止通过瞬移优化
+            target_dist_history.append(torch.norm(target_v_raw, p=2, dim=-1))
             
             # 执行动作 (使用延迟缓冲中的动作)
             # 关键：使用 act_buffer[t] 而不是取模，参考项目的实现方式
@@ -496,12 +502,12 @@ class DroneTrainer:
             
             # 深度图预处理
             # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
-            bg_mask = (depth < 0) | (depth > args.depth_max)
-            x = depth.clamp(args.depth_min, args.depth_max)
-            x = 3.0 / x - 0.6  # 逆距离变换: 近→高值(9.4@0.3m), 远→低值(0.0@5m)
-            x[bg_mask] = 0.0    # 空像素设为 0（无障碍物）
-            x = x + torch.randn_like(x) * 0.02  # 添加噪声
-            x = x.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+            x = preprocess_depth_for_model(
+                depth,
+                depth_min=args.depth_min,
+                depth_max=args.depth_max,
+                noise_std=0.02,
+            )
             # 可选: stride=1 max_pool 膨胀障碍物，类似 C-space expansion。
             # 默认禁用；仅在擦碰问题严重时通过 --depth_dilate 5 开启。
             # if getattr(args, 'depth_dilate', 0) > 1:
@@ -541,6 +547,7 @@ class DroneTrainer:
         p_history = torch.stack(p_history)          # (T, B, 3)
         v_history = torch.stack(v_history)          # (T, B, 3)
         target_v_history = torch.stack(target_v_history)  # (T, B, 3)
+        target_dist_history = torch.stack(target_dist_history)  # (T, B)
         vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
@@ -561,14 +568,15 @@ class DroneTrainer:
         with torch.no_grad():
             distance = torch.norm(vec_to_pt_history, 2, -1) - self.env.margin
             speed_history = v_history.norm(2, -1)
-            avg_speed = speed_history.mean(0)
-            success = torch.all(distance.flatten(0, 1) > 0, 0)
-            success_rate = success.float().mean()
-            
-            metrics['success_rate'] = success_rate
-            metrics['avg_speed'] = avg_speed.mean()
-            metrics['max_speed'] = speed_history.max(0).values.mean()
-            metrics['ar'] = (success.float() * avg_speed).mean()  # 成功率 × 平均速度
+            collision_history = distance <= 0
+            metrics.update(
+                compute_navigation_metrics_torch(
+                    target_dist_history=target_dist_history,
+                    collision_history=collision_history,
+                    speed_history=speed_history,
+                    reach_radius=getattr(args, 'reach_radius', 0.5),
+                )
+            )
         
         # 非保存迭代时 detach debug_data，避免计算图被引用残留到下一轮
         debug_out = (
@@ -638,6 +646,15 @@ class DroneTrainer:
                 best_path = os.path.join(args.save_dir, 'best_ar.pth')
                 torch.save(self.model.state_dict(), best_path)
                 self.writer.add_scalar('best_ar', self.best_ar, i + 1)
+
+            current_task_score = float(metrics.get('task_score', 0.0))
+            self.task_score_ema = self.ar_ema_alpha * current_task_score + (1 - self.ar_ema_alpha) * self.task_score_ema
+            if i >= 200 and self.task_score_ema > self.best_task_score:
+                self.best_task_score = self.task_score_ema
+                self.best_task_iter = i + 1
+                best_task_path = os.path.join(args.save_dir, 'best_task_score.pth')
+                torch.save(self.model.state_dict(), best_task_path)
+                self.writer.add_scalar('best_task_score', self.best_task_score, i + 1)
             
             if (i + 1) % 25 == 0:
                 for k, v in self.scaler_q.items():
@@ -650,6 +667,8 @@ class DroneTrainer:
         print(f"Training complete. Final model saved to {final_path}")
         if self.best_ar_iter > 0:
             print(f"Best AR model: best_ar.pth (AR={self.best_ar:.4f} @ iter {self.best_ar_iter})")
+        if self.best_task_iter > 0:
+            print(f"Best task-score model: best_task_score.pth (score={self.best_task_score:.4f} @ iter {self.best_task_iter})")
         
         self.monitor.close()
         self.writer.close()
