@@ -48,6 +48,57 @@ def focal_to_vfov(focal: float, image_height: int) -> float:
     import math as _m
     return 2.0 * _m.degrees(_m.atan(image_height / 2.0 / focal))
 
+
+def build_cam_mount_R(roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0, device=None, batch_size=1):
+    """
+    构造相机安装旋转矩阵（机体坐标系内）。
+
+    旋转约定（航空惯例，相对于机体 X-forward / Y-left / Z-up）：
+    - pitch: 正值 → 相机向下倾斜（俯视）
+    - roll:  正值 → 相机向右倾斜
+    - yaw:   正值 → 相机向右偏转
+
+    顺序: R = Rz(yaw) @ Rx(roll) @ Ry(-pitch)
+    （pitch 取负号使得"正值=向下"与航空惯例一致）
+
+    Args:
+        roll_deg, pitch_deg, yaw_deg: 相机安装角 (度)。可为 float 或 (B,) Tensor。
+        device: 目标设备。
+        batch_size: 若角度为标量则扩展到此 batch 大小。
+
+    Returns:
+        R_mount: (B, 3, 3) 旋转矩阵
+    """
+    _D2R = torch.pi / 180.0
+
+    # 自动推断 batch_size：若任一角度是 Tensor，以其尺寸为准
+    for _a in (roll_deg, pitch_deg, yaw_deg):
+        if isinstance(_a, torch.Tensor):
+            batch_size = _a.shape[0]
+            break
+
+    def _to_rad(x):
+        if isinstance(x, (int, float)):
+            return torch.full((batch_size,), x * _D2R, device=device)
+        return x.to(device=device, dtype=torch.float32) * _D2R
+
+    p = _to_rad(pitch_deg)   # pitch
+    r = _to_rad(roll_deg)    # roll
+    y = _to_rad(yaw_deg)     # yaw
+
+    # Ry(-pitch): 正 pitch → camera looks down
+    cp, sp = torch.cos(p), torch.sin(p)
+    cr, sr = torch.cos(r), torch.sin(r)
+    cy, sy = torch.cos(y), torch.sin(y)
+    z = torch.zeros_like(p)
+    o = torch.ones_like(p)
+
+    Ry = torch.stack([cp, z, -sp, z, o, z, sp, z, cp], dim=-1).reshape(-1, 3, 3)
+    Rx = torch.stack([o, z, z, z, cr, sr, z, -sr, cr], dim=-1).reshape(-1, 3, 3)
+    Rz = torch.stack([cy, -sy, z, sy, cy, z, z, z, o], dim=-1).reshape(-1, 3, 3)
+
+    return Rz @ Rx @ Ry
+
 class DroneRenderer:
     """
     可微分无人机 3D 渲染器类。
@@ -430,7 +481,8 @@ class DroneRenderer:
         
         return rgb_out, depth_out
 
-    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=-10.0, cam_offset_body=None):
+    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=None,
+                            cam_offset_body=None, cam_mount_R=None):
         """
         将无人机在 ROS 坐标系下的状态转换为 PyTorch3D 渲染器所需的外参 (R, T)。
 
@@ -439,30 +491,26 @@ class DroneRenderer:
         Args:
             p_ros (torch.Tensor): 无人机位置 (ROS World Frame ENU)，形状 (B, 3)。
             R_ros (torch.Tensor): 无人机姿态旋转矩阵 (Body -> ROS World)，形状 (B, 3, 3)。
-            camera_pitch_deg (float, optional): 相机安装俯仰角 (度)，默认 -10.0。
-                正值表示相机向下倾斜 (俯视)，负值表示仰视。
-            cam_offset_body (list or torch.Tensor, optional): 相机在机体坐标系下的偏移 [x, y, z]，默认 [0.1, 0, 0]。
-            
-        Returns:
-            tuple: (R_view, T_view)
-                - R_view (torch.Tensor): World-to-View 旋转矩阵，形状 (B, 3, 3)。
-                - T_view (torch.Tensor): World-to-View 平移向量，形状 (B, 3)。
+            camera_pitch_deg (float|Tensor, optional): 相机安装俯仰角度 (度)。
+                正值 → 向下（俯视），负值 → 向上（仰视）。
+                当 cam_mount_R 为 None 时使用，默认 10.0。
+            cam_offset_body (list or Tensor, optional): 相机在机体坐标系下的偏移 [x, y, z]，默认 [0.1, 0, 0]。
+            cam_mount_R (Tensor, optional): 相机安装旋转矩阵 (3,3) 或 (B,3,3)。
+                由 build_cam_mount_R() 生成；提供后 camera_pitch_deg 被忽略。
 
-        Raises:
-            ValueError: 如果输入张量的形状不符合要求。
+        Returns:
+            tuple: (R_view, T_view) — World-to-View 变换，形状 (B,3,3), (B,3)。
         """
         B = p_ros.shape[0]
         device = p_ros.device
         
-        # 计算相机在 ROS World 下的位置
-        # Camera Offset in Body Frame: Default [0.1, 0, 0]
+        # ---- 平移偏移 ----
         if cam_offset_body is None:
             cam_offset_body = [0.1, 0.0, 0.0]
         
         if not torch.is_tensor(cam_offset_body):
             cam_offset_body = torch.tensor(cam_offset_body, device=device, dtype=torch.float32)
         
-        # Ensure shape (B, 3, 1)
         if cam_offset_body.dim() == 1:
             cam_offset_body = cam_offset_body.view(1, 3, 1).repeat(B, 1, 1)
         elif cam_offset_body.dim() == 2:
@@ -470,25 +518,19 @@ class DroneRenderer:
             
         p_cam_ros = p_ros + torch.bmm(R_ros, cam_offset_body).squeeze(2)
         
-        # 定义相机相对于机体的旋转矩阵 (R_mount)
-        # 使用旋转矩阵标准化表达，便于扩展 (如增加Yaw/Roll偏置)
-        # 这里的 pitch 是绕机体 Y 轴旋转。正 Pitch 代表向下看，即 Forward 向量向 -Z 偏转。
-        # 支持 per-sample 的 Tensor 输入（用于训练时的相机角度随机化）
-        _DEG2RAD = torch.pi / 180.0
-        if isinstance(camera_pitch_deg, (int, float)):
-            pitch_rad = torch.full((B,), camera_pitch_deg * _DEG2RAD, device=device)
+        # ---- 安装旋转矩阵 ----
+        if cam_mount_R is not None:
+            # 使用调用方提供的完整安装旋转矩阵
+            R_mount = cam_mount_R
+            if R_mount.dim() == 2:
+                R_mount = R_mount.unsqueeze(0).expand(B, -1, -1)
         else:
-            # Tensor 输入 (B,) — per-sample 俯仰角
-            pitch_rad = camera_pitch_deg.to(device=device, dtype=torch.float32) * _DEG2RAD
-        c = torch.cos(pitch_rad)
-        s = torch.sin(pitch_rad)
-        zeros = torch.zeros(B, device=device)
-        ones = torch.ones(B, device=device)
-        R_mount = torch.stack([
-            c,     zeros, s,
-            zeros, ones,  zeros,
-            -s,    zeros, c
-        ], dim=-1).reshape(B, 3, 3)
+            # 从 camera_pitch_deg 构造（仅 pitch，向后兼容）
+            if camera_pitch_deg is None:
+                camera_pitch_deg = 10.0
+            R_mount = build_cam_mount_R(
+                pitch_deg=camera_pitch_deg, device=device, batch_size=B,
+            )
         
         # 计算 Look At 指向向量和 Up 向量 (在机体坐标系下)
         forward_canonical = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 3, 1).expand(B, -1, -1)
@@ -598,9 +640,11 @@ class DroneRendererVariant:
     def lights(self):
         return self.parent.lights
 
-    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=-10.0, cam_offset_body=None):
+    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=None,
+                            cam_offset_body=None, cam_mount_R=None):
         """委托给 parent。"""
-        return self.parent.compute_view_matrix(p_ros, R_ros, camera_pitch_deg, cam_offset_body)
+        return self.parent.compute_view_matrix(
+            p_ros, R_ros, camera_pitch_deg, cam_offset_body, cam_mount_R)
 
     @torch.no_grad()
     def render(self, R, T, return_tensor=True, return_rgb=True, return_depth=True, **_kw):
