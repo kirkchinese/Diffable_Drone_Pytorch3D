@@ -59,7 +59,7 @@ except ImportError:
     HAS_IMAGEIO = False
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger
+from model import Model, Model_bigger, Model_adaptive
 from navigation_utils import (
     compute_local_frame,
     compute_navigation_metrics_np,
@@ -109,8 +109,8 @@ def parse_args():
                         help='网格细分次数')
     parser.add_argument('--depth_min', type=float, default=0.3,
                         help='深度图近截断距离 (米)，同时也是渲染器近平面裁剪值')
-    parser.add_argument('--depth_max', type=float, default=3.0,
-                        help='深度图远截断距离 (米)')
+    parser.add_argument('--depth_max', type=float, default=10.0,
+                        help='深度图远截断距离 (米)，须与训练时一致，train.py 默认 10.0')
 
     # 高分辨率渲染选项（用于可视化输出，不影响模型输入）
     parser.add_argument('--viz_height', type=int, default=480,
@@ -189,6 +189,9 @@ def parse_args():
     # 模型参数
     parser.add_argument('--no_odom', action='store_true', default=False,
                         help='不使用里程计速度作为输入')
+    parser.add_argument('--model_type', type=str, default='bigger',
+                        choices=['bigger', 'adaptive', 'base'],
+                        help='模型类型 (bigger/adaptive/base)，需与训练时一致')
 
     # 目标点设置
     parser.add_argument('--max_speed', type=float, default=2.5,
@@ -370,7 +373,9 @@ class EvalRunner:
 
         # ---------- 模型 ----------
         dim_obs = 7 if args.no_odom else 10
-        self.model = Model_bigger(dim_obs=dim_obs, dim_action=6).to(self.device)
+        _model_map = {'bigger': Model_bigger, 'adaptive': Model_adaptive, 'base': Model}
+        ModelClass = _model_map[getattr(args, 'model_type', 'bigger')]
+        self.model = ModelClass(dim_obs=dim_obs, dim_action=6).to(self.device)
         self._load_checkpoint(args.checkpoint)
         self.model.eval()
 
