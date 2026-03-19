@@ -147,10 +147,11 @@ class DroneSimulator:
                 self.drone_mesh, self._drone_centroid, self.drone_bounding_radius = \
                     load_drone_mesh(drone_mesh_path, device=self.device)
                 centered = self.drone_mesh.verts_packed() - self._drone_centroid
-                # OBJ 文件使用 Y-up 约定（薄轴=Y），ROS 机体坐标使用 Z-up，
-                # 交换 Y↔Z 将网格从 OBJ 机体坐标转换到 ROS 机体坐标，
-                # 之后 transform_rot_ros2pt3d 才能正确将机体旋转映射到 PT3D 世界坐标。
-                self._drone_verts_centered = centered[:, [0, 2, 1]]
+                # OBJ Y-up → ROS Z-up 旋转 (等效于绕 X 轴旋转 -90°)：
+                #   body_X = obj_X, body_Y = -obj_Z, body_Z = obj_Y
+                # 列交换 [0,2,1] 的行列式为 -1（反射），翻转面法线导致渲染异常；
+                # 乘以 [1,-1,1] 后行列式 = +1，是正确的右手旋转。
+                self._drone_verts_centered = centered[:, [0, 2, 1]] * torch.tensor([1.0, -1.0, 1.0], device=self.device)
                 print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
                       f"包围球半径={self.drone_bounding_radius:.3f}m, "
                       f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m")
@@ -216,8 +217,8 @@ class DroneSimulator:
         # 安全边距：基于无人机网格包围球 + 空气动力学边距 + 随机化
         if self.drone_mesh is not None:
             base_radius = self.drone_bounding_radius + self.aero_margin
-            # 在 base_radius 附近小范围随机化 (±10%)
-            self.margin = base_radius * (0.9 + 0.2 * torch.rand((self.B,), device=self.device))
+            # 在 base_radius 附近随机化 (0.6x ~ 1.4x)，模拟不同大小的无人机
+            self.margin = base_radius * (0.6 + 0.8 * torch.rand((self.B,), device=self.device))
         else:
             low, high = self.init_margin_range
             self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low

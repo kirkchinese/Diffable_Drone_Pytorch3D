@@ -69,8 +69,8 @@ def parse_args():
     parser.add_argument('--cam_offset_x', type=float, default=0.0, help='相机安装 body-X 偏移 (m)')
     parser.add_argument('--cam_offset_y', type=float, default=0.0, help='相机安装 body-Y 偏移 (m)')
     parser.add_argument('--cam_offset_z', type=float, default=0.0, help='相机安装 body-Z 偏移 (m)')
-    parser.add_argument('--image_height', type=int, default=240, help='图像高度')
-    parser.add_argument('--image_width', type=int, default=320, help='图像宽度')
+    parser.add_argument('--image_height', type=int, default=48, help='图像高度')
+    parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
     parser.add_argument('--hfov', type=float, default=90.0,
                         help='相机水平视场角 (度)，默认90°。焦距由 FOV 和图像宽度自动计算')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
@@ -278,7 +278,7 @@ class DroneTrainer:
                 getattr(args, 'dynamic_obs_scale_max', 0.8),
             ),
             # 出生点/目标点间距约束
-            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
+            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 1.0),
             # 相机安装参数
             cam_offset_body=[getattr(args, 'cam_offset_x', 0.0),
                              getattr(args, 'cam_offset_y', 0.0),

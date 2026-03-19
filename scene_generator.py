@@ -343,13 +343,11 @@ def _random_rotation_matrix(device, max_tilt=torch.pi / 4):
     pitch = random.uniform(-max_tilt, max_tilt)
     roll = random.uniform(-max_tilt, max_tilt)
 
-    # 使用 torch 三角函数计算标量值
-    cy = torch.tensor(yaw).cos().item()
-    sy = torch.tensor(yaw).sin().item()
-    cp = torch.tensor(pitch).cos().item()
-    sp = torch.tensor(pitch).sin().item()
-    cr = torch.tensor(roll).cos().item()
-    sr = torch.tensor(roll).sin().item()
+    angles = torch.tensor([yaw, pitch, roll])
+    c = angles.cos()
+    s = angles.sin()
+    cy, cp, cr = c[0].item(), c[1].item(), c[2].item()
+    sy, sp, sr = s[0].item(), s[1].item(), s[2].item()
 
     # OBJ 坐标系: Y-up，Yaw 绕 Y 轴, Pitch 绕 X 轴, Roll 绕 Z 轴
     Ry = torch.tensor([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]],
