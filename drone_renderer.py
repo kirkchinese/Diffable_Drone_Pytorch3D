@@ -34,19 +34,17 @@ from pytorch3d.renderer import (
 _PI = torch.tensor(torch.pi)  # CPU 常量，仅用于初始化
 
 def hfov_to_focal(hfov_deg: float, image_width: int) -> float:
-    """从水平 FOV (度) 计算焦距 (像素)。纯 Python 浮点运算，适用于初始化。"""
-    import math as _m
-    return (image_width / 2.0) / _m.tan(_m.radians(hfov_deg) / 2.0)
+    """从水平 FOV (度) 计算焦距 (像素)。仅初始化调用。"""
+    half_rad = torch.deg2rad(torch.tensor(hfov_deg / 2.0))
+    return float(image_width / 2.0 / half_rad.tan())
 
 def focal_to_hfov(focal: float, image_width: int) -> float:
     """从焦距 (像素) 计算水平 FOV (度)。"""
-    import math as _m
-    return 2.0 * _m.degrees(_m.atan(image_width / 2.0 / focal))
+    return float(2.0 * torch.rad2deg(torch.atan(torch.tensor(image_width / 2.0 / focal))))
 
 def focal_to_vfov(focal: float, image_height: int) -> float:
     """从焦距 (像素) 计算垂直 FOV (度)。"""
-    import math as _m
-    return 2.0 * _m.degrees(_m.atan(image_height / 2.0 / focal))
+    return float(2.0 * torch.rad2deg(torch.atan(torch.tensor(image_height / 2.0 / focal))))
 
 
 def build_cam_mount_R(roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0, device=None, batch_size=1):
