@@ -7,14 +7,16 @@ from pytorch3d.ops import knn_points, sample_points_from_meshes
 try:
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
-                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d)
+                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d,
+                                build_cam_mount_R)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 except ImportError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from drone_dynamics import simulate_position_step, solve_attitude_from_thrust_and_goal_vec, update_dg
     from drone_renderer import (DroneRenderer, compute_drone_safety_radius,
-                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d)
+                                load_drone_mesh, transform_pos_ros2pt3d, transform_rot_ros2pt3d,
+                                build_cam_mount_R)
     from scene_generator import (SceneGenerator, sample_safe_points, sample_safe_targets,
                                   sample_cross_map_spawn_target, obj_to_ros, ros_to_obj)
 
@@ -64,12 +66,14 @@ class DroneSimulator:
                  act_queue_len=2,
                  # 相机参数
                  cam_offset_body=[0.1, 0.0, 0.0],
+                 cam_mount_rpy=(0.0, 10.0, 0.0),
                  # 渲染参数
                  z_clip_value=0.3,
                  # 场景随机化参数
                  enable_random_scene=False,
                  scene_generator=None,
                  safe_spawn_clearance=1.0,
+                 min_spawn_inter_distance=0.0,
                  random_init_yaw=True,
                  # 无人机网格参数
                  drone_mesh_path=None,
@@ -111,12 +115,14 @@ class DroneSimulator:
         self.wind_std = wind_std
         self.act_queue_len = act_queue_len
         self.cam_offset_body = cam_offset_body
+        self.cam_mount_rpy = cam_mount_rpy
         self.num_samples = num_samples
         
         # 场景随机化配置
         self.enable_random_scene = enable_random_scene
         self.scene_generator = scene_generator
         self.safe_spawn_clearance = safe_spawn_clearance
+        self.min_spawn_inter_distance = min_spawn_inter_distance
         self.random_init_yaw = random_init_yaw
         
         # 多无人机交互配置
@@ -276,6 +282,7 @@ class DroneSimulator:
             arena_range=arena_range,
             z_range=z_range,
             min_clearance=self.safe_spawn_clearance,
+            min_inter_distance=self.min_spawn_inter_distance,
             device=self.device,
         )
         
@@ -315,6 +322,7 @@ class DroneSimulator:
             min_clearance=self.safe_spawn_clearance,
             min_distance=min_distance,
             max_distance=max_distance,
+            min_inter_distance=self.min_spawn_inter_distance,
             device=self.device,
         )
         
@@ -352,6 +360,7 @@ class DroneSimulator:
             arena_range=arena_range,
             z_range=z_range,
             min_clearance=self.safe_spawn_clearance,
+            min_inter_distance=self.min_spawn_inter_distance,
             device=self.device,
         )
 
@@ -629,25 +638,32 @@ class DroneSimulator:
         self._dynamic_obstacles = []
         self.renderer.clear_dynamic_meshes()
 
-    def render(self, camera_pitch=10.0, return_tensor=True, return_rgb=True, return_depth=True, dt=None):
+    def render(self, camera_pitch=None, cam_mount_R=None,
+               return_tensor=True, return_rgb=True, return_depth=True, dt=None):
         """
         渲染当前帧
         
         Args:
-            camera_pitch (float): 相机俯仰角
+            camera_pitch (float|Tensor, optional): 相机俯仰角 (度)。
+                当 cam_mount_R 未提供时使用，默认取 self.cam_mount_rpy[1]。
+            cam_mount_R (Tensor, optional): 相机安装旋转矩阵 (B,3,3)；覆盖 camera_pitch。
             return_tensor (bool): 是否返回 Tensor
             return_rgb (bool): 是否返回 RGB
             return_depth (bool): 是否返回 Depth
-            dt (float, optional): 仿真时间步长，用于特定渲染效果（如运动模糊、流计算），可选。
+            dt (float, optional): 仿真时间步长。
         """
-        # 更新动态场景合成（无人机机体网格 + 动态障碍物网格）
         self._update_render_scene()
+
+        # 确定相机安装旋转
+        if cam_mount_R is None and camera_pitch is None:
+            camera_pitch = self.cam_mount_rpy[1]
 
         R_camera, T_camera = self.renderer.compute_view_matrix(
             p_ros=self.p, 
             R_ros=self.R, 
             camera_pitch_deg=camera_pitch,
-            cam_offset_body=self.cam_offset_body
+            cam_offset_body=self.cam_offset_body,
+            cam_mount_R=cam_mount_R,
         )
         rgb, depth = self.renderer.render(
             R=R_camera, 

@@ -12,7 +12,6 @@ from random import normalvariate
 from datetime import datetime
 
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -23,13 +22,12 @@ from drone_env import DroneSimulator
 from model import Model, Model_bigger,Model_adaptive
 from loss import DroneLoss
 from navigation_utils import (
-    compute_local_frame,
     compute_navigation_metrics_torch,
-    preprocess_depth_for_model,
+    DronePolicy,
 )
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
-from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
+from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov, build_cam_mount_R
 
 
 def parse_args():
@@ -64,6 +62,13 @@ def parse_args():
     
     # 环境参数 - 渲染
     parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
+    parser.add_argument('--min_spawn_inter_distance', type=float, default=1.0,
+                        help='出生/目标点之间的最小间距 (米), 防止无人机重叠')
+    parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
+    parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
+    parser.add_argument('--cam_offset_x', type=float, default=0.0, help='相机安装 body-X 偏移 (m)')
+    parser.add_argument('--cam_offset_y', type=float, default=0.0, help='相机安装 body-Y 偏移 (m)')
+    parser.add_argument('--cam_offset_z', type=float, default=0.0, help='相机安装 body-Z 偏移 (m)')
     parser.add_argument('--image_height', type=int, default=240, help='图像高度')
     parser.add_argument('--image_width', type=int, default=320, help='图像宽度')
     parser.add_argument('--hfov', type=float, default=90.0,
@@ -272,6 +277,15 @@ class DroneTrainer:
                 getattr(args, 'dynamic_obs_scale_min', 0.2),
                 getattr(args, 'dynamic_obs_scale_max', 0.8),
             ),
+            # 出生点/目标点间距约束
+            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
+            # 相机安装参数
+            cam_offset_body=[getattr(args, 'cam_offset_x', 0.0),
+                             getattr(args, 'cam_offset_y', 0.0),
+                             getattr(args, 'cam_offset_z', 0.0)],
+            cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
+                           args.cam_angle,
+                           getattr(args, 'cam_mount_yaw', 0.0)),
         )
         
         # 初始化模型
@@ -280,6 +294,14 @@ class DroneTrainer:
         else:
             self.model = Model_adaptive(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
         
+        # 重力标准向量 & 策略封装
+        self.g_std = torch.tensor([0.0, 0.0, -9.80665], device=self.device)
+        self.policy = DronePolicy(
+            model=self.model, g_std=self.g_std,
+            depth_min=args.depth_min, depth_max=args.depth_max,
+            no_odom=args.no_odom,
+        )
+
         # 加载预训练模型
         if args.resume:
             self._load_model(args.resume)
@@ -326,9 +348,6 @@ class DroneTrainer:
         
         # 指标平滑队列
         self.scaler_q = defaultdict(list)
-        
-        # 重力标准向量
-        self.g_std = torch.tensor([0.0, 0.0, -9.80665], device=self.device)
 
         # Best AR 追踪（用于保存最佳策略 checkpoint）
         # AR = success_rate × avg_speed，综合衡量"安全且高效"的行为质量
@@ -353,18 +372,6 @@ class DroneTrainer:
         """平滑指标记录"""
         for k, v in ori_dict.items():
             self.scaler_q[k].append(float(v))
-    
-    def _compute_local_R(self):
-        """
-        计算用于速度/目标向量转换的局部坐标系旋转矩阵
-        (参考项目的逻辑：使用水平投影后的前向轴)
-        
-        返回的 R_local 用于将世界坐标系向量转换到局部坐标系：
-        v_local = v_world @ R_local  (等价于 R_local.T @ v_world)
-        
-        注意：这里返回的矩阵列向量是局部坐标系的基向量在世界坐标系中的表示
-        """
-        return compute_local_frame(self.env.R)
     
     def run_episode(self, iteration):
         """
@@ -470,9 +477,14 @@ class DroneTrainer:
         # 推力估计误差 (模拟真实无人机的推力不确定性)
         thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
         
-        # Per-sample 相机俯仰角随机化 (参考项目在 reset 中一次性设定整个 episode)
-        # 模拟每架无人机相机安装角的个体差异，episode 内保持不变
-        cam_pitch = args.cam_angle + torch.randn(B, device=self.device)
+        # Per-sample 相机安装旋转矩阵 (俯仰角加随机扰动)
+        pitch_per_sample = args.cam_angle + torch.randn(B, device=self.device)
+        cam_mount_R = build_cam_mount_R(
+            roll_deg=getattr(args, 'cam_mount_roll', 0.0),
+            pitch_deg=pitch_per_sample,
+            yaw_deg=getattr(args, 'cam_mount_yaw', 0.0),
+            device=self.device,
+        )
         
         # 航向漂移 (可选)
         if args.yaw_drift:
@@ -495,7 +507,7 @@ class DroneTrainer:
             if t % args.render_interval == 0:
                 with torch.no_grad():
                     _, depth = self.env.render(
-                        camera_pitch=cam_pitch,
+                        cam_mount_R=cam_mount_R,
                         return_tensor=True,
                         return_rgb=False,
                         return_depth=True,
@@ -530,73 +542,20 @@ class DroneTrainer:
                          target_pos_vector=target_v_raw, 
                          dt=current_dt)
             
-            # 计算局部坐标系
-            R_local = self._compute_local_R()
-            
-            # 计算目标速度向量
-            target_v_norm = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
-            target_v_unit = target_v_raw / (target_v_norm + 1e-6)
-            target_v = target_v_unit * torch.minimum(target_v_norm, max_speed)
-            # 注意：target_v_history 在循环末尾与 v_history 一起记录
-            
-            # 构建观测状态
-            # 转换到局部坐标系 - 关键修复！
-            # 参考项目: torch.squeeze(target_v[:, None] @ R, 1)
-            # 这里 v @ R 相当于 v.unsqueeze(1) @ R，结果是 (B, 1, 3) -> squeeze -> (B, 3)
-            # 这是一种将世界坐标转换到以 R 的列向量为基的坐标系的方式
-            target_v_local = torch.squeeze(target_v[:, None] @ R_local, 1)
-            local_v = torch.squeeze(self.env.v[:, None] @ R_local, 1)
-            
-            state_parts = [
-                target_v_local,           # 目标速度 (local) [3]
-                self.env.R[:, 2],         # 机体姿态的第 3 行 [3] - 与参考项目保持一致
-                                          # 注：参考项目用 R[:, 2] 而不是 R[:, :, 2]
-                self.env.margin[:, None]  # 安全边距 [1]
-            ]
-            if not args.no_odom:
-                state_parts.insert(0, local_v)  # 加入局部速度 [3]
-            state = torch.cat(state_parts, dim=-1)  # [7] or [10]
-            
-            # 深度图预处理
-            # 空像素判定: PyTorch3D 背景 zbuf=-1 和超出探测距离的远处物体都视为「空」
-            x = preprocess_depth_for_model(
-                depth,
-                depth_min=args.depth_min,
-                depth_max=args.depth_max,
-                noise_std=0.02,
+            # 策略推理（obs 构造 → 模型前向 → 动作后处理）
+            act_cmd, v_pred, target_v, h = self.policy.infer(
+                depth, self.env.R, self.env.v, target_v_raw,
+                self.env.margin, max_speed, thr_est_error, h,
+                depth_noise_std=0.02,
             )
-            # 可选: stride=1 max_pool 膨胀障碍物，类似 C-space expansion。
-            # 默认禁用；仅在擦碰问题严重时通过 --depth_dilate 5 开启。
-            # if getattr(args, 'depth_dilate', 0) > 1:
-            #     pad = args.depth_dilate // 2
-            #     x = F.max_pool2d(x, kernel_size=args.depth_dilate, stride=1, padding=pad)
 
-            # 模型推理
-            act_raw, _, h = self.model(x, state, h)
-            
-            # Truncated BPTT: 每 30 步截断 GRU 梯度，避免全序列反向传播占满显存
+            # Truncated BPTT: 每 30 步截断 GRU 梯度
             if t > 0 and t % 30 == 0:
                 h = h.detach()
             
-            # 解析输出: [加速度向量(3), 速度预测(3)]
-            # 参考项目: a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
-            # act_raw: (B, 6) -> reshape to (B, 3, 2) 
-            # R @ (B, 3, 2) -> (B, 3, 2) -> unbind(-1) -> [a_pred, v_pred]
-            act_reshaped = act_raw.reshape(B, 3, 2)  # 关键修复！直接 reshape 为 (B, 3, 2)
-            act_world = R_local @ act_reshaped  # 转换到世界坐标系 (B, 3, 2)
-            a_pred, v_pred = act_world.unbind(-1)  # 分离加速度和速度预测
-            
             v_preds.append(v_pred)
+            act_buffer.append(act_cmd)
             
-            # 计算实际动作 (参考项目公式)
-            # act = (a_pred - v_pred - g_std) * thr_est_error + g_std
-            act = (a_pred - v_pred - self.g_std) * thr_est_error + self.g_std
-            
-            # 加入动作缓冲
-            act_buffer.append(act)
-            
-            # 关键修复：v_history 和 target_v_history 在 step 之后记录
-            # 与参考项目一致
             v_history.append(self.env.v)
             target_v_history.append(target_v)
         

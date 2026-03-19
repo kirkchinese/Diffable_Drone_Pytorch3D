@@ -805,6 +805,7 @@ def sample_cross_map_spawn_target(
     arena_range=6.0,
     z_range=(1.0, 3.0),
     min_clearance=1.0,
+    min_inter_distance=0.0,
     max_attempts=50,
     device=None,
 ):
@@ -889,7 +890,19 @@ def sample_cross_map_spawn_target(
                 mask_k = (idx_rep == global_idx) & safe
                 safe_cands = candidates[mask_k]
                 if safe_cands.shape[0] > 0 and not spawn_found[global_idx]:
-                    spawn[global_idx] = safe_cands[0]
+                    # 检查与已接受出生点的距离
+                    if min_inter_distance > 0 and spawn_found.any():
+                        existing = spawn[spawn_found]
+                        chosen = None
+                        for ci in range(safe_cands.shape[0]):
+                            if (existing - safe_cands[ci]).norm(dim=1).min().item() >= min_inter_distance:
+                                chosen = safe_cands[ci]
+                                break
+                        if chosen is None:
+                            continue
+                        spawn[global_idx] = chosen
+                    else:
+                        spawn[global_idx] = safe_cands[0]
                     spawn_found[global_idx] = True
 
         # ---- 目标点：在穿越方向的"正侧" ----
@@ -915,7 +928,19 @@ def sample_cross_map_spawn_target(
                 mask_k = (idx_rep == global_idx) & safe
                 safe_cands = candidates[mask_k]
                 if safe_cands.shape[0] > 0 and not target_found[global_idx]:
-                    target[global_idx] = safe_cands[0]
+                    # 检查与已接受目标点的距离
+                    if min_inter_distance > 0 and target_found.any():
+                        existing = target[target_found]
+                        chosen = None
+                        for ci in range(safe_cands.shape[0]):
+                            if (existing - safe_cands[ci]).norm(dim=1).min().item() >= min_inter_distance:
+                                chosen = safe_cands[ci]
+                                break
+                        if chosen is None:
+                            continue
+                        target[global_idx] = chosen
+                    else:
+                        target[global_idx] = safe_cands[0]
                     target_found[global_idx] = True
 
         if spawn_found.all() and target_found.all():
@@ -952,6 +977,7 @@ def sample_safe_points(
     arena_range=8.0,
     z_range=(1.0, 6.0),
     min_clearance=1.0,
+    min_inter_distance=0.0,
     max_attempts=50,
     device=None,
 ):
@@ -1025,8 +1051,21 @@ def sample_safe_points(
         safe_points = candidates[safe_mask]
 
         if safe_points.shape[0] > 0:
-            n_take = min(safe_points.shape[0], n_needed)
-            accepted.append(safe_points[:n_take])
+            if min_inter_distance > 0:
+                # 贪心接受：逐点检查与已接受点的距离
+                for j in range(safe_points.shape[0]):
+                    if len(accepted) >= num_points:
+                        break
+                    pt = safe_points[j]
+                    if len(accepted) > 0:
+                        stack = torch.stack(accepted)  # (M, 3)
+                        if (stack - pt).norm(dim=1).min().item() < min_inter_distance:
+                            continue
+                    accepted.append(pt)
+            else:
+                n_take = min(safe_points.shape[0], n_needed)
+                for j in range(n_take):
+                    accepted.append(safe_points[j])
 
     if len(accepted) == 0:
         # 极端退化：完全找不到安全点，返回高空随机点 (OBJ Y=height_hi)
@@ -1037,7 +1076,7 @@ def sample_safe_points(
         fallback[:, 2] = (torch.rand(num_points, device=device) - 0.5) * 2 * arena_range
         return fallback
 
-    result = torch.cat(accepted, dim=0)[:num_points]
+    result = torch.stack(accepted[:num_points])
 
     # 如果仍不够（理论上不太可能因为有退化逻辑），填充最后一个点
     if result.shape[0] < num_points:
@@ -1056,6 +1095,7 @@ def sample_safe_targets(
     min_clearance=1.0,
     min_distance=3.0,
     max_distance=8.0,
+    min_inter_distance=0.0,
     max_attempts=50,
     device=None,
 ):
@@ -1142,6 +1182,11 @@ def sample_safe_targets(
         remaining_indices = torch.where(remaining_mask)[0]
         for i, idx in enumerate(remaining_indices):
             if safe[i] and not found[idx]:
+                # 检查与已接受目标点的距离
+                if min_inter_distance > 0 and found.any():
+                    existing = targets[found]
+                    if (existing - candidates[i]).norm(dim=1).min().item() < min_inter_distance:
+                        continue
                 targets[idx] = candidates[i]
                 found[idx] = True
 

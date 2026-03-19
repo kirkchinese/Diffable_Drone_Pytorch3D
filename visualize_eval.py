@@ -25,7 +25,6 @@ import argparse
 from datetime import datetime
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # 非交互式后端，适合服务器
@@ -61,12 +60,11 @@ except ImportError:
 from drone_env import DroneSimulator
 from model import Model, Model_bigger, Model_adaptive
 from navigation_utils import (
-    compute_local_frame,
     compute_navigation_metrics_np,
-    preprocess_depth_for_model,
+    DronePolicy,
 )
 from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
-from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
+from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov, build_cam_mount_R
 
 
 # ================================================================
@@ -95,6 +93,13 @@ def parse_args():
     # 环境参数 - 渲染（与训练保持一致）
     parser.add_argument('--cam_angle', type=float, default=10,
                         help='相机俯仰角 (度)')
+    parser.add_argument('--min_spawn_inter_distance', type=float, default=1.0,
+                        help='出生/目标点之间的最小间距 (米)')
+    parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
+    parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
+    parser.add_argument('--cam_offset_x', type=float, default=0.0, help='相机安装 body-X 偏移 (m)')
+    parser.add_argument('--cam_offset_y', type=float, default=0.0, help='相机安装 body-Y 偏移 (m)')
+    parser.add_argument('--cam_offset_z', type=float, default=0.0, help='相机安装 body-Z 偏移 (m)')
     parser.add_argument('--image_height', type=int, default=48,
                         help='渲染图像高度')
     parser.add_argument('--image_width', type=int, default=64,
@@ -363,6 +368,15 @@ class EvalRunner:
                 getattr(args, 'dynamic_obs_scale_min', 0.2),
                 getattr(args, 'dynamic_obs_scale_max', 0.8),
             ),
+            # 出生点/目标点间距约束
+            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
+            # 相机安装参数
+            cam_offset_body=[getattr(args, 'cam_offset_x', 0.0),
+                             getattr(args, 'cam_offset_y', 0.0),
+                             getattr(args, 'cam_offset_z', 0.0)],
+            cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
+                           args.cam_angle,
+                           getattr(args, 'cam_mount_yaw', 0.0)),
         )
 
         # ---------- 高分辨率广角渲染器 (使用 create_variant 共享 mesh/lights) ----------
@@ -379,6 +393,13 @@ class EvalRunner:
         self._load_checkpoint(args.checkpoint)
         self.model.eval()
 
+        # ---------- 策略封装 ----------
+        self.policy = DronePolicy(
+            model=self.model, g_std=self.g_std,
+            depth_min=args.depth_min, depth_max=args.depth_max,
+            no_odom=args.no_odom,
+        )
+
         # ---------- 输出目录 ----------
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -390,10 +411,6 @@ class EvalRunner:
         if unexpected:
             print(f"[WARNING] Unexpected keys: {unexpected}")
         print(f"[Model] 已加载: {path}")
-
-    # ---- 局部坐标系 (复用训练逻辑) ----
-    def _compute_local_R(self):
-        return compute_local_frame(self.env.R)
 
     # ================================================================
     # 运行单个 episode
@@ -451,7 +468,13 @@ class EvalRunner:
         # 固定速度用于评估一致性
         max_speed = torch.full((B, 1), args.max_speed, device=self.device)
         thr_est_error = torch.ones((B, 1), device=self.device)  # 评估时不加推力噪声
-        cam_pitch = torch.full((B,), args.cam_angle, device=self.device, dtype=torch.float32)
+        cam_mount_R = build_cam_mount_R(
+            roll_deg=getattr(args, 'cam_mount_roll', 0.0),
+            pitch_deg=args.cam_angle,
+            yaw_deg=getattr(args, 'cam_mount_yaw', 0.0),
+            device=self.device,
+            batch_size=B,
+        )
 
         # 动作延迟缓冲
         act_lag = 1
@@ -484,7 +507,7 @@ class EvalRunner:
 
             # ---------- 模型输入深度图 (低分辨率，与训练一致) ----------
             _, depth_lo = self.env.render(
-                camera_pitch=cam_pitch,
+                cam_mount_R=cam_mount_R,
                 return_tensor=True,
                 return_rgb=False,
                 return_depth=True,
@@ -495,7 +518,7 @@ class EvalRunner:
             R_cam, T_cam = self.env.renderer.compute_view_matrix(
                 p_ros=self.env.p,
                 R_ros=self.env.R,
-                camera_pitch_deg=cam_pitch,
+                cam_mount_R=cam_mount_R,
                 cam_offset_body=self.env.cam_offset_body,
             )
             rgb_hi, depth_hi = self.hires_renderer.render(R_cam, T_cam)
@@ -533,40 +556,13 @@ class EvalRunner:
             # ---------- 执行动作 ----------
             self.env.step(act_cmd=act_buffer[t], target_pos_vector=target_v_raw, dt=current_dt)
 
-            # ---------- 模型推理 ----------
-            R_local = self._compute_local_R()
-
-            target_v_norm = torch.norm(target_v_raw, p=2, dim=-1, keepdim=True)
-            target_v_unit = target_v_raw / (target_v_norm + 1e-6)
-            target_v = target_v_unit * torch.minimum(target_v_norm, max_speed)
-            target_v_local = torch.squeeze(target_v[:, None] @ R_local, 1)
-            local_v = torch.squeeze(self.env.v[:, None] @ R_local, 1)
-
-            state_parts = [
-                target_v_local,
-                self.env.R[:, 2],
-                self.env.margin[:, None],
-            ]
-            if not args.no_odom:
-                state_parts.insert(0, local_v)
-            state = torch.cat(state_parts, dim=-1)
-
-            # 深度图预处理（与 train.py 完全一致）
-            x = preprocess_depth_for_model(
-                depth_lo,
-                depth_min=args.depth_min,
-                depth_max=args.depth_max,
-                noise_std=0.0,
+            # ---------- 策略推理 ----------
+            act_cmd, v_pred, target_v, h = self.policy.infer(
+                depth_lo, self.env.R, self.env.v, target_v_raw,
+                self.env.margin, max_speed, thr_est_error, h,
+                depth_noise_std=0.0,
             )
-
-            act_raw, _, h = self.model(x, state, h)
-
-            act_reshaped = act_raw.reshape(B, 3, 2)
-            act_world = R_local @ act_reshaped
-            a_pred, v_pred = act_world.unbind(-1)
-
-            act = (a_pred - v_pred - self.g_std) * thr_est_error + self.g_std
-            act_buffer.append(act)
+            act_buffer.append(act_cmd)
 
             rec['target_v'].append(target_v.cpu().numpy().copy())
 
