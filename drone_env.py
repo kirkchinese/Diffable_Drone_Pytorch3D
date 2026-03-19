@@ -60,7 +60,7 @@ class DroneSimulator:
                  init_p_range=2.0,
                  init_v_range=0.0,
                  init_dg_range=0.2,
-                 init_margin_range=(0.1, 0.3),
+                 init_margin_range=(0.3, 0.8),
                  # 运行参数
                  wind_std=0.1,
                  act_queue_len=2,
@@ -214,14 +214,10 @@ class DroneSimulator:
         # 模拟控制延迟的队列
         self.act_queue = [torch.zeros(self.B, 3, device=self.device) for _ in range(self.act_queue_len)]
         
-        # 安全边距：基于无人机网格包围球 + 空气动力学边距 + 随机化
-        if self.drone_mesh is not None:
-            base_radius = self.drone_bounding_radius + self.aero_margin
-            # 在 base_radius 附近随机化 (0.6x ~ 1.4x)，模拟不同大小的无人机
-            self.margin = base_radius * (0.6 + 0.8 * torch.rand((self.B,), device=self.device))
-        else:
-            low, high = self.init_margin_range
-            self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
+        # 安全边距：始终从 init_margin_range 采样，保证训练/评估一致
+        # 无人机网格仅作为视觉表示，按 margin 缩放渲染大小
+        low, high = self.init_margin_range
+        self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
 
         return self._get_state()
 

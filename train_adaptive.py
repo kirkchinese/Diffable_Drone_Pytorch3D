@@ -112,8 +112,8 @@ def parse_args():
                         help='出生/目标点最大高度（防止飞高规避）')
     
     # 环境参数 - 无人机物理
-    parser.add_argument('--margin_min', type=float, default=0.1, help='无人机安全半径最小值')
-    parser.add_argument('--margin_max', type=float, default=0.7, help='无人机安全半径最大值')
+    parser.add_argument('--margin_min', type=float, default=0.3, help='无人机安全半径最小值')
+    parser.add_argument('--margin_max', type=float, default=0.8, help='无人机安全半径最大值')
     parser.add_argument('--init_p_range', type=float, default=8.0, help='初始位置范围')
     parser.add_argument('--noise_std', type=float, default=0.04, help='环境扰动噪声标准差')
     parser.add_argument('--yaw_inertia', type=float, default=5.0, help='偏航惯性')
@@ -247,7 +247,7 @@ class DroneTrainer:
             airmode_coef=getattr(args, 'airmode_coef', 0.5),
             # 初始化参数
             init_p_range=getattr(args, 'init_p_range', 2.0),
-            init_margin_range=(getattr(args, 'margin_min', 0.1), getattr(args, 'margin_max', 0.3)),
+            init_margin_range=(getattr(args, 'margin_min', 0.3), getattr(args, 'margin_max', 0.8)),
             # 点云采样
             num_samples=args.num_samples,
             # 渲染优化: subdivide_times=0 配合 z_clip_value 可获得等价质量, 面片从 106 万降至 1.6 万

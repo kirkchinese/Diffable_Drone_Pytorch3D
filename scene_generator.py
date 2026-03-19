@@ -444,7 +444,7 @@ class SceneGenerator:
                  obstacle_z_range=(0.0, 5.0),
                  num_obstacles_range=(20, 40),
                  obstacle_scale_range=(0.3, 1.5),
-                 floor_scale=(1.0, 1.0, 1.0),
+                 floor_scale=None,
                  include_floor=True,
                  concentration=0.0,
                  grid_jitter=True,
@@ -468,7 +468,7 @@ class SceneGenerator:
                               会自动保证障碍物底部不低于地板 (OBJ Y >= 0)。
             num_obstacles_range: 障碍物数量范围 (min, max)，含两端
             obstacle_scale_range: 障碍物缩放范围
-            floor_scale: 地板缩放因子 (x, y, z)
+            floor_scale: 地板缩放因子 (x, y, z)，默认 None 自动根据 arena_range 计算
             include_floor: 是否包含地板
             concentration: 障碍物向中心集中的比例 (0=均匀, 1=全部集中)。
                            仅在 grid_jitter=False 时生效。默认 0.0（纯均匀分布）。
@@ -550,9 +550,21 @@ class SceneGenerator:
             self.primitive_half_heights[name] = verts_y.max().item()
 
         if include_floor:
-            self.primitive_meshes["floor"] = _load_primitive_mesh(
+            floor_raw = _load_primitive_mesh(
                 "floor", device=device, primitive_dir=primitive_dir
             )
+            # 居中地板 XZ（保持 Y 不变，使顶面仍在 Y≈0）
+            verts = floor_raw.verts_packed()
+            center = (verts.min(0).values + verts.max(0).values) / 2
+            center[1] = 0.0  # Y 轴不偏移
+            floor_raw = floor_raw.update_padded((verts - center).unsqueeze(0))
+            self.primitive_meshes["floor"] = floor_raw
+
+            # 自动计算地板缩放：覆盖 arena 并留 20% 余量
+            if self.floor_scale is None:
+                floor_extent = (verts.max(0).values - verts.min(0).values)[[0, 2]].max().item()
+                s = 2.0 * self.arena_range * 1.2 / floor_extent
+                self.floor_scale = (s, 1.0, s)
 
         self.obstacle_names = obstacle_names
 

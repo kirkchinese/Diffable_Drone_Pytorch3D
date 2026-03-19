@@ -253,7 +253,7 @@ class DroneTrainer:
             airmode_coef=getattr(args, 'airmode_coef', 0.5),
             # 初始化参数
             init_p_range=getattr(args, 'init_p_range', 2.0),
-            init_margin_range=(getattr(args, 'margin_min', 0.1), getattr(args, 'margin_max', 0.3)),
+            init_margin_range=(getattr(args, 'margin_min', 0.3), getattr(args, 'margin_max', 0.8)),
             # 点云采样
             num_samples=args.num_samples,
             # 渲染优化: subdivide_times=0 在 48x64 下无质量损失, 面片从 106 万降至 1.6 万
