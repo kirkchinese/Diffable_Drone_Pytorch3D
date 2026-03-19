@@ -17,7 +17,7 @@
 """
 
 import os
-import math
+from math import ceil, sqrt  # 仅用于 CPU 端整数运算
 import random
 import torch
 import numpy as np
@@ -325,7 +325,7 @@ def _center_mesh(mesh):
     return mesh.update_padded(new_verts.unsqueeze(0))
 
 
-def _random_rotation_matrix(device, max_tilt=math.pi / 4):
+def _random_rotation_matrix(device, max_tilt=torch.pi / 4):
     """
     生成随机旋转矩阵：完整 yaw 旋转 + 受限 pitch/roll。
 
@@ -339,13 +339,17 @@ def _random_rotation_matrix(device, max_tilt=math.pi / 4):
     Returns:
         (3, 3) 旋转矩阵 (float32)
     """
-    yaw = random.uniform(0, 2 * math.pi)
+    yaw = random.uniform(0, 2 * torch.pi)
     pitch = random.uniform(-max_tilt, max_tilt)
     roll = random.uniform(-max_tilt, max_tilt)
 
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
+    # 使用 torch 三角函数计算标量值
+    cy = torch.tensor(yaw).cos().item()
+    sy = torch.tensor(yaw).sin().item()
+    cp = torch.tensor(pitch).cos().item()
+    sp = torch.tensor(pitch).sin().item()
+    cr = torch.tensor(roll).cos().item()
+    sr = torch.tensor(roll).sin().item()
 
     # OBJ 坐标系: Y-up，Yaw 绕 Y 轴, Pitch 绕 X 轴, Roll 绕 Z 轴
     Ry = torch.tensor([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]],
@@ -389,8 +393,8 @@ def _transform_mesh(mesh, scale, rotation_y=0.0, translation=None, rotation_matr
     if rotation_matrix is not None:
         verts = verts @ rotation_matrix.T
     else:
-        cos_a = math.cos(rotation_y)
-        sin_a = math.sin(rotation_y)
+        cos_a = torch.tensor(rotation_y).cos().item()
+        sin_a = torch.tensor(rotation_y).sin().item()
         R = torch.tensor([
             [ cos_a, 0, sin_a],
             [ 0,     1, 0    ],
@@ -447,7 +451,7 @@ class SceneGenerator:
                  concentration=0.0,
                  grid_jitter=True,
                  enable_3d_rotation=True,
-                 max_tilt=math.pi / 4,
+                 max_tilt=torch.pi / 4,
                  ground_clearance=0.05,
                  ground_ratio=0.6,
                  cluster_ratio=0.3,
@@ -568,7 +572,7 @@ class SceneGenerator:
         """
         arena = self.arena_range
         # 网格边数：略多于 sqrt(num_obstacles)，保证有足够的格子
-        grid_side = max(math.ceil(math.sqrt(num_obstacles * 1.2)), 3)
+        grid_side = max(ceil(sqrt(num_obstacles * 1.2)), 3)
         cell_size = 2.0 * arena / grid_side
 
         # 生成所有网格中心
@@ -709,9 +713,9 @@ class SceneGenerator:
                 R = _random_rotation_matrix(self.device, self.max_tilt)
                 verts = verts @ R.T
             else:
-                rot_y = random.uniform(0, 2 * math.pi)
-                cos_a = math.cos(rot_y)
-                sin_a = math.sin(rot_y)
+                rot_y = random.uniform(0, 2 * torch.pi)
+                cos_a = torch.tensor(rot_y).cos().item()
+                sin_a = torch.tensor(rot_y).sin().item()
                 Ry = torch.tensor([
                     [ cos_a, 0, sin_a],
                     [ 0,     1, 0    ],
@@ -837,7 +841,7 @@ def sample_cross_map_spawn_target(
     height_lo, height_hi = z_range
 
     # 每个 batch 元素的穿越方向
-    theta = torch.rand(num_points, device=device) * 2 * math.pi
+    theta = torch.rand(num_points, device=device) * 2 * torch.pi
     cos_t = torch.cos(theta)
     sin_t = torch.sin(theta)
 
@@ -1105,7 +1109,7 @@ def sample_safe_targets(
         R = remaining_spawn.shape[0]
 
         # 随机角度 + 距离偏移（在 OBJ XZ 水平面内）
-        angle = torch.rand(R, device=device) * 2 * math.pi
+        angle = torch.rand(R, device=device) * 2 * torch.pi
         dist = torch.rand(R, device=device) * (max_distance - min_distance) + min_distance
 
         candidates = remaining_spawn.clone()

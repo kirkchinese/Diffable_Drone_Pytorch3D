@@ -6,7 +6,6 @@
 
 import os
 import gc
-import math
 import argparse
 from collections import defaultdict
 from random import normalvariate
@@ -30,6 +29,7 @@ from navigation_utils import (
 )
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
+from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
 
 
 def parse_args():
@@ -190,10 +190,9 @@ class DroneTrainer:
             print(f"[SafeSpawn] 已启用安全出生点/目标点, 最小安全距离: {getattr(args, 'safe_clearance', 1.0)}")
         
         # 根据 FOV 计算焦距
-        import math
-        focal_length = (args.image_width / 2.0) / math.tan(math.radians(args.hfov / 2.0))
-        hfov_actual = 2 * math.degrees(math.atan(args.image_width / 2.0 / focal_length))
-        vfov_actual = 2 * math.degrees(math.atan(args.image_height / 2.0 / focal_length))
+        focal_length = hfov_to_focal(args.hfov, args.image_width)
+        hfov_actual = focal_to_hfov(focal_length, args.image_width)
+        vfov_actual = focal_to_vfov(focal_length, args.image_height)
         print(f"[Camera] HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
@@ -395,7 +394,7 @@ class DroneTrainer:
             )
         else:
             # 原始方式：基于角度/距离偏移，不检查碰撞
-            angle = torch.rand(B, device=self.device) * 2 * math.pi
+            angle = torch.rand(B, device=self.device) * 2 * torch.pi
             dist = torch.rand(B, device=self.device) * 5.0 + 3.0 # 距离 3m ~ 8m
             
             offset_x = torch.cos(angle) * dist
@@ -424,7 +423,7 @@ class DroneTrainer:
         
         # 航向漂移 (可选)
         if args.yaw_drift:
-            drift_av = torch.randn(B, device=self.device) * (5 * math.pi / 180 / 15)
+            drift_av = torch.randn(B, device=self.device) * (5 * torch.pi / 180 / 15)
             zeros = torch.zeros_like(drift_av)
             ones = torch.ones_like(drift_av)
             R_drift = torch.stack([

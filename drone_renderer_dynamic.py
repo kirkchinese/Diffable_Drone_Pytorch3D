@@ -76,7 +76,6 @@ for step in range(timesteps):
 
 import torch
 import numpy as np
-import math
 from typing import List, Optional, Tuple, Union
 
 from pytorch3d.structures import Meshes, join_meshes_as_scene

@@ -4,26 +4,18 @@
 本模块提供了一个基于 PyTorch3D 的可微分 3D 渲染器类 `DroneRenderer`，
 用于加载无人机网格模型并生成 RGB 图像和深度图，支持批量渲染和坐标系转换。
 
-主要功能：
-- 加载和渲染 .obj 格式的 3D 网格模型。
-- 计算相机视图矩阵，支持 ROS 坐标系到 PyTorch3D 坐标系的转换。
-- 生成 RGB 和深度图像，支持梯度传播。
-- 提供障碍物距离计算和深度图清洗功能。
-
-依赖库：
-- torch: PyTorch 张量计算和自动微分。
-- pytorch3d: 3D 渲染和几何操作库。
-- numpy: 数值计算和数组操作。
-- math: 数学函数和常量。
+设计原则：
+- DroneRenderer 作为统一底座，支持不同分辨率/FOV 的渲染需求。
+- 通过 create_variant() 方法共享网格和光照，仅更换分辨率/FOV/光栅化参数。
+- 消除可视化脚本中独立 HighResRenderer 的硬编码重复。
 
 作者: KirkChinese
-版本: 你记了吗？
+版本: 2.0 (统一底座)
 日期: 2026-01-10
 """
 
 import torch
 import numpy as np
-import math
 from pytorch3d.ops import sample_points_from_meshes, knn_points, SubdivideMeshes
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
@@ -35,6 +27,26 @@ from pytorch3d.renderer import (
     TexturesVertex,
     look_at_view_transform
 )
+
+# ============================================================
+# 公共工具：FOV ↔ 焦距转换 (GPU-safe, 避免 math 模块)
+# ============================================================
+_PI = torch.tensor(torch.pi)  # CPU 常量，仅用于初始化
+
+def hfov_to_focal(hfov_deg: float, image_width: int) -> float:
+    """从水平 FOV (度) 计算焦距 (像素)。纯 Python 浮点运算，适用于初始化。"""
+    import math as _m
+    return (image_width / 2.0) / _m.tan(_m.radians(hfov_deg) / 2.0)
+
+def focal_to_hfov(focal: float, image_width: int) -> float:
+    """从焦距 (像素) 计算水平 FOV (度)。"""
+    import math as _m
+    return 2.0 * _m.degrees(_m.atan(image_width / 2.0 / focal))
+
+def focal_to_vfov(focal: float, image_height: int) -> float:
+    """从焦距 (像素) 计算垂直 FOV (度)。"""
+    import math as _m
+    return 2.0 * _m.degrees(_m.atan(image_height / 2.0 / focal))
 
 class DroneRenderer:
     """
@@ -161,6 +173,42 @@ class DroneRenderer:
         # Mesh.extend() 缓存：训练中 batch size 固定，避免每帧重建
         self._extended_mesh_cache = None
         self._extended_mesh_bs = 0
+
+    def create_variant(self, image_size=None, hfov_deg=None, focal_length=None,
+                       z_clip_value=0.3, max_faces_per_bin=50000):
+        """
+        创建共享 mesh / lights / obstacle_pcd 的渲染器变体。
+
+        用于同一场景下不同分辨率/FOV 的渲染需求（如高分辨率可视化），
+        避免重复加载网格和点云。
+
+        Args:
+            image_size: (H, W) 输出分辨率，默认复用当前渲染器设置。
+            hfov_deg: 水平 FOV (度)，与 focal_length 二选一。
+            focal_length: 直接指定焦距，优先于 hfov_deg。
+            z_clip_value: 近平面裁剪值。
+            max_faces_per_bin: 光栅化 bin 容量（高分辨率需要更大值）。
+
+        Returns:
+            DroneRendererVariant: 共享 mesh 的轻量渲染器。
+        """
+        if image_size is None:
+            image_size = self.image_size
+        H, W = image_size
+
+        if focal_length is None:
+            if hfov_deg is not None:
+                focal_length = hfov_to_focal(hfov_deg, W)
+            else:
+                focal_length = float(self.focal_length[0, 0])
+
+        return DroneRendererVariant(
+            parent=self,
+            image_size=image_size,
+            focal_length=focal_length,
+            z_clip_value=z_clip_value,
+            max_faces_per_bin=max_faces_per_bin,
+        )
 
     def _load_mesh(self, mesh_path, subdivide_times=3):
         """
@@ -374,11 +422,12 @@ class DroneRenderer:
         # 使用旋转矩阵标准化表达，便于扩展 (如增加Yaw/Roll偏置)
         # 这里的 pitch 是绕机体 Y 轴旋转。正 Pitch 代表向下看，即 Forward 向量向 -Z 偏转。
         # 支持 per-sample 的 Tensor 输入（用于训练时的相机角度随机化）
+        _DEG2RAD = torch.pi / 180.0
         if isinstance(camera_pitch_deg, (int, float)):
-            pitch_rad = torch.full((B,), camera_pitch_deg * math.pi / 180, device=device)
+            pitch_rad = torch.full((B,), camera_pitch_deg * _DEG2RAD, device=device)
         else:
             # Tensor 输入 (B,) — per-sample 俯仰角
-            pitch_rad = camera_pitch_deg.to(device=device, dtype=torch.float32) * (math.pi / 180)
+            pitch_rad = camera_pitch_deg.to(device=device, dtype=torch.float32) * _DEG2RAD
         c = torch.cos(pitch_rad)
         s = torch.sin(pitch_rad)
         zeros = torch.zeros(B, device=device)
@@ -442,6 +491,143 @@ class DroneRenderer:
         invalid_mask = (depth == -1) | (depth > max_dist) | (depth < min_dist)
         depth[invalid_mask] = float('nan')
         return depth
+
+
+class DroneRendererVariant:
+    """
+    共享 mesh/lights/obstacle_pcd 的轻量渲染器变体。
+
+    由 DroneRenderer.create_variant() 创建，适用于同一场景下
+    不同分辨率/FOV 的渲染需求（如高分辨率可视化输出）。
+    """
+
+    def __init__(self, parent, image_size, focal_length, z_clip_value=0.3,
+                 max_faces_per_bin=50000):
+        self.parent = parent
+        self.device = parent.device
+        self.image_size = image_size
+        H, W = image_size
+
+        fl = float(focal_length)
+        self.focal_length = torch.tensor([[fl, fl]], dtype=torch.float32, device=self.device)
+        self.principal_point = torch.tensor(
+            [[W / 2.0, H / 2.0]], dtype=torch.float32, device=self.device)
+        self.image_size_tensor = torch.tensor(
+            [[H, W]], dtype=torch.float32, device=self.device)
+
+        self.raster_settings = RasterizationSettings(
+            image_size=image_size,
+            blur_radius=0.0,
+            faces_per_pixel=1,
+            perspective_correct=True,
+            z_clip_value=z_clip_value,
+            max_faces_per_bin=max_faces_per_bin,
+        )
+        self.rasterizer = MeshRasterizer(raster_settings=self.raster_settings)
+        self.shader = SoftPhongShader(device=self.device, lights=parent.lights)
+
+    @property
+    def mesh(self):
+        return self.parent.mesh
+
+    @property
+    def obstacle_pcd(self):
+        return self.parent.obstacle_pcd
+
+    @property
+    def lights(self):
+        return self.parent.lights
+
+    def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=-10.0, cam_offset_body=None):
+        """委托给 parent。"""
+        return self.parent.compute_view_matrix(p_ros, R_ros, camera_pitch_deg, cam_offset_body)
+
+    @torch.no_grad()
+    def render(self, R, T, return_tensor=True, return_rgb=True, return_depth=True, **_kw):
+        """渲染 (默认 no_grad，用于可视化)。"""
+        if not torch.is_tensor(R):
+            R = torch.tensor(R, device=self.device, dtype=torch.float32)
+        if not torch.is_tensor(T):
+            T = torch.tensor(T, device=self.device, dtype=torch.float32)
+        if R.dim() == 2:
+            R = R.unsqueeze(0)
+        if T.dim() == 1:
+            T = T.unsqueeze(0)
+
+        cameras = PerspectiveCameras(
+            focal_length=self.focal_length,
+            principal_point=self.principal_point,
+            image_size=self.image_size_tensor,
+            in_ndc=False, R=R, T=T, device=self.device,
+        )
+        mesh = self.parent.mesh.extend(len(cameras))
+        fragments = self.rasterizer(mesh, cameras=cameras)
+
+        rgb_images = None
+        depth_maps = None
+        if return_rgb:
+            images = self.shader(fragments, mesh, cameras=cameras)
+            rgb_images = images[..., :3]
+        if return_depth:
+            depth_maps = fragments.zbuf[..., 0]
+
+        if not return_tensor:
+            if rgb_images is not None:
+                rgb_images = rgb_images.detach().cpu().numpy()
+            if depth_maps is not None:
+                depth_maps = depth_maps.detach().cpu().numpy()
+        return rgb_images, depth_maps
+
+
+# ============================================================
+# 无人机网格工具
+# ============================================================
+
+def compute_drone_safety_radius(drone_mesh_path, device=None, aero_margin=0.05):
+    """
+    从无人机网格文件计算安全半径 = 包围球半径 + 空气动力学干扰边距。
+
+    Args:
+        drone_mesh_path: .obj 文件路径。
+        device: 计算设备。
+        aero_margin: 空气动力学干扰边距 (m)，默认 0.05。
+
+    Returns:
+        float: 安全半径 (米)。
+    """
+    if device is None:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    mesh = load_objs_as_meshes([drone_mesh_path], device=device)
+    verts = mesh.verts_packed()  # (V, 3)
+    centroid = verts.mean(dim=0)
+    bounding_radius = (verts - centroid).norm(dim=1).max().item()
+    return bounding_radius + aero_margin
+
+
+def load_drone_mesh(drone_mesh_path, device=None, scale=1.0):
+    """
+    加载无人机网格并返回 Meshes 对象 + 包围球信息。
+
+    Args:
+        drone_mesh_path: .obj 文件路径。
+        device: 计算设备。
+        scale: 缩放因子 (随机化用)。
+
+    Returns:
+        tuple: (mesh, centroid, bounding_radius)
+    """
+    if device is None:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    mesh = load_objs_as_meshes([drone_mesh_path], device=device)
+    if mesh.textures is None:
+        verts = mesh.verts_list()[0]
+        verts_rgb = torch.ones_like(verts)[None]
+        mesh.textures = TexturesVertex(verts_features=verts_rgb)
+    verts = mesh.verts_packed()
+    centroid = verts.mean(dim=0)
+    bounding_radius = float((verts - centroid).norm(dim=1).max().item())
+    return mesh, centroid, bounding_radius
+
 
 def transform_pos_ros2pt3d(pos):
     """
