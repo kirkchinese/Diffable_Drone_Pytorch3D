@@ -65,6 +65,8 @@ class DroneSimulator:
                  wind_std=0.1,
                  act_queue_len=2,
                  # 相机参数
+                 cam_mode='auto',
+                 cam_extrinsic=None,
                  cam_offset_body=None,
                  cam_mount_rpy=(0.0, 10.0, 0.0),
                  # 渲染参数
@@ -114,8 +116,19 @@ class DroneSimulator:
         self.init_margin_range = init_margin_range
         self.wind_std = wind_std
         self.act_queue_len = act_queue_len
+        self.cam_mode = cam_mode
         self.cam_offset_body = cam_offset_body
         self.cam_mount_rpy = cam_mount_rpy
+
+        # 手动模式：解析 3×4 外参矩阵 [R(3×3) | t(3×1)]
+        self._cam_manual_R = None   # (3, 3)
+        self._cam_manual_t = None   # (3,)
+        if cam_extrinsic is not None:
+            ext = torch.as_tensor(cam_extrinsic, device=self.device, dtype=torch.float32)
+            if ext.numel() == 12:
+                ext = ext.reshape(3, 4)
+            self._cam_manual_R = ext[:, :3]   # 安装旋转
+            self._cam_manual_t = ext[:, 3]    # 机体偏移
         self.num_samples = num_samples
         
         # 场景随机化配置
@@ -677,16 +690,29 @@ class DroneSimulator:
         """
         self._update_render_scene()
 
-        # 确定相机安装旋转
+        # 确定相机安装旋转和位置偏移
+        if cam_mount_R is None and cam_offset_body is None:
+            if self.cam_mode == 'manual' and self._cam_manual_R is not None:
+                # 手动模式：使用用户提供的外参矩阵
+                cam_mount_R = self._cam_manual_R
+                cam_offset_body = self._cam_manual_t
+            else:
+                # 自动模式：网格比例偏移 + RPY 旋转
+                if hasattr(self, '_mesh_cam_offset_base'):
+                    cam_offset_body = self.get_scaled_cam_offset()
+                elif self.cam_offset_body is not None:
+                    cam_offset_body = self.cam_offset_body
+        elif cam_offset_body is None:
+            # 仅 cam_mount_R 被显式传入，自动计算偏移
+            if self.cam_mode == 'manual' and self._cam_manual_t is not None:
+                cam_offset_body = self._cam_manual_t
+            elif hasattr(self, '_mesh_cam_offset_base'):
+                cam_offset_body = self.get_scaled_cam_offset()
+            elif self.cam_offset_body is not None:
+                cam_offset_body = self.cam_offset_body
+
         if cam_mount_R is None and camera_pitch is None:
             camera_pitch = self.cam_mount_rpy[1]
-
-        # 确定相机位置偏移：优先使用调用方传入值，否则按网格比例自动计算
-        if cam_offset_body is None:
-            if hasattr(self, '_mesh_cam_offset_base'):
-                cam_offset_body = self.get_scaled_cam_offset()
-            else:
-                cam_offset_body = self.cam_offset_body
 
         R_camera, T_camera = self.renderer.compute_view_matrix(
             p_ros=self.p, 
