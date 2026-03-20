@@ -901,6 +901,11 @@ class DroneSimulator:
         # 每架无人机的最近同组无人机
         min_dist_grouped, min_idx = ellipsoid_dist.min(dim=2)  # (n_groups, G)
 
+        # 减去双方 margin 之和，使返回距离语义与障碍物一致（负值 = 碰撞）
+        margin_grouped = self.margin[:n_groups * G].view(n_groups, G)
+        margin_other = margin_grouped.gather(1, min_idx)
+        min_dist_grouped = min_dist_grouped - margin_grouped - margin_other
+
         # 对应向量
         min_idx_exp = min_idx.unsqueeze(-1).expand(-1, -1, 3)
         min_vec_grouped = diff.gather(2, min_idx_exp.unsqueeze(2)).squeeze(2)
@@ -921,7 +926,7 @@ class DroneSimulator:
 
     def inter_drone_vec_subdivided(self, n_subdiv=10, dt=None):
         """
-        子步细分版本的无人机间距离计算。
+        子步细分版本的无人机间距离计算（全向量化，无 Python 循环）。
 
         沿轨迹 p + v * t 均匀采样 n_subdiv 个点，
         计算每个子步位置处到同组最近无人机的向量。
@@ -938,13 +943,32 @@ class DroneSimulator:
         sub_div = torch.linspace(0, current_dt, n_subdiv, device=self.device)
         p_all = self.p.unsqueeze(0) + self.v.unsqueeze(0) * sub_div[:, None, None]
         S, B, _ = p_all.shape
+        G = self.n_drones_per_group
+        n_groups = B // G
 
-        vecs_list = []
-        for s in range(S):
-            _, vec = self.inter_drone_distances(p_all[s])
-            vecs_list.append(vec)
+        # 将 S 个子步与 n_groups 个组合并为一个批维度: (S*n_groups, G, 3)
+        p_grouped = p_all[:, :n_groups * G].view(S * n_groups, G, 3)
+        diff = p_grouped.unsqueeze(2) - p_grouped.unsqueeze(1)  # (S*n_groups, G, G, 3)
 
-        return torch.stack(vecs_list, dim=0)  # (S, B, 3)
+        ellipsoid_dist_sq = diff[..., 0]**2 + diff[..., 1]**2 + 4 * diff[..., 2]**2
+        ellipsoid_dist = torch.sqrt(ellipsoid_dist_sq + 1e-8)
+
+        if self._inter_drone_eye_mask is None or self._inter_drone_eye_mask.shape[-1] != G:
+            self._inter_drone_eye_mask = torch.eye(G, device=self.device, dtype=torch.bool).unsqueeze(0)
+        ellipsoid_dist = ellipsoid_dist.masked_fill(self._inter_drone_eye_mask, 1e6)
+
+        _, min_idx = ellipsoid_dist.min(dim=2)  # (S*n_groups, G)
+        min_idx_exp = min_idx.unsqueeze(-1).expand(-1, -1, 3)
+        min_vec_grouped = diff.gather(2, min_idx_exp.unsqueeze(2)).squeeze(2)  # (S*n_groups, G, 3)
+
+        # 还原: (S*n_groups, G, 3) -> (S, n_groups*G, 3)
+        vecs = min_vec_grouped.view(S, n_groups * G, 3)
+
+        if B > n_groups * G:
+            pad_n = B - n_groups * G
+            vecs = torch.cat([vecs, torch.zeros(S, pad_n, 3, device=self.device)], dim=1)
+
+        return vecs
 
     def combined_vec_to_nearest(self, n_subdiv=10, dt=None):
         """
@@ -965,11 +989,11 @@ class DroneSimulator:
         # 其他无人机的子步查询
         vecs_drone = self.inter_drone_vec_subdivided(n_subdiv=n_subdiv, dt=dt)
 
-        # 取距离更近者
-        dist_obs = vecs_obs.norm(dim=-1)      # (S, B)
-        dist_drone = vecs_drone.norm(dim=-1)  # (S, B)
+        # 取距离更近者（比较平方范数，省去 sqrt）
+        dist_sq_obs = (vecs_obs * vecs_obs).sum(dim=-1)
+        dist_sq_drone = (vecs_drone * vecs_drone).sum(dim=-1)
 
-        use_drone = dist_drone < dist_obs     # (S, B)
+        use_drone = dist_sq_drone < dist_sq_obs
         use_drone_exp = use_drone.unsqueeze(-1)  # (S, B, 1)
 
         return torch.where(use_drone_exp, vecs_drone, vecs_obs)
