@@ -66,12 +66,7 @@ def parse_args():
                         help='相机安装横滚角 (度，正值=右倾)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0,
                         help='相机安装偏航角 (度，正值=右转)')
-    parser.add_argument('--cam_offset_x', type=float, default=0.1,
-                        help='相机在机体前向的偏移 (m)')
-    parser.add_argument('--cam_offset_y', type=float, default=0.0,
-                        help='相机在机体左向的偏移 (m)')
-    parser.add_argument('--cam_offset_z', type=float, default=0.0,
-                        help='相机在机体上方的偏移 (m)')
+    # cam_offset_x/y/z 已弃用 —— 相机偏移由网格几何自动计算 (get_scaled_cam_offset)
     parser.add_argument('--cam_rand_xy', type=float, default=0.02,
                         help='相机 XY 偏移随机化半径 (m)，模拟安装误差')
     parser.add_argument('--cam_rand_z_range', type=float, nargs=2, default=[-0.04, 0.04],
@@ -272,10 +267,7 @@ class DroneTrainer:
             safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
             min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 1.0),
             random_init_yaw=getattr(args, 'random_init_yaw', True),
-            # 相机安装参数
-            cam_offset_body=[getattr(args, 'cam_offset_x', 0.1),
-                             getattr(args, 'cam_offset_y', 0.0),
-                             getattr(args, 'cam_offset_z', 0.0)],
+            # 相机安装参数 (cam_offset_body=None → 由网格几何自动计算)
             cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
                            getattr(args, 'cam_angle', 10),
                            getattr(args, 'cam_mount_yaw', 0.0)),
@@ -509,13 +501,15 @@ class DroneTrainer:
         )
 
         # Per-sample 相机位置偏移随机化（episode 内不变）
+        # 基准偏移由网格几何自动计算，已按当前 margin 缩放
+        cam_offset_base = self.env.get_scaled_cam_offset()  # (B, 3)
         xy_rand = getattr(args, 'cam_rand_xy', 0.02)
         z_lo, z_hi = getattr(args, 'cam_rand_z_range', [-0.04, 0.04])
-        cam_offset_body = torch.stack([
-            getattr(args, 'cam_offset_x', 0.1) + xy_rand * torch.randn(B, device=self.device),
-            getattr(args, 'cam_offset_y', 0.0) + xy_rand * torch.randn(B, device=self.device),
-            getattr(args, 'cam_offset_z', 0.0) + torch.rand(B, device=self.device) * (z_hi - z_lo) + z_lo,
-        ], dim=-1)  # (B, 3)
+        cam_offset_body = cam_offset_base + torch.stack([
+            xy_rand * torch.randn(B, device=self.device),
+            xy_rand * torch.randn(B, device=self.device),
+            torch.rand(B, device=self.device) * (z_hi - z_lo) + z_lo,
+        ], dim=-1)
         
         # 航向漂移 (可选)
         if args.yaw_drift:

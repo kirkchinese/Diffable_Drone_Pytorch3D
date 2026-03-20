@@ -65,7 +65,7 @@ class DroneSimulator:
                  wind_std=0.1,
                  act_queue_len=2,
                  # 相机参数
-                 cam_offset_body=[0.1, 0.0, 0.0],
+                 cam_offset_body=None,
                  cam_mount_rpy=(0.0, 10.0, 0.0),
                  # 渲染参数
                  z_clip_value=0.3,
@@ -152,9 +152,18 @@ class DroneSimulator:
                 # 列交换 [0,2,1] 的行列式为 -1（反射），翻转面法线导致渲染异常；
                 # 乘以 [1,-1,1] 后行列式 = +1，是正确的右手旋转。
                 self._drone_verts_centered = centered[:, [0, 2, 1]] * torch.tensor([1.0, -1.0, 1.0], device=self.device)
+
+                # 从网格几何计算相机安装基准偏移（未缩放，仿照真机前下方安装位置）
+                x_front = self._drone_verts_centered[:, 0].max().item()
+                z_bottom = self._drone_verts_centered[:, 2].min().item()
+                self._mesh_cam_offset_base = torch.tensor(
+                    [x_front * 1.15, 0.0, z_bottom * 0.3],
+                    device=self.device,
+                )
                 print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
                       f"包围球半径={self.drone_bounding_radius:.3f}m, "
-                      f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m")
+                      f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m, "
+                      f"相机基准偏移(未缩放)={self._mesh_cam_offset_base.tolist()}")
             else:
                 print(f"[DroneSimulator] 警告: 无人机网格文件不存在: {drone_mesh_path}")
 
@@ -220,6 +229,18 @@ class DroneSimulator:
         self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
 
         return self._get_state()
+
+    def get_scaled_cam_offset(self):
+        """按当前 margin 缩放的网格比例相机偏移 (B, 3)。
+
+        相机安装位置由网格几何决定，并随 margin 缩放保持与机体的相对关系。
+        若未加载无人机网格，返回零偏移。
+        """
+        if not hasattr(self, '_mesh_cam_offset_base'):
+            return torch.zeros(self.B, 3, device=self.device)
+        base_safety = self.drone_bounding_radius + self.aero_margin
+        scales = (self.margin / base_safety).unsqueeze(1)          # (B, 1)
+        return self._mesh_cam_offset_base.unsqueeze(0) * scales    # (B, 3)
 
     @torch.no_grad()
     def randomize_scene(self, num_obstacles=None):
@@ -647,7 +668,8 @@ class DroneSimulator:
                 当 cam_mount_R 未提供时使用，默认取 self.cam_mount_rpy[1]。
             cam_mount_R (Tensor, optional): 相机安装旋转矩阵 (B,3,3)；覆盖 camera_pitch。
             cam_offset_body (Tensor|list, optional): 相机机体坐标系偏移 (3,) 或 (B,3)。
-                默认使用 self.cam_offset_body。
+                默认按网格几何自动计算（前下方，随 margin 缩放）；
+                若无网格则使用 self.cam_offset_body 兜底。
             return_tensor (bool): 是否返回 Tensor
             return_rgb (bool): 是否返回 RGB
             return_depth (bool): 是否返回 Depth
@@ -659,11 +681,18 @@ class DroneSimulator:
         if cam_mount_R is None and camera_pitch is None:
             camera_pitch = self.cam_mount_rpy[1]
 
+        # 确定相机位置偏移：优先使用调用方传入值，否则按网格比例自动计算
+        if cam_offset_body is None:
+            if hasattr(self, '_mesh_cam_offset_base'):
+                cam_offset_body = self.get_scaled_cam_offset()
+            else:
+                cam_offset_body = self.cam_offset_body
+
         R_camera, T_camera = self.renderer.compute_view_matrix(
             p_ros=self.p, 
             R_ros=self.R, 
             camera_pitch_deg=camera_pitch,
-            cam_offset_body=cam_offset_body if cam_offset_body is not None else self.cam_offset_body,
+            cam_offset_body=cam_offset_body,
             cam_mount_R=cam_mount_R,
         )
         rgb, depth = self.renderer.render(
