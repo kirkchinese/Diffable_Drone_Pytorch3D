@@ -35,7 +35,9 @@ class DroneLoss:
                  coef_lateral=0.0,
                  coef_drone_collide=5.0,
                  ctl_dt=0.02,
-                 window_size=30):
+                 window_size=30,
+                 loss_v_mode='mse',
+                 adaptive_decay_rate=2.0):
         """
         初始化无人机损失函数。
 
@@ -56,6 +58,12 @@ class DroneLoss:
                 仅在 forward 传入 inter_drone_dist_history 时生效。
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
+            loss_v_mode (str): 速度损失模式。
+                'mse'        — 参考项目式，SmoothL1(||v̄−target_v||₂)，惩罚所有方向（默认）
+                'decomposed' — 分解式，只罚前向速度不足，横向完全免罚
+                'adaptive'   — 自适应式，前向跟踪＋指数衰减制动（终点强制悬停）
+            adaptive_decay_rate (float): adaptive 模式的指数衰减率 λ。
+                alpha = exp(-λ * V_target)。λ 越大制动越快开始，默认 2.0。
         """
         self.coefs = {
             'v': coef_v,
@@ -73,6 +81,8 @@ class DroneLoss:
         }
         self.ctl_dt = ctl_dt
         self.window_size = window_size
+        self.loss_v_mode = loss_v_mode
+        self.adaptive_decay_rate = adaptive_decay_rate
 
     def barrier(self, x: torch.Tensor, v_to_pt: torch.Tensor) -> torch.Tensor:
         """
@@ -144,25 +154,14 @@ class DroneLoss:
         loss_ground_affinity = p_history[..., 2].relu().pow(2).mean()
         metrics['loss_ground_affinity'] = loss_ground_affinity
 
-        # 速度跟踪损失：速度分解法（Velocity Decomposition）
-        # 将速度分解为前向分量（朝目标方向）和横向分量（垂直于目标方向）
-        # 只惩罚前向速度不足（shortfall），横向运动不额外惩罚
-        # 
-        # 数学原理：
-        #   target_unit = target_v / ||target_v||
-        #   v_fwd = dot(v_avg, target_unit)           → 前向速度标量
-        #   shortfall = relu(target_speed - v_fwd)    → 只惩罚比目标慢
-        #   loss_v = smooth_l1(shortfall)
-        #
-        # 关键性质：
-        #   - v=0: loss = smooth_l1(target_speed) （静止被惩罚）
-        #   - v=横向: loss = smooth_l1(target_speed) （与静止相同，横向免罚）
-        #   - v=45°绕行: loss = smooth_l1(target_speed - ||v||*cos45°) （优于静止）
-        #   - v=满速前进: loss ≈ 0 （最优）
-        #   
-        # 这打破了旧 loss 中的 APF 局部最小值：
-        #   旧 loss: ||v_lateral - target_v||² = max_speed² + v_lat² > max_speed²
-        #   → 横向运动比静止损失更高 → 无人机在障碍物前停滞
+        # ==================== 速度跟踪损失 ====================
+        # 三种模式 (loss_v_mode):
+        #   'mse'        — 参考项目式: SmoothL1(||v̄ − target_v||₂)
+        #                  惩罚所有方向偏差（含横向），容易在障碍物前悬停
+        #   'decomposed' — 分解式: SmoothL1(relu(V_target − v_fwd))
+        #                  横向完全免罚，打破悬停局部最优，但终点会绕圈
+        #   'adaptive'   — 自适应式: 前向跟踪 + exp(-λ·V_target) 制动
+        #                  路途横向免罚 + 终点强制悬停，兼顾避障与制动
         if T > self.window_size:
             v_history_cum = v_history.cumsum(0)
             v_history_avg = (v_history_cum[self.window_size:] - v_history_cum[:-self.window_size]) / self.window_size
@@ -174,24 +173,55 @@ class DroneLoss:
                 v_history_avg = v_history_avg[:min_len]
                 target_slice = target_slice[:min_len]
 
-            # 速度分解
-            target_speed = torch.norm(target_slice, p=2, dim=-1)  # (T', B)
-            target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)  # (T', B, 3)
-            
-            # 前向分量：v 在 target 方向上的投影
-            v_fwd = torch.sum(v_history_avg * target_unit, dim=-1)  # (T', B)
-            
-            # 前向损失：只惩罚速度不足（不惩罚超速）
-            shortfall = F.relu(target_speed - v_fwd)  # (T', B)
-            loss_v = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
-            
-            # 可选：横向分量惩罚（防止绕圈，默认关闭）
-            if self.coefs['lateral'] > 0:
-                v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit  # (T', B, 3)
-                v_perp_norm = torch.norm(v_perp, p=2, dim=-1)  # (T', B)
-                loss_lateral = F.smooth_l1_loss(v_perp_norm, torch.zeros_like(v_perp_norm))
-            else:
+            if self.loss_v_mode == 'mse':
+                # ---- 参考项目式 ----
+                # SmoothL1(||v̄₃₀ − target_v||₂)
+                # 等价于惩罚速度向量误差的模长，横向偏移也受罚
+                delta_v = (v_history_avg - target_slice).norm(p=2, dim=-1)
+                loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
                 loss_lateral = p_history.new_tensor(0.0)
+
+            elif self.loss_v_mode == 'decomposed':
+                # ---- 分解式 ----
+                target_speed = target_slice.norm(p=2, dim=-1)
+                target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
+                v_fwd = (v_history_avg * target_unit).sum(dim=-1)
+
+                shortfall = F.relu(target_speed - v_fwd)
+                loss_v = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
+
+                if self.coefs['lateral'] > 0:
+                    v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
+                    loss_lateral = F.smooth_l1_loss(
+                        v_perp.norm(p=2, dim=-1),
+                        torch.zeros(v_perp.shape[:-1], device=v_perp.device))
+                else:
+                    loss_lateral = p_history.new_tensor(0.0)
+
+            else:  # adaptive
+                # ---- 自适应式 ----
+                # Part 1: 前向速度不足惩罚（同 decomposed，横向免罚）
+                target_speed = target_slice.norm(p=2, dim=-1)          # (T', B)
+                target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
+                v_fwd = (v_history_avg * target_unit).sum(dim=-1)      # (T', B)
+
+                shortfall = F.relu(target_speed - v_fwd)
+                loss_v_fwd = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
+
+                # Part 2: 指数衰减制动 — 目标速度越低，制动惩罚越强
+                # alpha = exp(-λ * V_target)
+                #   V_target≈3 m/s (路途) → alpha≈0.002 → 几乎不制动,横向自由
+                #   V_target≈0   (终点) → alpha≈1.0   → 惩罚全部速度分量
+                alpha = torch.exp(-self.adaptive_decay_rate * target_speed)  # (T', B)
+                v_total = v_history_avg.norm(p=2, dim=-1)                   # (T', B)
+                brake_elem = F.smooth_l1_loss(
+                    v_total, torch.zeros_like(v_total), reduction='none')    # (T', B)
+                loss_v_brake = (alpha * brake_elem).mean()
+
+                loss_v = loss_v_fwd + loss_v_brake
+                loss_lateral = p_history.new_tensor(0.0)
+                metrics['loss_v_fwd'] = loss_v_fwd
+                metrics['loss_v_brake'] = loss_v_brake
         else:
             loss_v = p_history.new_tensor(0.0)
             loss_lateral = p_history.new_tensor(0.0)
