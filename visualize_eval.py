@@ -483,9 +483,12 @@ class EvalRunner:
             rec['attitude_z'].append(self.env.R[:, 2].cpu().numpy().copy())
             dist = self.env.calc_min_distance()
             rec['dist_to_obs'].append(dist.cpu().numpy().copy())
-            rec['collision'].append(
-                (dist < self.env.margin).cpu().numpy().copy()
-            )
+            obs_collision = dist < self.env.margin
+            # 多机模式: 检测无人机间碰撞 (margin-adjusted dist < 0)
+            if self.env.n_drones_per_group > 1:
+                drone_dist, _ = self.env.inter_drone_distances()
+                obs_collision = obs_collision | (drone_dist < 0)
+            rec['collision'].append(obs_collision.cpu().numpy().copy())
             # 模型深度图有效像素比例
             depth_valid = ((depth_lo > 0) & (depth_lo <= args.depth_max)).float().mean(dim=(-1, -2)).cpu().numpy() * 100
             rec['depth_valid_pct'].append(depth_valid.copy())
