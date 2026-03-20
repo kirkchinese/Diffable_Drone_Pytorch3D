@@ -141,6 +141,7 @@ class DroneSimulator:
         # 多无人机交互配置
         self.n_drones_per_group = n_drones_per_group
         self._inter_drone_eye_mask = None  # 延迟初始化，依赖 n_drones_per_group
+        self._per_group_drone_meshes = None  # per-group 渲染用，每帧更新
 
         # 动态障碍物配置
         self.enable_dynamic_obstacles = enable_dynamic_obstacles
@@ -490,27 +491,102 @@ class DroneSimulator:
 
     def _update_render_scene(self):
         """
-        更新渲染器的动态网格：将当前所有无人机机体和动态障碍物合成到渲染场景中。
+        预计算当前帧的动态网格数据，供 per-group 渲染使用。
 
-        在每次 render() 调用前自动执行，确保相机视角中能看到其他无人机和动态障碍物。
+        每组相机只能看到同组无人机（自身在相机后方不会遮挡），不跨组可见。
+        动态障碍物对所有相机可见。
         """
-        extra_meshes = []
-        extra_pcds = []
-
-        # 无人机机体网格（所有无人机对所有相机可见，自身机体在相机后方不会遮挡）
+        # --- 无人机机体网格（按组分） ---
         if self.drone_mesh is not None and self.n_drones_per_group > 1:
-            drone_meshes = self._compose_drone_meshes()
-            extra_meshes.extend(drone_meshes)
-
-        # 动态障碍物网格 + 点云
-        for obs in self._dynamic_obstacles:
-            extra_meshes.append(obs.get_transformed_mesh())
-            extra_pcds.append(obs.get_transformed_pcd())
-
-        if extra_meshes:
-            self.renderer.set_dynamic_meshes(extra_meshes, extra_pcds if extra_pcds else None)
+            all_drone_meshes = self._compose_drone_meshes()
+            G = self.n_drones_per_group
+            n_groups = self.B // G
+            self._per_group_drone_meshes = [
+                all_drone_meshes[g * G : g * G + G] for g in range(n_groups)
+            ]
         else:
-            self.renderer.clear_dynamic_meshes()
+            self._per_group_drone_meshes = None
+
+        # --- 动态障碍物网格 + 点云（所有组共享） ---
+        self._frame_obs_meshes = []
+        self._frame_obs_pcds = []
+        for obs in self._dynamic_obstacles:
+            self._frame_obs_meshes.append(obs.get_transformed_mesh())
+            self._frame_obs_pcds.append(obs.get_transformed_pcd())
+
+        # 对于无多机分组的情况，沿用旧路径直接设置渲染器
+        if self._per_group_drone_meshes is None:
+            if self._frame_obs_meshes:
+                self.renderer.set_dynamic_meshes(
+                    self._frame_obs_meshes,
+                    self._frame_obs_pcds if self._frame_obs_pcds else None)
+            else:
+                self.renderer.clear_dynamic_meshes()
+
+    def _render_per_group(self, renderer, R_camera, T_camera, **render_kw):
+        """
+        按组渲染：每组相机仅看到同组无人机 + 动态障碍物。
+
+        Args:
+            renderer: DroneRenderer 或 DroneRendererVariant。
+            R_camera: (B, 3, 3) 相机旋转矩阵。
+            T_camera: (B, 3) 相机平移向量。
+            **render_kw: 传递给 renderer.render() 的额外参数。
+
+        Returns:
+            (rgb, depth): 拼接后的 (B, H, W, 3) 和 (B, H, W)。
+        """
+        parent = renderer.parent if hasattr(renderer, 'parent') else renderer
+        G = self.n_drones_per_group
+        n_groups = len(self._per_group_drone_meshes)
+        obs_meshes = self._frame_obs_meshes
+        obs_pcds = self._frame_obs_pcds if self._frame_obs_pcds else None
+
+        rgb_parts = []
+        depth_parts = []
+
+        for g in range(n_groups):
+            sl = slice(g * G, g * G + G)
+            group_meshes = self._per_group_drone_meshes[g] + obs_meshes
+            parent.set_dynamic_meshes(group_meshes, obs_pcds)
+            rgb_g, depth_g = renderer.render(
+                R=R_camera[sl], T=T_camera[sl], **render_kw)
+            if rgb_g is not None:
+                rgb_parts.append(rgb_g)
+            if depth_g is not None:
+                depth_parts.append(depth_g)
+
+        # 不整除的尾部（无对应组，只渲染障碍物）
+        remainder = self.B - n_groups * G
+        if remainder > 0:
+            sl = slice(n_groups * G, self.B)
+            parent.set_dynamic_meshes(obs_meshes or [], obs_pcds)
+            rgb_g, depth_g = renderer.render(
+                R=R_camera[sl], T=T_camera[sl], **render_kw)
+            if rgb_g is not None:
+                rgb_parts.append(rgb_g)
+            if depth_g is not None:
+                depth_parts.append(depth_g)
+
+        # 最终恢复：设置障碍物 PCD 供碰撞检测 (full_obstacle_pcd) 使用
+        parent.set_dynamic_meshes(obs_meshes or [], obs_pcds)
+
+        rgb = torch.cat(rgb_parts, dim=0) if rgb_parts else None
+        depth = torch.cat(depth_parts, dim=0) if depth_parts else None
+        return rgb, depth
+
+    def render_with_renderer(self, renderer, R_camera, T_camera, **render_kw):
+        """
+        使用指定渲染器进行 per-group 渲染（公共接口，供外部调用如 visualize_eval）。
+
+        调用前须已执行 _update_render_scene()（通常由 render() 触发）。
+
+        Returns:
+            (rgb, depth): 拼接后的结果。
+        """
+        if self._per_group_drone_meshes is not None:
+            return self._render_per_group(renderer, R_camera, T_camera, **render_kw)
+        return renderer.render(R=R_camera, T=T_camera, **render_kw)
 
     @torch.no_grad()
     def _compose_drone_meshes(self):
@@ -721,14 +797,25 @@ class DroneSimulator:
             cam_offset_body=cam_offset_body,
             cam_mount_R=cam_mount_R,
         )
-        rgb, depth = self.renderer.render(
-            R=R_camera, 
-            T=T_camera, 
-            return_tensor=return_tensor, 
-            return_rgb=return_rgb, 
-            return_depth=return_depth,
-            dt=dt
-        )
+
+        # 多机分组：按组渲染，每组相机只看到同组无人机
+        if self._per_group_drone_meshes is not None:
+            rgb, depth = self._render_per_group(
+                self.renderer, R_camera, T_camera,
+                return_tensor=return_tensor,
+                return_rgb=return_rgb,
+                return_depth=return_depth,
+                dt=dt,
+            )
+        else:
+            rgb, depth = self.renderer.render(
+                R=R_camera, 
+                T=T_camera, 
+                return_tensor=return_tensor, 
+                return_rgb=return_rgb, 
+                return_depth=return_depth,
+                dt=dt
+            )
         return rgb, depth
 
     def _knn_query(self, p=None):
