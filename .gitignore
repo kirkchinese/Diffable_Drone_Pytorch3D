@@ -7,9 +7,13 @@ runs/
 __pycache__/
 logs/
 checkpoints/
-docs/
 __pycache__/
 trajectory_plots/
 诊断脚本路径/
 train_cmd.txt
 viz_results/
+.worktrees/
+.sisyphus/
+testscript/
+.opencode/
+docs/
