@@ -148,7 +148,7 @@ def parse_args():
                         help='启用动态障碍物（每个 episode 随机生成移动的球体/立方体）')
     parser.add_argument('--num_dynamic_obstacles_min', type=int, default=2,
                         help='动态障碍物最小数量')
-    parser.add_argument('--num_dynamic_obstacles_max', type=int, default=5,
+    parser.add_argument('--num_dynamic_obstacles_max', type=int, default=10,
                         help='动态障碍物最大数量')
     parser.add_argument('--dynamic_obs_speed_min', type=float, default=-0.5,
                         help='动态障碍物最小速度')
