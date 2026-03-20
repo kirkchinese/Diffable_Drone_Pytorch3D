@@ -646,6 +646,7 @@ class DroneTrainer:
                         return_depth=True,
                         dt=current_dt
                     )
+                # depth = depth.requires_grad_(False)
             
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
