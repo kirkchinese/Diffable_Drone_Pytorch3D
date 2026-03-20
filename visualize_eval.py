@@ -466,7 +466,9 @@ class EvalRunner:
                 cam_mount_R=cam_mount_R,
                 cam_offset_body=_hires_offset,
             )
-            rgb_hi, depth_hi = self.hires_renderer.render(R_cam, T_cam)
+            rgb_hi, depth_hi = self.env.render_with_renderer(
+                self.hires_renderer, R_cam, T_cam,
+                return_tensor=True, return_rgb=True, return_depth=True)
 
             # 转 numpy
             rgb_np = (rgb_hi.clamp(0, 1) * 255).byte().cpu().numpy()
