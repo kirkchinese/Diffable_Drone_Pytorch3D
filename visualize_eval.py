@@ -108,7 +108,7 @@ def parse_args():
                         help='渲染图像宽度')
     parser.add_argument('--hfov', type=float, default=90.0,
                         help='模型相机水平视场角 (度)，需与训练时一致，默认90°')
-    parser.add_argument('--mesh_path', type=str, default='./data/sample/sample.obj',
+    parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj',
                         help='障碍物网格路径 (仅在非随机场景时使用)')
     parser.add_argument('--num_samples', type=int, default=50000,
                         help='障碍物点云采样数')

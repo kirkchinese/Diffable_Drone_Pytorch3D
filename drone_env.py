@@ -419,7 +419,6 @@ class DroneSimulator:
                             包含了 pos(3), vel(3), rot(9), act_curr(3) (实际推力状态)
         """
         current_dt = dt if dt is not None else self.dt
-        p_old = self.p.clone()
         
         # 更新环境扰动
         self.dg = update_dg(dg_curr=self.dg, dt=current_dt, noise_std=self.noise_std)
@@ -464,8 +463,8 @@ class DroneSimulator:
         
         # 确定期望的机头/速度朝向
         if target_pos_vector is None:
-            # 如未指定，使用实际位移方向
-            velocity_vector = self.p - p_old
+            # 如未指定，使用速度方向作为朝向参考
+            velocity_vector = self.v
         else:
             velocity_vector = target_pos_vector
             
@@ -666,16 +665,16 @@ class DroneSimulator:
 
         from pytorch3d.renderer import TexturesVertex
         from pytorch3d.structures import Meshes
-        import numpy as np
 
         lo, hi = self.num_dynamic_obstacles_range
-        num = np.random.randint(lo, hi + 1)
+        num = torch.randint(lo, hi + 1, (1,)).item()
         speed_lo, speed_hi = self.dynamic_obstacle_speed_range
         scale_lo, scale_hi = self.dynamic_obstacle_scale_range
 
         for _ in range(num):
             # 随机几何体（从 data/base_model/ 缓存加载）
-            shape_name = np.random.choice(_OBSTACLE_SHAPES)
+            shape_idx = torch.randint(len(_OBSTACLE_SHAPES), (1,)).item()
+            shape_name = _OBSTACLE_SHAPES[shape_idx]
             base_mesh = self._load_base_mesh(shape_name)
             base_verts = base_mesh.verts_list()[0]
 
@@ -700,7 +699,8 @@ class DroneSimulator:
             angular_vel = torch.randn(3, device=self.device) * 0.5
 
             # 随机运动模式 + 参数
-            motion_mode = np.random.choice(MOTION_MODES)
+            mode_idx = torch.randint(len(MOTION_MODES), (1,)).item()
+            motion_mode = MOTION_MODES[mode_idx]
             motion_params = self._random_motion_params(motion_mode, arena_range)
 
             obs = DynamicObstacle(
@@ -717,15 +717,14 @@ class DroneSimulator:
 
     def _random_motion_params(self, mode, arena_range):
         """为给定运动模式生成随机参数。"""
-        import numpy as np
         params = {}
         if mode in ('sinusoidal', 'pendulum'):
-            params['amplitude'] = float(np.random.uniform(0.5, min(2.0, arena_range * 0.5)))
-            params['frequency'] = float(np.random.uniform(0.2, 0.8))
-            params['phase'] = float(np.random.uniform(0, 6.2832))
+            params['amplitude'] = float(torch.rand(1).item() * (min(2.0, arena_range * 0.5) - 0.5) + 0.5)
+            params['frequency'] = float(torch.rand(1).item() * 0.6 + 0.2)
+            params['phase'] = float(torch.rand(1).item() * 6.2832)
         elif mode in ('circular', 'figure8'):
-            r = float(np.random.uniform(0.5, min(2.0, arena_range * 0.4)))
-            params['frequency'] = float(np.random.uniform(0.1, 0.5))
+            r = float(torch.rand(1).item() * (min(2.0, arena_range * 0.4) - 0.5) + 0.5)
+            params['frequency'] = float(torch.rand(1).item() * 0.4 + 0.1)
             # 随机轨道平面 (Gram-Schmidt 正交化)
             u = torch.randn(3, device=self.device)
             u = u / u.norm()
@@ -740,7 +739,7 @@ class DroneSimulator:
                 params['radius'] = r
             else:
                 params['amplitude_u'] = r
-                params['amplitude_v'] = r * float(np.random.uniform(0.3, 0.7))
+                params['amplitude_v'] = r * float(torch.rand(1).item() * 0.4 + 0.3)
         return params
 
     def clear_dynamic_obstacles(self):

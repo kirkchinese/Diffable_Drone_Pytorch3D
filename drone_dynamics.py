@@ -154,7 +154,6 @@ def solve_attitude_from_thrust_and_goal_vec(
     
     # 避免除以零 (当机体 Z 轴完全水平时，uz=0)
     # 使用软阈值避免梯度问题
-    uz_safe = uz.clone()
     uz_safe = torch.where(torch.abs(uz) < 1e-6, torch.sign(uz + 1e-8) * 1e-6, uz)
     
     fz_new = -(fx * ux + fy * uy) / uz_safe

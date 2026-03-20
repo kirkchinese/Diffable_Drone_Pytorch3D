@@ -533,7 +533,7 @@ class DynamicSceneRenderer(DroneRenderer):
             
             # 随机选择形状
             primitive = np.random.choice(['sphere', 'cube'])
-            color = torch.rand(3).tolist()
+            color = torch.rand(3, device=self.device).tolist()
             
             self.add_primitive_obstacle(
                 primitive_type=primitive,
