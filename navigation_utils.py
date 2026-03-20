@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 _FALLBACK_FWD = None  # 缓存的 fallback 向量（延迟初始化，第一次调用时创建）
@@ -85,6 +84,8 @@ def compute_navigation_metrics_np(
     reach_radius: float = 0.5,
 ) -> dict:
     """NumPy 版本，用于评估与可视化摘要。"""
+    import numpy as np
+
     target_dist_history = np.asarray(target_dist_history, dtype=np.float64)
     collision_history = np.asarray(collision_history, dtype=bool)
 

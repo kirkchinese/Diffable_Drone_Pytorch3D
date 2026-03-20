@@ -496,23 +496,33 @@ class DroneSimulator:
         每组相机只能看到同组无人机（自身在相机后方不会遮挡），不跨组可见。
         动态障碍物对所有相机可见。
         """
-        # --- 无人机机体网格（按组分） ---
-        if self.drone_mesh is not None and self.n_drones_per_group > 1:
-            all_drone_meshes = self._compose_drone_meshes()
-            G = self.n_drones_per_group
-            n_groups = self.B // G
-            self._per_group_drone_meshes = [
-                all_drone_meshes[g * G : g * G + G] for g in range(n_groups)
-            ]
-        else:
-            self._per_group_drone_meshes = None
-
         # --- 动态障碍物网格 + 点云（所有组共享） ---
         self._frame_obs_meshes = []
         self._frame_obs_pcds = []
         for obs in self._dynamic_obstacles:
             self._frame_obs_meshes.append(obs.get_transformed_mesh())
             self._frame_obs_pcds.append(obs.get_transformed_pcd())
+
+        # --- 无人机机体网格（按组分） ---
+        if self.drone_mesh is not None and self.n_drones_per_group > 1:
+            all_drone_meshes = self._compose_drone_meshes()
+            G = self.n_drones_per_group
+            if self.B <= G:
+                # 单组模式：所有无人机互相可见，直接写入主渲染器，
+                # 便于调试/高分辨率派生渲染器与当前场景状态保持一致。
+                self._per_group_drone_meshes = None
+                self.renderer.set_dynamic_meshes(
+                    all_drone_meshes + self._frame_obs_meshes,
+                    self._frame_obs_pcds if self._frame_obs_pcds else None,
+                )
+                return
+
+            n_groups = self.B // G
+            self._per_group_drone_meshes = [
+                all_drone_meshes[g * G : g * G + G] for g in range(n_groups)
+            ]
+        else:
+            self._per_group_drone_meshes = None
 
         # 对于无多机分组的情况，沿用旧路径直接设置渲染器
         if self._per_group_drone_meshes is None:

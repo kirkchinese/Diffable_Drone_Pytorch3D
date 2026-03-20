@@ -20,7 +20,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger
+from model import (
+    Model, Model_bigger, Model_adaptive,
+    Model_attention, Model_multiscale, Model_residual, Model_lightweight,
+)
 from loss import DroneLoss
 from navigation_utils import (
     compute_navigation_metrics_torch,
@@ -161,6 +164,10 @@ def parse_args():
     
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
+    parser.add_argument('--model_type', type=str, default='bigger',
+                        choices=['base', 'bigger', 'adaptive', 'attention', 'multiscale', 'residual', 'lightweight'],
+                        help='模型类型: base=Model, bigger=Model_bigger, adaptive=Model_adaptive, '
+                             'attention=注意力, multiscale=多尺度, residual=残差+LSTM, lightweight=轻量级')
     parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
     parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
     
@@ -299,10 +306,20 @@ class DroneTrainer:
         )
         
         # 初始化模型
-        if args.no_odom:
-            self.model = Model_bigger(dim_obs=7, dim_action=6).to(self.device) # 这里换了个大一点的模型，如果换回去就用 Model
-        else:
-            self.model = Model_bigger(dim_obs=10, dim_action=6).to(self.device)  # 7 + 3 (local_v)
+        dim_obs = 7 if args.no_odom else 10
+        model_map = {
+            'base': Model,
+            'bigger': Model_bigger,
+            'adaptive': Model_adaptive,
+            'attention': Model_attention,
+            'multiscale': Model_multiscale,
+            'residual': Model_residual,
+            'lightweight': Model_lightweight,
+        }
+        model_type = getattr(args, 'model_type', 'bigger')
+        ModelClass = model_map[model_type]
+        self.model = ModelClass(dim_obs=dim_obs, dim_action=6).to(self.device)
+        print(f"[Model] 使用 {ModelClass.__name__} (model_type={model_type}, dim_obs={dim_obs})")
         
         # 加载预训练模型
         if args.resume:
@@ -629,7 +646,6 @@ class DroneTrainer:
                         return_depth=True,
                         dt=current_dt
                     )
-                depth = depth.requires_grad_(False)
             
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
@@ -664,9 +680,12 @@ class DroneTrainer:
                 depth_noise_std=0.02,
             )
 
-            # Truncated BPTT: 每 30 步截断 GRU 梯度
+            # Truncated BPTT: 每 30 步截断隐状态梯度
             if t > 0 and t % 30 == 0:
-                h = h.detach()
+                if isinstance(h, tuple):
+                    h = tuple(t_.detach() for t_ in h)
+                else:
+                    h = h.detach()
             
             v_preds.append(v_pred)
             act_buffer.append(act_cmd)
