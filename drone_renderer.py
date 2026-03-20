@@ -504,7 +504,7 @@ class DroneRenderer:
         
         # ---- 平移偏移 ----
         if cam_offset_body is None:
-            cam_offset_body = [0.1, 0.0, 0.0]
+            cam_offset_body = [0.0, 0.0, 0.0]
         
         if not torch.is_tensor(cam_offset_body):
             cam_offset_body = torch.tensor(cam_offset_body, device=device, dtype=torch.float32)

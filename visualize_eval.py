@@ -97,9 +97,7 @@ def parse_args():
                         help='出生/目标点之间的最小间距 (米)')
     parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
-    parser.add_argument('--cam_offset_x', type=float, default=0.0, help='相机安装 body-X 偏移 (m)')
-    parser.add_argument('--cam_offset_y', type=float, default=0.0, help='相机安装 body-Y 偏移 (m)')
-    parser.add_argument('--cam_offset_z', type=float, default=0.0, help='相机安装 body-Z 偏移 (m)')
+    # cam_offset_x/y/z 已弃用 —— 相机偏移由网格几何自动计算 (get_scaled_cam_offset)
     parser.add_argument('--image_height', type=int, default=48,
                         help='渲染图像高度')
     parser.add_argument('--image_width', type=int, default=64,
@@ -305,10 +303,7 @@ class EvalRunner:
             ),
             # 出生点/目标点间距约束
             min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
-            # 相机安装参数
-            cam_offset_body=[getattr(args, 'cam_offset_x', 0.0),
-                             getattr(args, 'cam_offset_y', 0.0),
-                             getattr(args, 'cam_offset_z', 0.0)],
+            # 相机安装参数 (cam_offset_body=None → 由网格几何自动计算)
             cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
                            args.cam_angle,
                            getattr(args, 'cam_mount_yaw', 0.0)),
@@ -455,7 +450,7 @@ class EvalRunner:
                 p_ros=self.env.p,
                 R_ros=self.env.R,
                 cam_mount_R=cam_mount_R,
-                cam_offset_body=self.env.cam_offset_body,
+                cam_offset_body=self.env.get_scaled_cam_offset(),
             )
             rgb_hi, depth_hi = self.hires_renderer.render(R_cam, T_cam)
 
