@@ -66,13 +66,16 @@ def parse_args():
                         help='出生/目标点之间的最小间距 (米), 防止无人机重叠')
     parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
-    # cam_offset_x/y/z 已弃用 —— 相机偏移由网格几何自动计算 (get_scaled_cam_offset)
+    parser.add_argument('--cam_mode', type=str, default='auto', choices=['auto', 'manual'],
+                        help='相机安装模式: auto=网格比例自动计算+随机化, manual=用户3×4外参矩阵')
+    parser.add_argument('--cam_extrinsic', type=float, nargs=12, default=None,
+                        help='手动模式相机外参 [R|t] 3×4行优先 (12个浮点数)')
     parser.add_argument('--cam_rand_xy', type=float, default=0.02,
-                        help='相机 XY 偏移随机化半径 (m)，模拟安装误差')
+                        help='相机 XY 偏移随机化半径 (m) (仅auto模式)')
     parser.add_argument('--cam_rand_z_range', type=float, nargs=2, default=[-0.04, 0.04],
-                        help='相机 Z 偏移随机范围 [min, max] (m)，模拟上/中/下安装位置')
+                        help='相机 Z 偏移随机范围 [min, max] (m) (仅auto模式)')
     parser.add_argument('--cam_rand_rpy', type=float, default=2.0,
-                        help='相机 roll/yaw 随机化半径 (度)，模拟安装角度误差')
+                        help='相机 roll/yaw 随机化半径 (度) (仅auto模式)')
     parser.add_argument('--image_height', type=int, default=48, help='图像高度')
     parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
     parser.add_argument('--hfov', type=float, default=90.0,
@@ -283,7 +286,9 @@ class DroneTrainer:
             ),
             # 出生点/目标点间距约束
             min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 1.0),
-            # 相机安装参数 (cam_offset_body=None → 由网格几何自动计算)
+            # 相机安装参数
+            cam_mode=getattr(args, 'cam_mode', 'auto'),
+            cam_extrinsic=getattr(args, 'cam_extrinsic', None),
             cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
                            args.cam_angle,
                            getattr(args, 'cam_mount_yaw', 0.0)),
@@ -478,28 +483,32 @@ class DroneTrainer:
         # 推力估计误差 (模拟真实无人机的推力不确定性)
         thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
         
-        # Per-sample 相机安装旋转矩阵（含三轴随机化）
-        rpy_rand = getattr(args, 'cam_rand_rpy', 2.0)
-        pitch_per_sample = args.cam_angle + torch.randn(B, device=self.device)
-        roll_per_sample = getattr(args, 'cam_mount_roll', 0.0) + rpy_rand * torch.randn(B, device=self.device)
-        yaw_per_sample = getattr(args, 'cam_mount_yaw', 0.0) + rpy_rand * torch.randn(B, device=self.device)
-        cam_mount_R = build_cam_mount_R(
-            roll_deg=roll_per_sample,
-            pitch_deg=pitch_per_sample,
-            yaw_deg=yaw_per_sample,
-            device=self.device,
-        )
+        # Per-sample 相机安装旋转矩阵和位置偏移
+        if getattr(args, 'cam_mode', 'auto') == 'manual' and self.env._cam_manual_R is not None:
+            # 手动模式：固定使用用户提供的外参矩阵，无随机化
+            cam_mount_R = self.env._cam_manual_R.unsqueeze(0).expand(B, -1, -1)
+            cam_offset_body = self.env._cam_manual_t.unsqueeze(0).expand(B, -1)
+        else:
+            # 自动模式：含三轴随机化
+            rpy_rand = getattr(args, 'cam_rand_rpy', 2.0)
+            pitch_per_sample = args.cam_angle + torch.randn(B, device=self.device)
+            roll_per_sample = getattr(args, 'cam_mount_roll', 0.0) + rpy_rand * torch.randn(B, device=self.device)
+            yaw_per_sample = getattr(args, 'cam_mount_yaw', 0.0) + rpy_rand * torch.randn(B, device=self.device)
+            cam_mount_R = build_cam_mount_R(
+                roll_deg=roll_per_sample,
+                pitch_deg=pitch_per_sample,
+                yaw_deg=yaw_per_sample,
+                device=self.device,
+            )
 
-        # Per-sample 相机位置偏移随机化（episode 内不变）
-        # 基准偏移由网格几何自动计算，已按当前 margin 缩放
-        cam_offset_base = self.env.get_scaled_cam_offset()  # (B, 3)
-        xy_rand = getattr(args, 'cam_rand_xy', 0.02)
-        z_lo, z_hi = getattr(args, 'cam_rand_z_range', [-0.04, 0.04])
-        cam_offset_body = cam_offset_base + torch.stack([
-            xy_rand * torch.randn(B, device=self.device),
-            xy_rand * torch.randn(B, device=self.device),
-            torch.rand(B, device=self.device) * (z_hi - z_lo) + z_lo,
-        ], dim=-1)
+            cam_offset_base = self.env.get_scaled_cam_offset()  # (B, 3)
+            xy_rand = getattr(args, 'cam_rand_xy', 0.02)
+            z_lo, z_hi = getattr(args, 'cam_rand_z_range', [-0.04, 0.04])
+            cam_offset_body = cam_offset_base + torch.stack([
+                xy_rand * torch.randn(B, device=self.device),
+                xy_rand * torch.randn(B, device=self.device),
+                torch.rand(B, device=self.device) * (z_hi - z_lo) + z_lo,
+            ], dim=-1)
         
         # 航向漂移 (可选)
         if args.yaw_drift:

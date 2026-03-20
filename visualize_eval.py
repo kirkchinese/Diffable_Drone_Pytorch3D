@@ -97,6 +97,10 @@ def parse_args():
                         help='出生/目标点之间的最小间距 (米)')
     parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
+    parser.add_argument('--cam_mode', type=str, default='auto', choices=['auto', 'manual'],
+                        help='相机安装模式: auto=网格比例自动计算, manual=用户3×4外参矩阵')
+    parser.add_argument('--cam_extrinsic', type=float, nargs=12, default=None,
+                        help='手动模式相机外参 [R|t] 3×4行优先 (12个浮点数)')
     # cam_offset_x/y/z 已弃用 —— 相机偏移由网格几何自动计算 (get_scaled_cam_offset)
     parser.add_argument('--image_height', type=int, default=48,
                         help='渲染图像高度')
@@ -303,7 +307,9 @@ class EvalRunner:
             ),
             # 出生点/目标点间距约束
             min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
-            # 相机安装参数 (cam_offset_body=None → 由网格几何自动计算)
+            # 相机安装参数
+            cam_mode=getattr(args, 'cam_mode', 'auto'),
+            cam_extrinsic=getattr(args, 'cam_extrinsic', None),
             cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
                            args.cam_angle,
                            getattr(args, 'cam_mount_yaw', 0.0)),
@@ -399,13 +405,17 @@ class EvalRunner:
         # 固定速度用于评估一致性
         max_speed = torch.full((B, 1), args.max_speed, device=self.device)
         thr_est_error = torch.ones((B, 1), device=self.device)  # 评估时不加推力噪声
-        cam_mount_R = build_cam_mount_R(
-            roll_deg=getattr(args, 'cam_mount_roll', 0.0),
-            pitch_deg=args.cam_angle,
-            yaw_deg=getattr(args, 'cam_mount_yaw', 0.0),
-            device=self.device,
-            batch_size=B,
-        )
+        # 相机安装参数：根据 cam_mode 选择 auto/manual
+        if getattr(args, 'cam_mode', 'auto') == 'manual' and self.env._cam_manual_R is not None:
+            cam_mount_R = self.env._cam_manual_R.unsqueeze(0).expand(B, -1, -1)
+        else:
+            cam_mount_R = build_cam_mount_R(
+                roll_deg=getattr(args, 'cam_mount_roll', 0.0),
+                pitch_deg=args.cam_angle,
+                yaw_deg=getattr(args, 'cam_mount_yaw', 0.0),
+                device=self.device,
+                batch_size=B,
+            )
 
         # 动作延迟缓冲
         act_lag = 1
@@ -446,11 +456,15 @@ class EvalRunner:
             )
 
             # ---------- 高分辨率可视化渲染 ----------
+            # cam_offset 由 cam_mode 决定: manual 用外参 t, auto 用网格比例偏移
+            _hires_offset = (self.env._cam_manual_t
+                             if self.env.cam_mode == 'manual' and self.env._cam_manual_t is not None
+                             else self.env.get_scaled_cam_offset())
             R_cam, T_cam = self.env.renderer.compute_view_matrix(
                 p_ros=self.env.p,
                 R_ros=self.env.R,
                 cam_mount_R=cam_mount_R,
-                cam_offset_body=self.env.get_scaled_cam_offset(),
+                cam_offset_body=_hires_offset,
             )
             rgb_hi, depth_hi = self.hires_renderer.render(R_cam, T_cam)
 
