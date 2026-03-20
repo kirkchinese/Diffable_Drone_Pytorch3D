@@ -64,6 +64,14 @@ def parse_args():
     parser.add_argument('--coef_drone_collide', type=float, default=5.0,
                         help='无人机间碰撞损失权重 (仅多机模式生效，参考项目使用5.0)')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
+    parser.add_argument('--loss_v_mode', type=str, default='mse',
+                        choices=['mse', 'decomposed', 'adaptive'],
+                        help='速度损失模式: '
+                             'mse=参考项目式(惩罚全方向,默认), '
+                             'decomposed=分解式(横向免罚), '
+                             'adaptive=自适应(终点指数衰减制动)')
+    parser.add_argument('--adaptive_decay_rate', type=float, default=2.0,
+                        help='adaptive模式的指数衰减率λ, alpha=exp(-λ*V_target), 默认2.0')
     
     # 环境参数 - 渲染
     parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
@@ -124,7 +132,7 @@ def parse_args():
     parser.add_argument('--force_cross_map', action='store_true', default=False,
                         help='强制出生/目标点在场景对向两侧（防止绕行）')
     parser.add_argument('--spawn_z_max', type=float, default=3.0,
-                        help='出生/目标点最大高度（防止飞高规避）')
+                        help='出生/目标点最大高度')
     
     # 环境参数 - 无人机物理
     parser.add_argument('--margin_min', type=float, default=0.3, help='无人机安全半径最小值')
@@ -374,7 +382,9 @@ class DroneTrainer:
             coef_lateral=getattr(args, 'coef_lateral', 0.0),
             coef_drone_collide=getattr(args, 'coef_drone_collide', 5.0),
             ctl_dt=self.ctl_dt,
-            window_size=getattr(args, 'window_size', 30)
+            window_size=getattr(args, 'window_size', 30),
+            loss_v_mode=getattr(args, 'loss_v_mode', 'mse'),
+            adaptive_decay_rate=getattr(args, 'adaptive_decay_rate', 2.0),
         )
         # 保存初始系数（LossGuide 模式下用于合并未被进化覆盖的系数）
         self._base_coefs = dict(self.losser.coefs)
