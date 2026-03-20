@@ -75,7 +75,6 @@ for step in range(timesteps):
 """
 
 import torch
-import numpy as np
 from typing import List, Optional, Tuple, Union
 
 from pytorch3d.structures import Meshes, join_meshes_as_scene
@@ -132,10 +131,10 @@ class DynamicObstacle:
         self.scale = scale
         
         # 状态初始化 - 确保所有 tensor 都在正确的设备上
-        self.position = position.to(self.device) if position is not None else torch.zeros(3, device=self.device)
-        self.velocity = velocity.to(self.device) if velocity is not None else torch.zeros(3, device=self.device)
-        self.rotation = rotation.to(self.device) if rotation is not None else torch.eye(3, device=self.device)
-        self.angular_velocity = angular_velocity.to(self.device) if angular_velocity is not None else torch.zeros(3, device=self.device)
+        self.position = torch.as_tensor(position, dtype=torch.float32, device=self.device) if position is not None else torch.zeros(3, device=self.device)
+        self.velocity = torch.as_tensor(velocity, dtype=torch.float32, device=self.device) if velocity is not None else torch.zeros(3, device=self.device)
+        self.rotation = torch.as_tensor(rotation, dtype=torch.float32, device=self.device) if rotation is not None else torch.eye(3, device=self.device)
+        self.angular_velocity = torch.as_tensor(angular_velocity, dtype=torch.float32, device=self.device) if angular_velocity is not None else torch.zeros(3, device=self.device)
         
         # 缓存变换后的网格
         self._transformed_mesh = None
@@ -401,13 +400,32 @@ class DynamicSceneRenderer(DroneRenderer):
             障碍物索引
         """
         from pytorch3d.utils import ico_sphere
+        import os
         
-        if primitive_type == 'sphere':
+        _base_model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'base_model')
+        _PRIM_MAP = {'sphere': '球1_1', 'cube': '方块', 'cylinder': '圆柱体2_2_2',
+                      'cone': '椎体2_2_2', 'torus': '圆环5_5_1'}
+
+        prim_name = _PRIM_MAP.get(primitive_type)
+        if prim_name is not None:
+            obj_path = os.path.join(_base_model_dir, f'{prim_name}.obj')
+            if os.path.exists(obj_path):
+                from pytorch3d.io import load_objs_as_meshes
+                mesh = load_objs_as_meshes([obj_path], device=self.device)
+                # 居中 + 归一化到单位包围球
+                verts = mesh.verts_packed()
+                centroid = verts.mean(dim=0)
+                verts = verts - centroid
+                radius = verts.norm(dim=1).max().item()
+                if radius > 1e-6:
+                    verts = verts / radius
+                mesh = Meshes(verts=[verts], faces=[mesh.faces_packed()], textures=mesh.textures)
+            else:
+                # 文件不存在时 fallback 到 ico_sphere
+                mesh = ico_sphere(level=2, device=self.device)
+        elif primitive_type == 'sphere':
             level = kwargs.get('level', 2)
             mesh = ico_sphere(level=level, device=self.device)
-        elif primitive_type == 'cube':
-            # 创建立方体网格
-            mesh = self._create_cube_mesh()
         else:
             raise ValueError(f"Unsupported primitive type: {primitive_type}")
             
@@ -418,26 +436,6 @@ class DynamicSceneRenderer(DroneRenderer):
         mesh.textures = TexturesVertex(verts_features=verts_rgb)
         
         return self.add_obstacle(mesh, position, velocity, scale)
-    
-    def _create_cube_mesh(self) -> Meshes:
-        """创建单位立方体网格"""
-        # 立方体顶点
-        verts = torch.tensor([
-            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
-            [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]
-        ], device=self.device, dtype=torch.float32)
-        
-        # 立方体面 (三角形)
-        faces = torch.tensor([
-            [0, 1, 2], [0, 2, 3],  # 前
-            [4, 6, 5], [4, 7, 6],  # 后
-            [0, 4, 5], [0, 5, 1],  # 下
-            [2, 6, 7], [2, 7, 3],  # 上
-            [0, 3, 7], [0, 7, 4],  # 左
-            [1, 5, 6], [1, 6, 2],  # 右
-        ], device=self.device, dtype=torch.int64)
-        
-        return Meshes(verts=[verts], faces=[faces])
     
     def remove_obstacle(self, index: int):
         """移除指定障碍物"""
@@ -532,7 +530,7 @@ class DynamicSceneRenderer(DroneRenderer):
             scale = torch.rand(1, device=self.device).item() * (scale_range[1] - scale_range[0]) + scale_range[0]
             
             # 随机选择形状
-            primitive = np.random.choice(['sphere', 'cube'])
+            primitive = ('sphere', 'cube')[torch.randint(2, (1,)).item()]
             color = torch.rand(3, device=self.device).tolist()
             
             self.add_primitive_obstacle(

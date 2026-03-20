@@ -419,6 +419,7 @@ class DroneSimulator:
                             包含了 pos(3), vel(3), rot(9), act_curr(3) (实际推力状态)
         """
         current_dt = dt if dt is not None else self.dt
+        p_old = self.p.clone()
         
         # 更新环境扰动
         self.dg = update_dg(dg_curr=self.dg, dt=current_dt, noise_std=self.noise_std)
@@ -463,8 +464,8 @@ class DroneSimulator:
         
         # 确定期望的机头/速度朝向
         if target_pos_vector is None:
-            # 如未指定，使用速度方向作为朝向参考
-            velocity_vector = self.v
+            # 如未指定，使用实际位移方向
+            velocity_vector = self.p - p_old
         else:
             velocity_vector = target_pos_vector
             
@@ -670,11 +671,12 @@ class DroneSimulator:
         num = torch.randint(lo, hi + 1, (1,)).item()
         speed_lo, speed_hi = self.dynamic_obstacle_speed_range
         scale_lo, scale_hi = self.dynamic_obstacle_scale_range
+        n_shapes = len(_OBSTACLE_SHAPES)
+        n_modes = len(MOTION_MODES)
 
         for _ in range(num):
             # 随机几何体（从 data/base_model/ 缓存加载）
-            shape_idx = torch.randint(len(_OBSTACLE_SHAPES), (1,)).item()
-            shape_name = _OBSTACLE_SHAPES[shape_idx]
+            shape_name = _OBSTACLE_SHAPES[torch.randint(n_shapes, (1,)).item()]
             base_mesh = self._load_base_mesh(shape_name)
             base_verts = base_mesh.verts_list()[0]
 
@@ -699,8 +701,7 @@ class DroneSimulator:
             angular_vel = torch.randn(3, device=self.device) * 0.5
 
             # 随机运动模式 + 参数
-            mode_idx = torch.randint(len(MOTION_MODES), (1,)).item()
-            motion_mode = MOTION_MODES[mode_idx]
+            motion_mode = MOTION_MODES[torch.randint(n_modes, (1,)).item()]
             motion_params = self._random_motion_params(motion_mode, arena_range)
 
             obs = DynamicObstacle(
@@ -716,14 +717,16 @@ class DroneSimulator:
             print(f"[DynamicObs] 已生成 {num} 个动态障碍物, 运动模式: {modes}")
 
     def _random_motion_params(self, mode, arena_range):
-        """为给定运动模式生成随机参数。"""
+        """为给定运动模式生成随机参数（纯 torch，无 numpy）。"""
         params = {}
         if mode in ('sinusoidal', 'pendulum'):
-            params['amplitude'] = float(torch.rand(1).item() * (min(2.0, arena_range * 0.5) - 0.5) + 0.5)
+            amp_hi = min(2.0, arena_range * 0.5)
+            params['amplitude'] = float(torch.rand(1).item() * (amp_hi - 0.5) + 0.5)
             params['frequency'] = float(torch.rand(1).item() * 0.6 + 0.2)
-            params['phase'] = float(torch.rand(1).item() * 6.2832)
+            params['phase'] = float(torch.rand(1).item() * 6.283185307179586)
         elif mode in ('circular', 'figure8'):
-            r = float(torch.rand(1).item() * (min(2.0, arena_range * 0.4) - 0.5) + 0.5)
+            r_hi = min(2.0, arena_range * 0.4)
+            r = float(torch.rand(1).item() * (r_hi - 0.5) + 0.5)
             params['frequency'] = float(torch.rand(1).item() * 0.4 + 0.1)
             # 随机轨道平面 (Gram-Schmidt 正交化)
             u = torch.randn(3, device=self.device)
