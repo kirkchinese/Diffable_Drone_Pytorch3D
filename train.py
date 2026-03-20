@@ -404,8 +404,12 @@ class DroneTrainer:
                     decay_range=getattr(args, 'decay_max', 1.0) - getattr(args, 'decay_min', 0.2),
                 ).to(self.device)
                 x0 = self.decay_controller.get_params_vector().cpu().numpy()
-                print(f"[CMA-ES] DecayController: {self.decay_controller.num_params} params, "
+                n_params = self.decay_controller.num_params
+                print(f"[CMA-ES] DecayController: {n_params} params, "
                       f"decay ∈ [{args.decay_min}, {args.decay_max}]")
+                if n_params > 50:
+                    print(f"[CMA-ES] ⚠ 警告: DecayController 有 {n_params} 参数，"
+                          f"CMA-ES 在 >50 维空间效率极低，建议使用 guide 模式或简化参数化")
             else:  # guide
                 self.loss_guide = LossGuide().to(self.device)
                 x0 = self.loss_guide.get_params_vector().cpu().numpy()
