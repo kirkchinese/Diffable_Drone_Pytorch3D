@@ -520,7 +520,8 @@ class DroneSimulator:
                 self.renderer.set_dynamic_meshes(
                     self._frame_obs_meshes,
                     self._frame_obs_pcds if self._frame_obs_pcds else None)
-            else:
+            elif self.renderer._dynamic_meshes:
+                # 仅当已有动态网格时才清除，避免无谓地使 extend 缓存失效
                 self.renderer.clear_dynamic_meshes()
 
     def _render_per_group(self, renderer, R_camera, T_camera, **render_kw):
