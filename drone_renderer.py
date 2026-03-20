@@ -510,7 +510,7 @@ class DroneRenderer:
             cam_offset_body = torch.tensor(cam_offset_body, device=device, dtype=torch.float32)
         
         if cam_offset_body.dim() == 1:
-            cam_offset_body = cam_offset_body.view(1, 3, 1).repeat(B, 1, 1)
+            cam_offset_body = cam_offset_body.view(1, 3, 1).expand(B, -1, -1)
         elif cam_offset_body.dim() == 2:
             cam_offset_body = cam_offset_body.unsqueeze(2)
             

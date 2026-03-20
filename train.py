@@ -72,6 +72,12 @@ def parse_args():
                         help='相机在机体左向的偏移 (m)')
     parser.add_argument('--cam_offset_z', type=float, default=0.0,
                         help='相机在机体上方的偏移 (m)')
+    parser.add_argument('--cam_rand_xy', type=float, default=0.02,
+                        help='相机 XY 偏移随机化半径 (m)，模拟安装误差')
+    parser.add_argument('--cam_rand_z_range', type=float, nargs=2, default=[-0.04, 0.04],
+                        help='相机 Z 偏移随机范围 [min, max] (m)，模拟上/中/下安装位置')
+    parser.add_argument('--cam_rand_rpy', type=float, default=2.0,
+                        help='相机 roll/yaw 随机化半径 (度)，模拟安装角度误差')
     parser.add_argument('--image_height', type=int, default=48, help='图像高度')
     parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
     parser.add_argument('--hfov', type=float, default=90.0,
@@ -488,16 +494,28 @@ class DroneTrainer:
         # 推力估计误差 (模拟真实无人机的推力不确定性)
         thr_est_error = 1.0 + 0.01 * torch.randn((B, 1), device=self.device)
         
-        # Per-sample 相机安装旋转矩阵（含俯仰角随机化）
+        # Per-sample 相机安装旋转矩阵（含三轴随机化）
         # 模拟每架无人机相机安装角的个体差异，episode 内保持不变
         from drone_renderer import build_cam_mount_R
+        rpy_rand = getattr(args, 'cam_rand_rpy', 2.0)
         cam_pitch_per_sample = args.cam_angle + torch.randn(B, device=self.device)
+        cam_roll_per_sample = getattr(args, 'cam_mount_roll', 0.0) + rpy_rand * torch.randn(B, device=self.device)
+        cam_yaw_per_sample = getattr(args, 'cam_mount_yaw', 0.0) + rpy_rand * torch.randn(B, device=self.device)
         cam_mount_R = build_cam_mount_R(
-            roll_deg=getattr(args, 'cam_mount_roll', 0.0),
+            roll_deg=cam_roll_per_sample,
             pitch_deg=cam_pitch_per_sample,
-            yaw_deg=getattr(args, 'cam_mount_yaw', 0.0),
+            yaw_deg=cam_yaw_per_sample,
             device=self.device, batch_size=B,
         )
+
+        # Per-sample 相机位置偏移随机化（episode 内不变）
+        xy_rand = getattr(args, 'cam_rand_xy', 0.02)
+        z_lo, z_hi = getattr(args, 'cam_rand_z_range', [-0.04, 0.04])
+        cam_offset_body = torch.stack([
+            getattr(args, 'cam_offset_x', 0.1) + xy_rand * torch.randn(B, device=self.device),
+            getattr(args, 'cam_offset_y', 0.0) + xy_rand * torch.randn(B, device=self.device),
+            getattr(args, 'cam_offset_z', 0.0) + torch.rand(B, device=self.device) * (z_hi - z_lo) + z_lo,
+        ], dim=-1)  # (B, 3)
         
         # 航向漂移 (可选)
         if args.yaw_drift:
@@ -521,6 +539,7 @@ class DroneTrainer:
                 with torch.no_grad():
                     _, depth = self.env.render(
                         cam_mount_R=cam_mount_R,
+                        cam_offset_body=cam_offset_body,
                         return_tensor=True,
                         return_rgb=False,
                         return_depth=True,
