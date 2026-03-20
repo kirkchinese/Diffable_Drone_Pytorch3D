@@ -220,45 +220,307 @@ class Model_640x480(nn.Module):
         return act, None, hx
 
 
+# ================================================================
+# 注意力模型 — CBAM-style 通道+空间注意力
+# ================================================================
+
+class _ChannelAttention(nn.Module):
+    """通道注意力：squeeze-excitation 变体"""
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        w = x.mean(dim=(2, 3))          # (B, C)
+        w = self.fc(w).unsqueeze(-1).unsqueeze(-1)
+        return x * w
+
+
+class _SpatialAttention(nn.Module):
+    """空间注意力：用 max/avg 池化后 1×1 融合"""
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        avg_out = x.mean(dim=1, keepdim=True)
+        max_out = x.amax(dim=1, keepdim=True)
+        w = self.conv(torch.cat([avg_out, max_out], dim=1))
+        return x * w
+
+
+class Model_attention(nn.Module):
+    """
+    注意力增强模型 — 在 CNN 特征上施加通道+空间注意力 (CBAM)。
+
+    与 Model_bigger 同分辨率 (48×64)，使用 AdaptiveAvgPool 兼容任意尺寸。
+    注意力帮助模型聚焦深度图中障碍物密集区域。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1,  32, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(128, 256, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+        )
+        self.ca = _ChannelAttention(256)
+        self.sa = _SpatialAttention()
+        self.pool = nn.AdaptiveAvgPool2d((3, 4))
+        self.stem_fc = nn.Linear(256 * 3 * 4, hidden_dim, bias=False)
+
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x, v, hx=None):
+        feat = self.conv(x)
+        feat = self.ca(feat)
+        feat = self.sa(feat)
+        feat = self.pool(feat).flatten(1)
+        img_feat = self.stem_fc(feat)
+        fused = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(fused, hx)
+        return self.fc(self.act(hx)), None, hx
+
+
+# ================================================================
+# 多尺度特征金字塔模型
+# ================================================================
+
+class Model_multiscale(nn.Module):
+    """
+    多尺度特征金字塔模型 — 不同层级的 CNN 特征分别池化后拼接。
+
+    低层特征捕获近距离 fine-grained 障碍物边缘，高层特征捕获远处全局布局。
+    兼容任意输入分辨率。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=256):
+        super().__init__()
+        self.conv1 = nn.Sequential(nn.Conv2d(1,  32, 3, 2, 1, bias=False), nn.LeakyReLU(0.05))
+        self.conv2 = nn.Sequential(nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.LeakyReLU(0.05))
+        self.conv3 = nn.Sequential(nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.LeakyReLU(0.05))
+        self.conv4 = nn.Sequential(nn.Conv2d(128, 256, 3, 2, 1, bias=False), nn.LeakyReLU(0.05))
+
+        # 每级特征独立池化到 2×2
+        self.pool2 = nn.AdaptiveAvgPool2d((2, 2))
+        self.pool3 = nn.AdaptiveAvgPool2d((2, 2))
+        self.pool4 = nn.AdaptiveAvgPool2d((2, 2))
+
+        # 64*4 + 128*4 + 256*4 = 1792
+        cat_dim = (64 + 128 + 256) * 2 * 2
+        self.stem_fc = nn.Linear(cat_dim, hidden_dim, bias=False)
+
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x, v, hx=None):
+        f1 = self.conv1(x)
+        f2 = self.conv2(f1)
+        f3 = self.conv3(f2)
+        f4 = self.conv4(f3)
+        multi = torch.cat([
+            self.pool2(f2).flatten(1),
+            self.pool3(f3).flatten(1),
+            self.pool4(f4).flatten(1),
+        ], dim=1)
+        img_feat = self.stem_fc(multi)
+        fused = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(fused, hx)
+        return self.fc(self.act(hx)), None, hx
+
+
+# ================================================================
+# 残差模型 — ResBlock + LSTM
+# ================================================================
+
+class _ResBlock(nn.Module):
+    """带下采样的残差块 (stride=2 时 shortcut 用 1×1 conv)"""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False),
+        )
+        self.shortcut = (
+            nn.Conv2d(in_ch, out_ch, 1, stride, bias=False)
+            if stride != 1 or in_ch != out_ch
+            else nn.Identity()
+        )
+        self.act = nn.LeakyReLU(0.05)
+
+    def forward(self, x):
+        return self.act(self.conv(x) + self.shortcut(x))
+
+
+class Model_residual(nn.Module):
+    """
+    残差网络模型 — ResBlock 堆叠 + LSTM 时序记忆。
+
+    与 GRU 模型对比，使用 LSTM 提供更强的长时记忆能力（独立的遗忘门）。
+    残差连接缓解深层网络梯度消失。兼容任意输入分辨率。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            _ResBlock(1,   32, stride=2),
+            _ResBlock(32,  64, stride=2),
+            _ResBlock(64,  128, stride=2),
+            _ResBlock(128, 256, stride=2),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((3, 4))
+        self.stem_fc = nn.Linear(256 * 3 * 4, hidden_dim, bias=False)
+
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x, v, hx=None):
+        feat = self.conv(x)
+        feat = self.pool(feat).flatten(1)
+        img_feat = self.stem_fc(feat)
+        fused = self.act(img_feat + self.v_proj(v))
+        # hx 是 (h, c) 元组；首次传 None 时 LSTMCell 自动初始化
+        if hx is not None and not isinstance(hx, tuple):
+            # 兼容外部传入单张量的情况：视为 h，c 初始化为零
+            hx = (hx, torch.zeros_like(hx))
+        if hx is None:
+            h, c = self.lstm(fused)
+        else:
+            h, c = self.lstm(fused, hx)
+        act = self.fc(self.act(h))
+        return act, None, (h, c)
+
+
+# ================================================================
+# 轻量级模型 — 深度可分离卷积 (MobileNet-style)
+# ================================================================
+
+class _DepthwiseSeparable(nn.Module):
+    """深度可分离卷积：depthwise + pointwise"""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.act = nn.LeakyReLU(0.05)
+
+    def forward(self, x):
+        return self.act(self.pw(self.dw(x)))
+
+
+class Model_lightweight(nn.Module):
+    """
+    轻量级模型 — 深度可分离卷积 + 小隐层维度。
+
+    参数量约为 Model_bigger 的 1/4，适合快速迭代实验或边缘部署验证。
+    兼容任意输入分辨率。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, 3, 2, 1, bias=False),  # 首层用普通卷积（单通道不适合 depthwise）
+            nn.LeakyReLU(0.05),
+            _DepthwiseSeparable(16, 32, stride=2),
+            _DepthwiseSeparable(32, 64, stride=2),
+            _DepthwiseSeparable(64, 128, stride=2),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((3, 4))
+        self.stem_fc = nn.Linear(128 * 3 * 4, hidden_dim, bias=False)
+
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x, v, hx=None):
+        feat = self.conv(x)
+        feat = self.pool(feat).flatten(1)
+        img_feat = self.stem_fc(feat)
+        fused = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(fused, hx)
+        return self.fc(self.act(hx)), None, hx
+
+
 if __name__ == '__main__':
     print("Testing models...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 测试原始模型
-    model1 = Model().to(device)
-    x1 = torch.randn(2, 1, 12, 16).to(device)
-    v1 = torch.randn(2, 9).to(device)
-    out1, _, hx1 = model1(x1, v1)
-    print(f"Model (12x16): input={x1.shape}, output={out1.shape}")
-    
-    # 测试 bigger 模型
-    model2 = Model_bigger().to(device)
-    x2 = torch.randn(2, 1, 48, 64).to(device)
-    v2 = torch.randn(2, 9).to(device)
-    out2, _, hx2 = model2(x2, v2)
-    print(f"Model_bigger (48x64): input={x2.shape}, output={out2.shape}")
-    
-    # 测试自适应模型 - 不同分辨率
-    model3 = Model_adaptive(dim_obs=10, dim_action=6).to(device)
-    for h, w in [(48, 64), (240, 320), (480, 640), (720, 1280)]:
-        x3 = torch.randn(2, 1, h, w).to(device)
-        v3 = torch.randn(2, 10).to(device)
-        out3, _, hx3 = model3(x3, v3)
-        print(f"Model_adaptive ({h}x{w}): input={x3.shape}, output={out3.shape}")
-    
-    # 测试 640x480 专用模型
-    model4 = Model_640x480(dim_obs=10, dim_action=6).to(device)
-    x4 = torch.randn(2, 1, 480, 640).to(device)
-    v4 = torch.randn(2, 10).to(device)
-    out4, _, hx4 = model4(x4, v4)
-    print(f"Model_640x480: input={x4.shape}, output={out4.shape}")
-    
-    # 统计参数量
-    def count_params(model):
-        return sum(p.numel() for p in model.parameters())
-    
-    print(f"\nParameter counts:")
-    print(f"  Model: {count_params(model1):,}")
-    print(f"  Model_bigger: {count_params(model2):,}")
-    print(f"  Model_adaptive: {count_params(model3):,}")
-    print(f"  Model_640x480: {count_params(model4):,}")
+
+    def count_params(m):
+        return sum(p.numel() for p in m.parameters())
+
+    # 原始模型
+    m = Model().to(device)
+    o, _, _ = m(torch.randn(2, 1, 12, 16, device=device), torch.randn(2, 9, device=device))
+    print(f"Model (12x16): output={o.shape}, params={count_params(m):,}")
+
+    # bigger
+    m = Model_bigger().to(device)
+    o, _, _ = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 9, device=device))
+    print(f"Model_bigger (48x64): output={o.shape}, params={count_params(m):,}")
+
+    # adaptive — 多分辨率
+    m = Model_adaptive(dim_obs=10, dim_action=6).to(device)
+    for h, w in [(48, 64), (240, 320), (480, 640)]:
+        o, _, _ = m(torch.randn(2, 1, h, w, device=device), torch.randn(2, 10, device=device))
+        print(f"Model_adaptive ({h}x{w}): output={o.shape}, params={count_params(m):,}")
+
+    # 640x480
+    m = Model_640x480(dim_obs=10, dim_action=6).to(device)
+    o, _, _ = m(torch.randn(2, 1, 480, 640, device=device), torch.randn(2, 10, device=device))
+    print(f"Model_640x480: output={o.shape}, params={count_params(m):,}")
+
+    # attention
+    m = Model_attention(dim_obs=10, dim_action=6).to(device)
+    o, _, _ = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 10, device=device))
+    print(f"Model_attention (48x64): output={o.shape}, params={count_params(m):,}")
+
+    # multiscale
+    m = Model_multiscale(dim_obs=10, dim_action=6).to(device)
+    o, _, _ = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 10, device=device))
+    print(f"Model_multiscale (48x64): output={o.shape}, params={count_params(m):,}")
+
+    # residual (LSTM)
+    m = Model_residual(dim_obs=10, dim_action=6).to(device)
+    o, _, hx = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 10, device=device))
+    o2, _, _ = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 10, device=device), hx)
+    print(f"Model_residual (48x64): output={o.shape}, params={count_params(m):,}")
+
+    # lightweight
+    m = Model_lightweight(dim_obs=10, dim_action=6).to(device)
+    o, _, _ = m(torch.randn(2, 1, 48, 64, device=device), torch.randn(2, 10, device=device))
+    print(f"Model_lightweight (48x64): output={o.shape}, params={count_params(m):,}")

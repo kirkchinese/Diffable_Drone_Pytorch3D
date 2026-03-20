@@ -17,8 +17,6 @@
 """
 
 import os
-from math import ceil, sqrt  # 仅用于 CPU 端整数运算
-import random
 import torch
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.structures import Meshes, join_meshes_as_scene
@@ -324,7 +322,7 @@ def _center_mesh(mesh):
     return mesh.update_padded(new_verts.unsqueeze(0))
 
 
-def _random_rotation_matrix(device, max_tilt=torch.pi / 4):
+def _random_rotation_matrix(device, max_tilt=torch.pi / 4, generator=None):
     """
     生成随机旋转矩阵：完整 yaw 旋转 + 受限 pitch/roll。
 
@@ -338,23 +336,19 @@ def _random_rotation_matrix(device, max_tilt=torch.pi / 4):
     Returns:
         (3, 3) 旋转矩阵 (float32)
     """
-    yaw = random.uniform(0, 2 * torch.pi)
-    pitch = random.uniform(-max_tilt, max_tilt)
-    roll = random.uniform(-max_tilt, max_tilt)
+    yaw = torch.rand((), device=device, generator=generator) * (2.0 * torch.pi)
+    pitch = (torch.rand((), device=device, generator=generator) * 2.0 - 1.0) * max_tilt
+    roll = (torch.rand((), device=device, generator=generator) * 2.0 - 1.0) * max_tilt
 
-    angles = torch.tensor([yaw, pitch, roll])
-    c = angles.cos()
-    s = angles.sin()
-    cy, cp, cr = c[0].item(), c[1].item(), c[2].item()
-    sy, sp, sr = s[0].item(), s[1].item(), s[2].item()
+    cy, cp, cr = yaw.cos(), pitch.cos(), roll.cos()
+    sy, sp, sr = yaw.sin(), pitch.sin(), roll.sin()
 
     # OBJ 坐标系: Y-up，Yaw 绕 Y 轴, Pitch 绕 X 轴, Roll 绕 Z 轴
-    Ry = torch.tensor([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]],
-                       device=device, dtype=torch.float32)
-    Rx = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]],
-                       device=device, dtype=torch.float32)
-    Rz = torch.tensor([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]],
-                       device=device, dtype=torch.float32)
+    z = torch.zeros((), device=device)
+    o = torch.ones((), device=device)
+    Ry = torch.stack([torch.stack([cy, z, sy]), torch.stack([z, o, z]), torch.stack([-sy, z, cy])])
+    Rx = torch.stack([torch.stack([o, z, z]), torch.stack([z, cp, -sp]), torch.stack([z, sp, cp])])
+    Rz = torch.stack([torch.stack([cr, -sr, z]), torch.stack([sr, cr, z]), torch.stack([z, z, o])])
     return Ry @ Rx @ Rz
 
 
@@ -514,8 +508,9 @@ class SceneGenerator:
         self.max_faces_per_primitive = max_faces_per_primitive
         self.weld_scene = weld_scene
 
+        self.generator = torch.Generator(device=device)
         if seed is not None:
-            random.seed(seed)
+            self.generator.manual_seed(seed)
 
         # 预加载所有原语网格
         self.primitive_meshes = {}
@@ -567,6 +562,23 @@ class SceneGenerator:
 
         self.obstacle_names = obstacle_names
 
+    def _rand(self, *size):
+        shape = size if size else ()
+        return torch.rand(shape, device=self.device, generator=self.generator)
+
+    def _randn(self, *size):
+        shape = size if size else ()
+        return torch.randn(shape, device=self.device, generator=self.generator)
+
+    def _rand_scalar(self, low=0.0, high=1.0):
+        return float((self._rand() * (high - low) + low).item())
+
+    def _rand_int(self, low, high):
+        return int(torch.randint(low, high, (), device=self.device, generator=self.generator).item())
+
+    def _rand_bool(self, p_true):
+        return bool((self._rand() < p_true).item())
+
     def _grid_jitter_positions(self, num_obstacles):
         """
         网格抖动位置生成：将场景划分为均匀网格，随机选取网格并在格内抖动。
@@ -581,34 +593,30 @@ class SceneGenerator:
         """
         arena = self.arena_range
         # 网格边数：略多于 sqrt(num_obstacles)，保证有足够的格子
-        grid_side = max(ceil(sqrt(num_obstacles * 1.2)), 3)
+        grid_side = max(
+            int(torch.ceil(torch.sqrt(torch.tensor(float(num_obstacles) * 1.2, device=self.device))).item()),
+            3,
+        )
         cell_size = 2.0 * arena / grid_side
 
-        # 生成所有网格中心
-        cells = []
-        for i in range(grid_side):
-            for j in range(grid_side):
-                cx = -arena + (i + 0.5) * cell_size
-                cz = -arena + (j + 0.5) * cell_size
-                cells.append((cx, cz))
+        coords = torch.arange(grid_side, device=self.device, dtype=torch.float32)
+        cx, cz = torch.meshgrid(coords, coords, indexing='ij')
+        centers = torch.stack([
+            -arena + (cx.reshape(-1) + 0.5) * cell_size,
+            -arena + (cz.reshape(-1) + 0.5) * cell_size,
+        ], dim=-1)
 
-        # 随机选取 num_obstacles 个格子
-        random.shuffle(cells)
-        selected = cells[:num_obstacles]
+        perm = torch.randperm(centers.shape[0], device=self.device, generator=self.generator)
+        selected = centers[perm[:num_obstacles]]
 
-        # 在格内添加抖动（±40% cell_size）
-        positions = []
-        for cx, cz in selected:
-            jx = random.uniform(-0.4, 0.4) * cell_size
-            jz = random.uniform(-0.4, 0.4) * cell_size
-            px = max(-arena + 0.05, min(arena - 0.05, cx + jx))
-            pz = max(-arena + 0.05, min(arena - 0.05, cz + jz))
-            positions.append((px, pz))
+        jitter = (self._rand(num_obstacles, 2) * 0.8 - 0.4) * cell_size
+        positions_t = (selected + jitter).clamp(-arena + 0.05, arena - 0.05)
+        positions = [tuple(p.tolist()) for p in positions_t]
 
         # 如果需要的障碍物多于网格数，额外随机填充
         while len(positions) < num_obstacles:
-            px = random.uniform(-arena, arena)
-            pz = random.uniform(-arena, arena)
+            px = self._rand_scalar(-arena, arena)
+            pz = self._rand_scalar(-arena, arena)
             positions.append((px, pz))
 
         return positions
@@ -627,12 +635,12 @@ class SceneGenerator:
         sigma = arena / 3.0
         positions = []
         for _ in range(num_obstacles):
-            if random.random() < self.concentration:
-                tx = max(-arena, min(arena, random.gauss(0, sigma)))
-                tz = max(-arena, min(arena, random.gauss(0, sigma)))
+            if self._rand_bool(self.concentration):
+                tx = float(self._randn().mul(sigma).clamp(-arena, arena).item())
+                tz = float(self._randn().mul(sigma).clamp(-arena, arena).item())
             else:
-                tx = random.uniform(-arena, arena)
-                tz = random.uniform(-arena, arena)
+                tx = self._rand_scalar(-arena, arena)
+                tz = self._rand_scalar(-arena, arena)
             positions.append((tx, tz))
         return positions
 
@@ -675,7 +683,7 @@ class SceneGenerator:
         # 2) 随机障碍物
         if num_obstacles is None:
             lo, hi = self.num_obstacles_range
-            num_obstacles = random.randint(lo, hi)
+            num_obstacles = self._rand_int(lo, hi + 1)
 
         # 分离主体与簇生障碍物
         n_primary = max(int(num_obstacles * (1 - self.cluster_ratio)), 1)
@@ -694,24 +702,24 @@ class SceneGenerator:
 
         def _place_one(px, pz, force_grounded=None):
             """放置单个障碍物，返回无。直接修改外层 meshes_to_join / obstacle_info。"""
-            name = random.choice(self.obstacle_names)
+            name = self.obstacle_names[self._rand_int(0, len(self.obstacle_names))]
             base_mesh = self.primitive_meshes[name]
             base_verts = base_mesh.verts_packed()  # (V, 3), 已居中 (归一化后)
 
             # 决定是否接地
             is_grounded = force_grounded if force_grounded is not None \
-                else (random.random() < self.ground_ratio)
+                else self._rand_bool(self.ground_ratio)
 
             # 随机缩放 (XYZ 独立，基础值 ±30% 扰动)
             s_lo, s_hi = self.obstacle_scale_range
-            base_scale = random.uniform(s_lo, s_hi)
-            sx = base_scale * random.uniform(0.7, 1.3)
-            sz = base_scale * random.uniform(0.7, 1.3)
+            base_scale = self._rand_scalar(s_lo, s_hi)
+            sx = base_scale * self._rand_scalar(0.7, 1.3)
+            sz = base_scale * self._rand_scalar(0.7, 1.3)
             if is_grounded:
                 # 接地物体：Y 轴缩放偏大，形成柱子/墙壁/树桩等
-                sy = base_scale * random.uniform(1.0, 3.0)
+                sy = base_scale * self._rand_scalar(1.0, 3.0)
             else:
-                sy = base_scale * random.uniform(0.7, 1.3)
+                sy = base_scale * self._rand_scalar(0.7, 1.3)
             scale = torch.tensor([sx, sy, sz], device=self.device)
 
             # 缩放
@@ -719,17 +727,19 @@ class SceneGenerator:
 
             # 旋转
             if self.enable_3d_rotation:
-                R = _random_rotation_matrix(self.device, self.max_tilt)
+                R = _random_rotation_matrix(self.device, self.max_tilt, generator=self.generator)
                 verts = verts @ R.T
             else:
-                rot_y = random.uniform(0, 2 * torch.pi)
-                cos_a = torch.tensor(rot_y).cos().item()
-                sin_a = torch.tensor(rot_y).sin().item()
-                Ry = torch.tensor([
-                    [ cos_a, 0, sin_a],
-                    [ 0,     1, 0    ],
-                    [-sin_a, 0, cos_a]
-                ], device=self.device, dtype=torch.float32)
+                rot_y = self._rand() * (2.0 * torch.pi)
+                cos_a = rot_y.cos()
+                sin_a = rot_y.sin()
+                z = torch.zeros((), device=self.device)
+                o = torch.ones((), device=self.device)
+                Ry = torch.stack([
+                    torch.stack([cos_a, z, sin_a]),
+                    torch.stack([z, o, z]),
+                    torch.stack([-sin_a, z, cos_a]),
+                ])
                 verts = verts @ Ry.T
 
             # 动态计算旋转后实际 Y 范围（精确防止地下放置）
@@ -742,7 +752,7 @@ class SceneGenerator:
                 # 悬浮：在 [min_ty, height_hi] 范围内随机
                 min_ty = self.ground_clearance - y_min_local  # y_min_local 通常为负
                 min_ty = max(min_ty, height_lo)
-                ty = random.uniform(min_ty, height_hi) if min_ty < height_hi else min_ty
+                ty = self._rand_scalar(min_ty, height_hi) if min_ty < height_hi else min_ty
 
             # 平移
             translation = torch.tensor([px, ty, pz], device=self.device)
@@ -770,17 +780,17 @@ class SceneGenerator:
         # --- 簇生障碍物：在已有物体附近组合，形成复合形状 ---
         for _ in range(n_cluster):
             if placed_centers:
-                parent = random.choice(placed_centers)
-                dx = random.uniform(-self.cluster_spread, self.cluster_spread)
-                dz = random.uniform(-self.cluster_spread, self.cluster_spread)
+                parent = placed_centers[self._rand_int(0, len(placed_centers))]
+                dx = self._rand_scalar(-self.cluster_spread, self.cluster_spread)
+                dz = self._rand_scalar(-self.cluster_spread, self.cluster_spread)
                 cx = max(-self.arena_range + 0.05,
                          min(self.arena_range - 0.05, parent[0] + dx))
                 cz = max(-self.arena_range + 0.05,
                          min(self.arena_range - 0.05, parent[2] + dz))
                 _place_one(cx, cz)
             else:
-                px = random.uniform(-self.arena_range, self.arena_range)
-                pz = random.uniform(-self.arena_range, self.arena_range)
+                px = self._rand_scalar(-self.arena_range, self.arena_range)
+                pz = self._rand_scalar(-self.arena_range, self.arena_range)
                 _place_one(px, pz)
 
         # 3) 合并所有网格为一个场景
