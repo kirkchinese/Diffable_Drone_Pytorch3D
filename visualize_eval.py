@@ -341,7 +341,23 @@ class EvalRunner:
         os.makedirs(args.output_dir, exist_ok=True)
 
     def _load_checkpoint(self, path):
-        state_dict = torch.load(path, map_location=self.device, weights_only=True)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+            saved_args = ckpt.get('args', {})
+            saved_iter = ckpt.get('iteration', '?')
+            print(f"[Checkpoint] 迭代={saved_iter}, 超参数已记录")
+            if saved_args:
+                keys = ['lr', 'batch_size', 'timesteps', 'coef_collide',
+                        'coef_obj_avoidance', 'coef_drone_collide',
+                        'n_drones_per_group', 'cam_mode']
+                info = ', '.join(f'{k}={saved_args[k]}'
+                                for k in keys if k in saved_args)
+                if info:
+                    print(f"[Checkpoint] 训练超参: {info}")
+        else:
+            state_dict = ckpt
+            print(f"[Checkpoint] 旧格式（仅权重），无超参数记录")
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"[WARNING] Missing keys: {missing}")

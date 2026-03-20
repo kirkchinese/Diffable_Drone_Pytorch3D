@@ -372,9 +372,36 @@ class DroneTrainer:
         self.best_task_iter = -1
         self.task_score_ema = 0.0
         
+    def _make_checkpoint(self, iteration, extra=None):
+        """构建完整 checkpoint dict（含模型权重、优化器、调度器、超参数、迭代计数）。"""
+        ckpt = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'iteration': iteration,
+            'args': vars(self.args),
+        }
+        if extra:
+            ckpt.update(extra)
+        return ckpt
+
     def _load_model(self, path):
-        """加载模型"""
-        state_dict = torch.load(path, map_location=self.device, weights_only=True)
+        """加载模型（兼容旧纯 state_dict 格式与新 checkpoint dict 格式）。"""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # 新格式：dict 含 'model_state_dict' 键
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+            saved_args = ckpt.get('args', {})
+            saved_iter = ckpt.get('iteration', '?')
+            print(f"[Checkpoint] 迭代={saved_iter}, 超参数已记录")
+            if saved_args:
+                print(f"[Checkpoint] 保存时超参: lr={saved_args.get('lr')}, "
+                      f"batch_size={saved_args.get('batch_size')}, "
+                      f"timesteps={saved_args.get('timesteps')}")
+        else:
+            # 旧格式：直接是 state_dict
+            state_dict = ckpt
+            print(f"[Checkpoint] 旧格式（仅权重），无超参数记录")
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
@@ -688,8 +715,8 @@ class DroneTrainer:
             
             if (i + 1) % args.save_freq == 0:
                 save_path = os.path.join(args.save_dir, f'checkpoint_{i+1:06d}.pth')
-                torch.save(self.model.state_dict(), save_path)
-                print(f"\nSaved model to {save_path}")
+                torch.save(self._make_checkpoint(i + 1), save_path)
+                print(f"\nSaved checkpoint to {save_path}")
             
             # ---- Best AR checkpoint（独立保存，不覆盖常规 checkpoint）----
             current_ar = float(metrics.get('ar', 0.0))
@@ -699,7 +726,7 @@ class DroneTrainer:
                 self.best_ar = self.ar_ema
                 self.best_ar_iter = i + 1
                 best_path = os.path.join(args.save_dir, 'best_ar.pth')
-                torch.save(self.model.state_dict(), best_path)
+                torch.save(self._make_checkpoint(i + 1, {'best_ar': self.best_ar}), best_path)
                 # 同时记录到 TensorBoard
                 self.writer.add_scalar('best_ar', self.best_ar, i + 1)
 
@@ -709,7 +736,7 @@ class DroneTrainer:
                 self.best_task_score = self.task_score_ema
                 self.best_task_iter = i + 1
                 best_task_path = os.path.join(args.save_dir, 'best_task_score.pth')
-                torch.save(self.model.state_dict(), best_task_path)
+                torch.save(self._make_checkpoint(i + 1, {'best_task_score': self.best_task_score}), best_task_path)
                 self.writer.add_scalar('best_task_score', self.best_task_score, i + 1)
             
             if (i + 1) % 25 == 0:
@@ -719,8 +746,13 @@ class DroneTrainer:
         
         # 保存最终模型
         final_path = os.path.join(args.save_dir, 'checkpoint_final.pth')
-        torch.save(self.model.state_dict(), final_path)
-        print(f"Training complete. Final model saved to {final_path}")
+        torch.save(self._make_checkpoint(args.num_iters, {
+            'best_ar': self.best_ar,
+            'best_ar_iter': self.best_ar_iter,
+            'best_task_score': self.best_task_score,
+            'best_task_iter': self.best_task_iter,
+        }), final_path)
+        print(f"Training complete. Final checkpoint saved to {final_path}")
         if self.best_ar_iter > 0:
             print(f"Best AR model: best_ar.pth (AR={self.best_ar:.4f} @ iter {self.best_ar_iter})")
         if self.best_task_iter > 0:
