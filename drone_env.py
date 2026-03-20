@@ -488,20 +488,22 @@ class DroneSimulator:
         """
         from pytorch3d.structures import Meshes
 
-        base_verts = self._drone_verts_centered  # 已在 __init__ 中预计算并做 Y↔Z 换轴
+        base_verts = self._drone_verts_centered  # (V, 3)
         base_faces = self.drone_mesh.faces_packed()
         base_tex = self.drone_mesh.textures
-        p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3) 批量转换
+        p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3)
         base_safety = self.drone_bounding_radius + self.aero_margin
 
-        meshes = []
-        for b in range(self.B):
-            R_pt3d = transform_rot_ros2pt3d(self.R[b])
-            # 按该无人机的安全半径缩放网格，使渲染大小与碰撞判定一致
-            scale = self.margin[b] / base_safety
-            verts_world = (base_verts * scale) @ R_pt3d.T + p_pt3d[b]
-            meshes.append(Meshes(verts=[verts_world], faces=[base_faces], textures=base_tex))
-        return meshes
+        # 批量计算所有无人机的世界坐标顶点
+        R_pt3d = transform_rot_ros2pt3d(self.R)  # (B, 3, 3)
+        scales = (self.margin / base_safety).view(self.B, 1, 1)  # (B, 1, 1)
+        verts_all = torch.bmm(
+            base_verts.unsqueeze(0).expand(self.B, -1, -1) * scales,
+            R_pt3d.transpose(1, 2)
+        ) + p_pt3d.unsqueeze(1)  # (B, V, 3)
+
+        return [Meshes(verts=[verts_all[b]], faces=[base_faces], textures=base_tex)
+                for b in range(self.B)]
 
     def _step_dynamic_obstacles(self, dt):
         """推进所有动态障碍物一步。"""
@@ -635,7 +637,7 @@ class DroneSimulator:
         self._dynamic_obstacles = []
         self.renderer.clear_dynamic_meshes()
 
-    def render(self, camera_pitch=None, cam_mount_R=None,
+    def render(self, camera_pitch=None, cam_mount_R=None, cam_offset_body=None,
                return_tensor=True, return_rgb=True, return_depth=True, dt=None):
         """
         渲染当前帧
@@ -644,6 +646,8 @@ class DroneSimulator:
             camera_pitch (float|Tensor, optional): 相机俯仰角 (度)。
                 当 cam_mount_R 未提供时使用，默认取 self.cam_mount_rpy[1]。
             cam_mount_R (Tensor, optional): 相机安装旋转矩阵 (B,3,3)；覆盖 camera_pitch。
+            cam_offset_body (Tensor|list, optional): 相机机体坐标系偏移 (3,) 或 (B,3)。
+                默认使用 self.cam_offset_body。
             return_tensor (bool): 是否返回 Tensor
             return_rgb (bool): 是否返回 RGB
             return_depth (bool): 是否返回 Depth
@@ -659,7 +663,7 @@ class DroneSimulator:
             p_ros=self.p, 
             R_ros=self.R, 
             camera_pitch_deg=camera_pitch,
-            cam_offset_body=self.cam_offset_body,
+            cam_offset_body=cam_offset_body if cam_offset_body is not None else self.cam_offset_body,
             cam_mount_R=cam_mount_R,
         )
         rgb, depth = self.renderer.render(

@@ -124,6 +124,8 @@ def parse_args():
                         help='可视化输出 RGB/Depth 的宽度')
     parser.add_argument('--viz_fov', type=float, default=90.0,
                         help='可视化渲染水平视场角 (度)，默认90度广角')
+    parser.add_argument('--viz_z_clip', type=float, default=0.02,
+                        help='可视化渲染近平面裁剪值 (m)，较小值可显示近处无人机网格，默认0.02')
 
     # 场景随机化
     parser.add_argument('--random_scene', action='store_true', default=False,
@@ -316,6 +318,7 @@ class EvalRunner:
         self.hires_renderer = self.env.renderer.create_variant(
             hfov_deg=args.viz_fov,
             image_size=(args.viz_height, args.viz_width),
+            z_clip_value=getattr(args, 'viz_z_clip', 0.02),
         )
 
         # ---------- 模型 ----------
