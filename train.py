@@ -23,6 +23,7 @@ from drone_env import DroneSimulator
 from model import (
     Model, Model_bigger, Model_adaptive,
     Model_attention, Model_multiscale, Model_residual, Model_lightweight,
+    DecayController, LossGuide,
 )
 from loss import DroneLoss
 from navigation_utils import (
@@ -170,6 +171,19 @@ def parse_args():
                              'attention=注意力, multiscale=多尺度, residual=残差+LSTM, lightweight=轻量级')
     parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
     parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
+    
+    # CMA-ES 参数
+    parser.add_argument('--use_cmaes', action='store_true', default=False,
+                        help='启用 CMA-ES 进化优化（与梯度训练双重循环）')
+    parser.add_argument('--cma_mode', type=str, default='guide',
+                        choices=['decay', 'guide'],
+                        help='CMA-ES 模式: decay=进化梯度衰减控制器, guide=进化损失系数')
+    parser.add_argument('--cma_pop_size', type=int, default=20, help='CMA-ES 种群大小')
+    parser.add_argument('--cma_sigma0', type=float, default=0.5, help='CMA-ES 初始步长')
+    parser.add_argument('--cma_eval_interval', type=int, default=50,
+                        help='CMA-ES 评估间隔 (每 N 个训练步进行一次进化)')
+    parser.add_argument('--decay_min', type=float, default=0.2, help='DecayController 最小衰减因子')
+    parser.add_argument('--decay_max', type=float, default=1.0, help='DecayController 最大衰减因子')
     
     # 保存参数
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
@@ -362,6 +376,50 @@ class DroneTrainer:
             ctl_dt=self.ctl_dt,
             window_size=getattr(args, 'window_size', 30)
         )
+        # 保存初始系数（LossGuide 模式下用于合并未被进化覆盖的系数）
+        self._base_coefs = dict(self.losser.coefs)
+        
+        # CMA-ES 初始化
+        self.use_cmaes = getattr(args, 'use_cmaes', False)
+        self.cma_mode = getattr(args, 'cma_mode', 'guide')
+        self.decay_controller = None
+        self.loss_guide = None
+        self.cma_es = None
+        
+        if self.use_cmaes:
+            import cma as _cma
+            self._cma = _cma
+            
+            if self.cma_mode == 'decay':
+                # 从模型推断 CNN 特征维度
+                if hasattr(self.model, 'gru'):
+                    feat_dim = self.model.gru.input_size
+                elif hasattr(self.model, 'lstm'):
+                    feat_dim = self.model.lstm.input_size
+                else:
+                    feat_dim = 256
+                self.decay_controller = DecayController(
+                    feat_dim=feat_dim,
+                    decay_min=getattr(args, 'decay_min', 0.2),
+                    decay_range=getattr(args, 'decay_max', 1.0) - getattr(args, 'decay_min', 0.2),
+                ).to(self.device)
+                x0 = self.decay_controller.get_params_vector().cpu().numpy()
+                print(f"[CMA-ES] DecayController: {self.decay_controller.num_params} params, "
+                      f"decay ∈ [{args.decay_min}, {args.decay_max}]")
+            else:  # guide
+                self.loss_guide = LossGuide().to(self.device)
+                x0 = self.loss_guide.get_params_vector().cpu().numpy()
+                print(f"[CMA-ES] LossGuide: {self.loss_guide.num_params} params (损失系数进化)")
+            
+            cma_options = {
+                'popsize': getattr(args, 'cma_pop_size', 20),
+                'seed': 42,
+                'maxiter': int(1e6),
+                'verbose': -1,
+            }
+            self.cma_es = _cma.CMAEvolutionStrategy(x0.tolist(), args.cma_sigma0, cma_options)
+            print(f"[CMA-ES] pop_size={args.cma_pop_size}, sigma0={args.cma_sigma0}, "
+                  f"eval_interval={args.cma_eval_interval}")
         
         # TensorBoard
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -417,6 +475,11 @@ class DroneTrainer:
             'iteration': iteration,
             'args': vars(self.args),
         }
+        # CMA-ES 状态
+        if self.decay_controller is not None:
+            ckpt['decay_controller'] = self.decay_controller.state_dict()
+        if self.loss_guide is not None:
+            ckpt['loss_guide'] = self.loss_guide.state_dict()
         if extra:
             ckpt.update(extra)
         return ckpt
@@ -580,6 +643,7 @@ class DroneTrainer:
             p_target[:, 2] = p_target[:, 2].clamp(1.5, spawn_z_max)  # 限制 Z 范围
         
         target_v_raw = p_target - self.env.p
+        p_start = self.env.p.detach().clone()  # CMA-ES fitness 计算用
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
@@ -629,6 +693,10 @@ class DroneTrainer:
                 zeros, zeros, ones,
             ], -1).reshape(B, 3, 3)
         
+        # CMA-ES DecayController 跟踪
+        prev_decay = None  # 首步使用默认 grad_decay
+        decay_history = []
+        
         for t in range(args.timesteps):
             # 随机化控制间隔 (参考项目: mean=ctl_dt, std=0.1*ctl_dt)
             current_dt = normalvariate(self.ctl_dt, self.ctl_dt * 0.1)
@@ -672,7 +740,8 @@ class DroneTrainer:
             # 关键：使用 act_buffer[t] 而不是取模，参考项目的实现方式
             self.env.step(act_cmd=act_buffer[t], 
                          target_pos_vector=target_v_raw, 
-                         dt=current_dt)
+                         dt=current_dt,
+                         override_grad_decay=prev_decay)
             
             # 策略推理（obs 构造 → 模型前向 → 动作后处理）
             act_cmd, v_pred, target_v, h = self.policy.infer(
@@ -680,6 +749,14 @@ class DroneTrainer:
                 self.env.margin, max_speed, thr_est_error, h,
                 depth_noise_std=0.02,
             )
+            
+            # CMA-ES DecayController: 从当前帧的 CNN 特征计算下一步的梯度衰减
+            if self.decay_controller is not None:
+                img_feat = getattr(self.policy, '_last_img_feat', None)
+                if img_feat is not None:
+                    with torch.no_grad():
+                        prev_decay = self.decay_controller(img_feat.detach())
+                    decay_history.append(prev_decay)
 
             # Truncated BPTT: 每 30 步截断隐状态梯度
             if t > 0 and t % 30 == 0:
@@ -704,6 +781,16 @@ class DroneTrainer:
 
         # 无人机间碰撞距离历史
         inter_drone_dist_history = torch.stack(inter_drone_dist_list) if inter_drone_dist_list else None
+        
+        # CMA-ES LossGuide: 注入进化的损失系数
+        if self.loss_guide is not None:
+            with torch.no_grad():
+                evolved_coefs = self.loss_guide()
+            # 合并：进化系数覆盖对应项，未覆盖的保持初始值
+            merged = dict(self._base_coefs)
+            merged.update({k: v.item() if isinstance(v, torch.Tensor) else v
+                           for k, v in evolved_coefs.items()})
+            self.losser.coefs = merged
         
         # 计算损失
         loss, metrics = self.losser.forward(
@@ -731,24 +818,86 @@ class DroneTrainer:
                     reach_radius=getattr(args, 'reach_radius', 0.5),
                 )
             )
+            # CMA-ES decay 统计
+            if decay_history:
+                decay_vals = torch.stack(decay_history)
+                metrics['decay_mean'] = decay_vals.mean().item()
+                metrics['decay_std'] = decay_vals.std().item()
         
         # 非保存迭代时 detach debug_data，避免计算图被引用残留到下一轮
         debug_out = (
             p_history.detach(), v_history.detach(),
             act_buffer_stacked.detach(), vid
         )
-        return loss, metrics, debug_out
+        
+        # CMA-ES 评估所需的额外数据
+        extra = {
+            'p_history': p_history.detach(),
+            'p_start': p_start,
+            'p_target': p_target,
+            'vec_to_obj_history': vec_to_pt_history.detach(),
+            'margin': self.env.margin,
+        }
+        
+        return loss, metrics, debug_out, extra
+    
+    def compute_fitness(self, extra):
+        """
+        CMA-ES 适应度函数。
+        
+        Fitness = progress × (1 - collision_rate) × (1 + 0.1 × avg_speed)
+        
+        防作弊设计:
+        - 原地不动: progress=0 → fitness=0
+        - 碰撞: collision=1 → fitness=0
+        """
+        p_history = extra['p_history']
+        p_start = extra['p_start']
+        p_target = extra['p_target']
+        vec_to_obj_history = extra['vec_to_obj_history']
+        margin = extra['margin']
+        
+        total_dist = (p_target - p_start).norm(dim=-1)  # (B,)
+        final_dist = (p_target - p_history[-1]).norm(dim=-1)  # (B,)
+        progress = (1.0 - final_dist / (total_dist + 1e-6)).clamp(0, 1)
+        
+        distance = vec_to_obj_history.norm(dim=-1)
+        if distance.dim() == 3:  # (T, S, B) 子步细分
+            distance = distance.amin(dim=1)
+        distance = distance - margin
+        collision = (distance < 0).any(dim=0).float()
+        
+        if p_history.shape[0] > 1:
+            avg_speed = (p_history[1:] - p_history[:-1]).norm(dim=-1).mean(0)
+        else:
+            avg_speed = torch.zeros(p_history.shape[1], device=p_history.device)
+        
+        per_sample = progress * (1.0 - collision) * (1.0 + 0.1 * avg_speed)
+        return per_sample.mean().item()
+    
+    def evaluate_cma_individual(self, params_vector):
+        """评估单个 CMA-ES 个体的 fitness"""
+        vec = torch.tensor(params_vector, dtype=torch.float32, device=self.device)
+        if self.cma_mode == 'decay':
+            self.decay_controller.set_params_vector(vec)
+        else:
+            self.loss_guide.set_params_vector(vec)
+        
+        with torch.no_grad():
+            _, _, _, extra = self.run_episode(iteration=-1)
+        return self.compute_fitness(extra)
     
     def train(self):
         """主训练循环"""
         args = self.args
         
         pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
+        cma_gen = 0
         
         for i in pbar:
             try:
                 # 运行一个 episode
-                loss, metrics, debug_data = self.run_episode(i)
+                loss, metrics, debug_data, extra = self.run_episode(i)
                 
                 # 检查 NaN
                 if torch.isnan(loss):
@@ -769,6 +918,56 @@ class DroneTrainer:
                 torch.cuda.empty_cache()
                 print(f"\n[OOM] iter {i}: episode OOM, skipping")
                 continue
+            
+            # CMA-ES 外层循环: 每 N 步进化一代
+            if self.use_cmaes and (i + 1) % args.cma_eval_interval == 0 and not self.cma_es.stop():
+                if self.cma_mode == 'decay':
+                    best_before = self.decay_controller.get_params_vector().clone()
+                else:
+                    best_before = self.loss_guide.get_params_vector().clone()
+                
+                solutions = self.cma_es.ask()
+                fitnesses = []
+                for sol in solutions:
+                    try:
+                        fit = self.evaluate_cma_individual(sol)
+                        fitnesses.append(-fit)  # CMA-ES 最小化，fitness 取负
+                    except torch.cuda.OutOfMemoryError:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        fitnesses.append(0.0)
+                
+                self.cma_es.tell(solutions, fitnesses)
+                cma_gen += 1
+                
+                # 恢复当前最优个体
+                best = self.cma_es.result.xbest
+                if best is not None:
+                    vec = torch.tensor(best, dtype=torch.float32, device=self.device)
+                    if self.cma_mode == 'decay':
+                        self.decay_controller.set_params_vector(vec)
+                    else:
+                        self.loss_guide.set_params_vector(vec)
+                else:
+                    if self.cma_mode == 'decay':
+                        self.decay_controller.set_params_vector(best_before)
+                    else:
+                        self.loss_guide.set_params_vector(best_before)
+                
+                # 记录 CMA-ES 指标
+                best_fitness = -min(fitnesses)
+                mean_fitness = -sum(fitnesses) / len(fitnesses)
+                metrics['cma_best_fitness'] = best_fitness
+                metrics['cma_mean_fitness'] = mean_fitness
+                metrics['cma_gen'] = cma_gen
+                
+                # LossGuide 模式：记录当前进化的系数
+                if self.loss_guide is not None:
+                    with torch.no_grad():
+                        current_coefs = self.loss_guide()
+                    for name, val in current_coefs.items():
+                        v = val.item() if isinstance(val, torch.Tensor) else val
+                        metrics[f'guide_{name}'] = v
             
             # 记录当前学习率到 metrics
             metrics['lr'] = self.scheduler.get_last_lr()[0]

@@ -184,7 +184,8 @@ class DronePolicy:
             depth, self.depth_min, self.depth_max, depth_noise_std)
 
         # 模型前向
-        act_raw, _, hx = self.model(x, state, hx)
+        act_raw, img_feat, hx = self.model(x, state, hx)
+        self._last_img_feat = img_feat  # 供 CMA-ES DecayController 使用
 
         # 动作后处理：local→world + 推力换算
         act_world = R_local @ act_raw.reshape(B, 3, 2)
