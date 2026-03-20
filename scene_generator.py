@@ -20,7 +20,6 @@ import os
 from math import ceil, sqrt  # 仅用于 CPU 端整数运算
 import random
 import torch
-import numpy as np
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.structures import Meshes, join_meshes_as_scene
 from pytorch3d.renderer import TexturesVertex

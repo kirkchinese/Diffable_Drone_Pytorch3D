@@ -45,12 +45,11 @@ def run_visualize_with_features():
         "--timesteps", "20",             # 只运行 20 步（快速测试）
         "--batch_size", "2",
         "--random_scene",                # 随机场景
-        "--dynamic_obstacles",           # Feature 2: 启用动态障碍物
-        "--num_dynamic_obstacles", "2",
-        "--dynamic_position_range", "2.0",
-        "--dynamic_velocity_range", "0.3",
+        "--enable_dynamic_obstacles",    # Feature 2: 启用动态障碍物
+        "--num_dynamic_obstacles_min", "1",
+        "--num_dynamic_obstacles_max", "3",
         "--drone_mesh_path", str(PROJECT_ROOT / "data" / "base_model" / "drone.obj"),  # Feature 3: 无人机互视
-        "--drone_mesh_scale", "0.15",
+        "--n_drones_per_group", "2",
         "--no_video",  # 不生成视频（快速）
     ]
     
@@ -102,11 +101,11 @@ def main():
     )
     
     required_params = [
-        "--dynamic_obstacles",
-        "--num_dynamic_obstacles",
-        "--dynamic_position_range",
+        "--enable_dynamic_obstacles",
+        "--num_dynamic_obstacles_min",
+        "--num_dynamic_obstacles_max",
         "--drone_mesh_path",
-        "--drone_mesh_scale",
+        "--n_drones_per_group",
     ]
     
     help_text = result.stdout + result.stderr

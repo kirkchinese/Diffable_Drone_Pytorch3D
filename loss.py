@@ -133,7 +133,7 @@ class DroneLoss:
         v_preds = to_tensor(v_preds)
 
         if env_g_std is None:
-            env_g_std = torch.tensor([0.0, 0.0, -9.80665], device=p_history.device)
+            env_g_std = p_history.new_tensor([0.0, 0.0, -9.80665])
 
         T, B, _ = v_history.shape
         metrics = {}
@@ -191,10 +191,10 @@ class DroneLoss:
                 v_perp_norm = torch.norm(v_perp, p=2, dim=-1)  # (T', B)
                 loss_lateral = F.smooth_l1_loss(v_perp_norm, torch.zeros_like(v_perp_norm))
             else:
-                loss_lateral = torch.tensor(0.0, device=p_history.device)
+                loss_lateral = p_history.new_tensor(0.0)
         else:
-            loss_v = torch.tensor(0.0, device=p_history.device)
-            loss_lateral = torch.tensor(0.0, device=p_history.device)
+            loss_v = p_history.new_tensor(0.0)
+            loss_lateral = p_history.new_tensor(0.0)
         metrics['loss_v'] = loss_v
         metrics['loss_lateral'] = loss_lateral
 
@@ -265,7 +265,7 @@ class DroneLoss:
             # softplus(-32 * d) 在 d<0 时急剧增长, 惩罚碰撞
             loss_drone_collide = F.softplus(drone_dist.mul(-32)).mean()
         else:
-            loss_drone_collide = torch.tensor(0.0, device=p_history.device)
+            loss_drone_collide = p_history.new_tensor(0.0)
         metrics['loss_drone_collide'] = loss_drone_collide
 
         # 整体速度损失

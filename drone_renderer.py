@@ -15,7 +15,6 @@
 """
 
 import torch
-import numpy as np
 from pytorch3d.ops import sample_points_from_meshes, knn_points, SubdivideMeshes
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
@@ -222,6 +221,10 @@ class DroneRenderer:
         # Mesh.extend() 缓存：训练中 batch size 固定，避免每帧重建
         self._extended_mesh_cache = None
         self._extended_mesh_bs = 0
+
+        # compute_view_matrix 中的规范向量缓存（避免每帧重建 tensor）
+        self._fwd_canonical = torch.tensor([1.0, 0.0, 0.0], device=self.device).view(1, 3, 1)
+        self._up_canonical = torch.tensor([0.0, 0.0, 1.0], device=self.device).view(1, 3, 1)
 
         # 动态场景合成：额外网格（无人机机体、动态障碍物等）在渲染时与静态场景合并
         self._dynamic_meshes = []
@@ -531,8 +534,8 @@ class DroneRenderer:
             )
         
         # 计算 Look At 指向向量和 Up 向量 (在机体坐标系下)
-        forward_canonical = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 3, 1).expand(B, -1, -1)
-        up_canonical = torch.tensor([0.0, 0.0, 1.0], device=device).view(1, 3, 1).expand(B, -1, -1)
+        forward_canonical = self._fwd_canonical.expand(B, -1, -1)
+        up_canonical = self._up_canonical.expand(B, -1, -1)
         
         # 应用安装旋转
         look_dir_body = torch.bmm(R_mount, forward_canonical)
