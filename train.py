@@ -7,6 +7,7 @@
 import os
 import gc
 import argparse
+import subprocess
 from collections import defaultdict
 from random import normalvariate
 from datetime import datetime
@@ -323,6 +324,10 @@ class DroneTrainer:
         self.optimizer = AdamW(self.model.parameters(), lr=args.lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, args.num_iters, eta_min=args.lr * 0.01)
         
+        # 恢复优化器 / 调度器 / best-metric 状态（必须在 optimizer/scheduler 创建之后）
+        if args.resume:
+            self._restore_training_state()
+        
         # 损失函数
         self.losser = DroneLoss(
             coef_v=args.coef_v,
@@ -372,9 +377,23 @@ class DroneTrainer:
         self.best_task_iter = -1
         self.task_score_ema = 0.0
         
+    @staticmethod
+    def _get_git_hash():
+        """获取当前 git commit hash，失败时返回 'unknown'。"""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip() if result.returncode == 0 else 'unknown'
+        except Exception:
+            return 'unknown'
+
     def _make_checkpoint(self, iteration, extra=None):
-        """构建完整 checkpoint dict（含模型权重、优化器、调度器、超参数、迭代计数）。"""
+        """构建完整 checkpoint dict（含模型权重、优化器、调度器、超参数、迭代计数、版本号、git hash）。"""
         ckpt = {
+            'version': 2,
+            'git_hash': self._get_git_hash(),
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -386,28 +405,62 @@ class DroneTrainer:
         return ckpt
 
     def _load_model(self, path):
-        """加载模型（兼容旧纯 state_dict 格式与新 checkpoint dict 格式）。"""
+        """加载模型权重（兼容旧纯 state_dict 与新 checkpoint dict），并缓存 ckpt 供后续恢复优化器状态。"""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        # 新格式：dict 含 'model_state_dict' 键
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
             state_dict = ckpt['model_state_dict']
-            saved_args = ckpt.get('args', {})
             saved_iter = ckpt.get('iteration', '?')
-            print(f"[Checkpoint] 迭代={saved_iter}, 超参数已记录")
+            ver = ckpt.get('version', 1)
+            git_hash = ckpt.get('git_hash', '无')
+            print(f"[Checkpoint] v{ver}, 迭代={saved_iter}, git={git_hash}")
+            # 自动 diff 超参数
+            saved_args = ckpt.get('args', {})
             if saved_args:
-                print(f"[Checkpoint] 保存时超参: lr={saved_args.get('lr')}, "
-                      f"batch_size={saved_args.get('batch_size')}, "
-                      f"timesteps={saved_args.get('timesteps')}")
+                current_args = vars(self.args)
+                diffs = []
+                for k in sorted(set(saved_args) | set(current_args)):
+                    old_v, new_v = saved_args.get(k), current_args.get(k)
+                    if old_v != new_v:
+                        diffs.append(f"  {k}: {old_v} → {new_v}")
+                if diffs:
+                    print(f"[Checkpoint] 超参差异 ({len(diffs)} 项):")
+                    for d in diffs:
+                        print(d)
+                else:
+                    print(f"[Checkpoint] 超参与当前一致")
+            self._resume_ckpt = ckpt  # 缓存，供 _restore_training_state 使用
         else:
-            # 旧格式：直接是 state_dict
             state_dict = ckpt
             print(f"[Checkpoint] 旧格式（仅权重），无超参数记录")
+            self._resume_ckpt = None
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
         print(f"Loaded model from {path}")
+
+    def _restore_training_state(self):
+        """从缓存的 checkpoint 恢复优化器、调度器及 best-metric 状态（须在 optimizer/scheduler 创建后调用）。"""
+        ckpt = getattr(self, '_resume_ckpt', None)
+        if ckpt is None:
+            return
+        if 'optimizer_state_dict' in ckpt:
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            print(f"[Resume] 优化器状态已恢复")
+        if 'scheduler_state_dict' in ckpt:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
+        # 恢复 best metric 追踪
+        if 'best_ar' in ckpt:
+            self.best_ar = ckpt['best_ar']
+            self.best_ar_iter = ckpt.get('best_ar_iter', -1)
+            print(f"[Resume] best_ar={self.best_ar:.4f} @ iter {self.best_ar_iter}")
+        if 'best_task_score' in ckpt:
+            self.best_task_score = ckpt['best_task_score']
+            self.best_task_iter = ckpt.get('best_task_iter', -1)
+            print(f"[Resume] best_task_score={self.best_task_score:.4f} @ iter {self.best_task_iter}")
+        del self._resume_ckpt  # 释放引用
     
     def _smooth_dict(self, ori_dict):
         """平滑指标记录"""

@@ -344,9 +344,11 @@ class EvalRunner:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
             state_dict = ckpt['model_state_dict']
-            saved_args = ckpt.get('args', {})
             saved_iter = ckpt.get('iteration', '?')
-            print(f"[Checkpoint] 迭代={saved_iter}, 超参数已记录")
+            ver = ckpt.get('version', 1)
+            git_hash = ckpt.get('git_hash', '无')
+            print(f"[Checkpoint] v{ver}, 迭代={saved_iter}, git={git_hash}")
+            saved_args = ckpt.get('args', {})
             if saved_args:
                 keys = ['lr', 'batch_size', 'timesteps', 'coef_collide',
                         'coef_obj_avoidance', 'coef_drone_collide',
