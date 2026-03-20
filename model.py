@@ -31,7 +31,7 @@ class Model(nn.Module):
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
         act = self.fc(self.act(hx))
-        return act, None, hx
+        return act, img_feat, hx
 
 class Model_bigger(nn.Module):
     def __init__(self, dim_obs=9, dim_action=4) -> None:
@@ -65,7 +65,7 @@ class Model_bigger(nn.Module):
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
         act = self.fc(self.act(hx))
-        return act, None, hx
+        return act, img_feat, hx
 
 
 class Model_adaptive(nn.Module):
@@ -161,7 +161,7 @@ class Model_adaptive(nn.Module):
         # 输出动作
         act = self.fc(self.act(hx))
         
-        return act, None, hx
+        return act, img_feat, hx
 
 
 class Model_640x480(nn.Module):
@@ -217,7 +217,7 @@ class Model_640x480(nn.Module):
         x = self.act(img_feat + self.v_proj(v))
         hx = self.gru(x, hx)
         act = self.fc(self.act(hx))
-        return act, None, hx
+        return act, img_feat, hx
 
 
 # ================================================================
@@ -297,7 +297,7 @@ class Model_attention(nn.Module):
         img_feat = self.stem_fc(feat)
         fused = self.act(img_feat + self.v_proj(v))
         hx = self.gru(fused, hx)
-        return self.fc(self.act(hx)), None, hx
+        return self.fc(self.act(hx)), img_feat, hx
 
 
 # ================================================================
@@ -350,7 +350,7 @@ class Model_multiscale(nn.Module):
         img_feat = self.stem_fc(multi)
         fused = self.act(img_feat + self.v_proj(v))
         hx = self.gru(fused, hx)
-        return self.fc(self.act(hx)), None, hx
+        return self.fc(self.act(hx)), img_feat, hx
 
 
 # ================================================================
@@ -419,7 +419,7 @@ class Model_residual(nn.Module):
         else:
             h, c = self.lstm(fused, hx)
         act = self.fc(self.act(h))
-        return act, None, (h, c)
+        return act, img_feat, (h, c)
 
 
 # ================================================================
@@ -473,7 +473,113 @@ class Model_lightweight(nn.Module):
         img_feat = self.stem_fc(feat)
         fused = self.act(img_feat + self.v_proj(v))
         hx = self.gru(fused, hx)
-        return self.fc(self.act(hx)), None, hx
+        return self.fc(self.act(hx)), img_feat, hx
+
+
+# ================================================================
+# CMA-ES 控制器
+# ================================================================
+
+class DecayController(nn.Module):
+    """
+    CMA-ES 优化的梯度衰减控制器。
+
+    接收主网络 CNN 提取的图像特征（detach），输出 per-sample 的梯度衰减因子。
+    参数由 CMA-ES 进化搜索，不参与梯度训练。
+
+    输出范围: [decay_min, decay_min + decay_range] 通过 sigmoid 映射。
+    默认 [0.2, 1.0]。
+    """
+    def __init__(self, feat_dim=256, decay_min=0.2, decay_range=0.8):
+        super().__init__()
+        self.decay_min = decay_min
+        self.decay_range = decay_range
+        self.linear = nn.Linear(feat_dim, 1)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, img_feat):
+        """
+        Args:
+            img_feat: (B, feat_dim), 从主网络 CNN detach 后的特征
+        Returns:
+            decay: (B,), 每个 sample 的梯度衰减因子
+        """
+        raw = self.linear(img_feat)
+        decay = self.decay_min + self.decay_range * torch.sigmoid(raw)
+        return decay.squeeze(-1)
+
+    def get_params_vector(self):
+        """将所有参数展平为一维向量（CMA-ES 接口）"""
+        return torch.cat([p.data.flatten() for p in self.parameters()])
+
+    def set_params_vector(self, vector):
+        """从一维向量恢复参数（CMA-ES 接口）"""
+        offset = 0
+        for p in self.parameters():
+            numel = p.numel()
+            p.data.copy_(vector[offset:offset + numel].reshape(p.shape))
+            offset += numel
+
+    @property
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+
+class LossGuide(nn.Module):
+    """
+    CMA-ES 进化的损失系数控制器（指导函数）。
+
+    原始参数 → sigmoid[min, max] 映射 → 有界损失权重。
+    参数由 CMA-ES 进化搜索，不参与梯度训练。
+
+    零初始化: sigmoid(0) = 0.5 → 每个系数映射到 [min, max] 中点。
+    """
+    COEFF_NAMES = ['v', 'speed', 'v_pred', 'collide', 'obj_avoidance',
+                   'd_acc', 'd_jerk', 'd_snap', 'ground_affinity', 'bias',
+                   'lateral', 'drone_collide']
+
+    DEFAULT_BOUNDS = {
+        'v':              (0.1, 5.0),
+        'speed':          (0.0, 2.0),
+        'v_pred':         (0.1, 5.0),
+        'collide':        (0.5, 10.0),
+        'obj_avoidance':  (0.3, 8.0),
+        'd_acc':          (0.001, 0.1),
+        'd_jerk':         (0.0001, 0.05),
+        'd_snap':         (0.0, 0.01),
+        'ground_affinity':(0.0, 1.0),
+        'bias':           (0.0, 1.0),
+        'lateral':        (0.0, 1.0),
+        'drone_collide':  (1.0, 10.0),
+    }
+
+    def __init__(self, bounds=None):
+        super().__init__()
+        b = bounds if bounds is not None else self.DEFAULT_BOUNDS
+
+        mins = torch.tensor([b[n][0] for n in self.COEFF_NAMES])
+        maxs = torch.tensor([b[n][1] for n in self.COEFF_NAMES])
+
+        self.register_buffer('mins', mins)
+        self.register_buffer('ranges', maxs - mins)
+
+        self.raw = nn.Parameter(torch.zeros(len(self.COEFF_NAMES)))
+
+    def forward(self):
+        """Returns dict of {name: bounded_coefficient_value}."""
+        bounded = self.mins + self.ranges * torch.sigmoid(self.raw)
+        return {name: bounded[i] for i, name in enumerate(self.COEFF_NAMES)}
+
+    def get_params_vector(self):
+        return self.raw.data.clone()
+
+    def set_params_vector(self, vector):
+        self.raw.data.copy_(vector)
+
+    @property
+    def num_params(self):
+        return self.raw.numel()
 
 
 if __name__ == '__main__':

@@ -401,7 +401,7 @@ class DroneSimulator:
 
         return self._get_state(), obj_to_ros(target_obj)
 
-    def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None):
+    def step(self, act_cmd, target_pos_vector=None, v_wind=None, dt=None, override_grad_decay=None):
         """
         执行一步模拟并更新状态
         
@@ -412,6 +412,8 @@ class DroneSimulator:
                                                   如果为 None，默认使用当前速度 v。
             v_wind (Tensor, optional): 风速向量 (B, 3)。如果不传，则根据 wind_std 随机生成。
             dt (float, optional): 当前步的仿真时间步长。如果为 None，使用初始化时的 self.dt。
+            override_grad_decay: 可选，覆盖默认 grad_decay (标量或 (B,) 张量)。
+                                 CMA-ES DecayController 使用此参数传入 per-sample 衰减因子。
             
         Returns:
             state (Tensor): 将状态扁平化拼接的 Tensor, Shape: (B, 18)。
@@ -445,7 +447,7 @@ class DroneSimulator:
             enable_induced_drag=self.enable_induced_drag,
             dg=self.dg,
             v_wind=v_wind,
-            grad_decay=self.grad_decay,
+            grad_decay=override_grad_decay if override_grad_decay is not None else self.grad_decay,
             # 完整暴露参数
             pitch_ctl_delay=self.pitch_ctl_delay,
             drag_coef_lin=self.drag_coef_lin,

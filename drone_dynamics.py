@@ -50,7 +50,11 @@ class GDecay(torch.autograd.Function):
         Returns:
             tuple: (衰减后的梯度, None)
         """
-        return grad_output * ctx.param, None
+        param = ctx.param
+        # per-sample (B,) 张量需要 unsqueeze 以与 (B, 3) grad_output 广播
+        if isinstance(param, torch.Tensor) and param.dim() == 1 and grad_output.dim() == 2:
+            param = param.unsqueeze(-1)
+        return grad_output * param, None
 
 def g_decay(x, param):
     """
