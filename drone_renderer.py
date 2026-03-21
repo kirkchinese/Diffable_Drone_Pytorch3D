@@ -51,7 +51,7 @@ def build_cam_mount_R(roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0, device=None, bat
     构造相机安装旋转矩阵（机体坐标系内）。
 
     旋转约定（航空惯例，相对于机体 X-forward / Y-left / Z-up）：
-    - pitch: 正值 → 相机向上倾斜（仰视），与参考项目 cam_angle 一致
+    - pitch: 正值 → 相机向上倾斜（仰视）
     - roll:  正值 → 相机向左倾斜
     - yaw:   正值 → 相机向左偏转
 
@@ -83,7 +83,7 @@ def build_cam_mount_R(roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0, device=None, bat
     r = _to_rad(roll_deg)    # roll
     y = _to_rad(yaw_deg)     # yaw
 
-    # Ry(-pitch): 正 pitch → camera looks up (与参考项目一致)
+    # Ry(-pitch): 正 pitch → camera looks up 
     cp, sp = torch.cos(p), torch.sin(p)
     cr, sr = torch.cos(r), torch.sin(r)
     cy, sy = torch.cos(y), torch.sin(y)

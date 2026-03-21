@@ -57,7 +57,9 @@ def parse_args():
     parser.add_argument('--coef_d_acc', type=float, default=0.01, help='加速度正则化权重')
     parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='加加速度正则化权重')
     parser.add_argument('--coef_d_snap', type=float, default=0.0, help='snap正则化权重 (legacy)')
-    parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度惩罚损失权重 (防止飞高规避)')
+    parser.add_argument('--coef_ground_affinity', type=float, default=0.0, help='高度天花板损失权重 (仅惩罚超过 ga_z_ceiling 的高度)')
+    parser.add_argument('--ga_z_ceiling', type=float, default=5.0,
+                        help='高度天花板 (m), 仅在 z > 此值时产生惩罚梯度 (默认 5.0)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
     parser.add_argument('--coef_lateral', type=float, default=0.0, help='横向运动惩罚权重 (速度分解loss中的横向分量，0=横向免罚)')
     parser.add_argument('--coef_drone_collide', type=float, default=5.0,
@@ -126,8 +128,8 @@ def parse_args():
                         help='启用碰撞安全的出生点/目标点采样')
     parser.add_argument('--safe_clearance', type=float, default=1.0,
                         help='安全出生点到障碍物的最小距离')
-    parser.add_argument('--min_spawn_inter_distance', type=float, default=1.0,
-                        help='无人机之间的最小出生点/目标点间距 (米，0=不约束)')
+    parser.add_argument('--min_spawn_inter_distance', type=float, default=0.0,
+                        help='无人机之间的最小出生间距 (米)。0=自动计算,基于 2*margin_max+0.5')
     parser.add_argument('--force_cross_map', action='store_true', default=False,
                         help='强制出生/目标点在场景对向两侧（防止绕行）')
     parser.add_argument('--spawn_z_max', type=float, default=3.0,
@@ -275,6 +277,18 @@ class DroneTrainer:
         print(f"[Camera] HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
+        # 自动计算最小出生间距：必须 > 2*margin_max 以避免出生即碰撞
+        margin_max = getattr(args, 'margin_max', 0.8)
+        min_sid = getattr(args, 'min_spawn_inter_distance', 0.0)
+        safe_min_sid = 2.0 * margin_max + 0.5  # 留 0.5m 余量
+        if min_sid <= 0:
+            min_sid = safe_min_sid
+        elif min_sid < safe_min_sid:
+            print(f"[Warn] min_spawn_inter_distance={min_sid:.1f}m < 2*margin_max+0.5={safe_min_sid:.1f}m, "
+                  f"自动提升至 {safe_min_sid:.1f}m 以避免出生即碰撞")
+            min_sid = safe_min_sid
+        args.min_spawn_inter_distance = min_sid
+
         # 初始化环境
         self.env = DroneSimulator(
             batch_size=args.batch_size,
@@ -305,7 +319,7 @@ class DroneTrainer:
             enable_random_scene=getattr(args, 'random_scene', False),
             scene_generator=self.scene_generator,
             safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
-            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 1.0),
+            min_spawn_inter_distance=args.min_spawn_inter_distance,
             random_init_yaw=getattr(args, 'random_init_yaw', True),
             # 相机安装参数
             cam_mode=getattr(args, 'cam_mode', 'auto'),
@@ -392,6 +406,7 @@ class DroneTrainer:
             window_size=getattr(args, 'window_size', 30),
             loss_v_mode=getattr(args, 'loss_v_mode', 'mse'),
             adaptive_decay_rate=getattr(args, 'adaptive_decay_rate', 2.0),
+            ga_z_ceiling=getattr(args, 'ga_z_ceiling', 5.0),
         )
         # 保存初始系数（LossGuide 模式下用于合并未被进化覆盖的系数）
         self._base_coefs = dict(self.losser.coefs)
@@ -808,7 +823,7 @@ class DroneTrainer:
         v_history = torch.stack(v_history)          # (T, B, 3)
         target_v_history = torch.stack(target_v_history)  # (T, B, 3)
         target_dist_history = torch.stack(target_dist_history)  # (T, B)
-        vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
+        vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, S, B, 3) 子步细分
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
         

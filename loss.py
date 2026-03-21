@@ -37,7 +37,8 @@ class DroneLoss:
                  ctl_dt=0.02,
                  window_size=30,
                  loss_v_mode='mse',
-                 adaptive_decay_rate=2.0):
+                 adaptive_decay_rate=2.0,
+                 ga_z_ceiling=5.0):
         """
         初始化无人机损失函数。
 
@@ -50,7 +51,8 @@ class DroneLoss:
             coef_d_acc (float): 加速度平滑损失权重。
             coef_d_jerk (float): 加加速度（jerk）平滑损失权重。
             coef_d_snap (float): 快照（snap）平滑损失权重。
-            coef_ground_affinity (float): 地面亲和损失权重。
+            coef_ground_affinity (float): 高度天花板损失权重。仅惩罚超过 ga_z_ceiling
+                的飞行高度，正常高度范围内梯度为零。参考项目使用 0.0。
             coef_bias (float): 偏向损失权重。
             coef_lateral (float): 横向运动惩罚权重。0.0=横向完全免罚（推荐），
                 >0时轻微惩罚横向分量以防止绕圈。
@@ -59,11 +61,13 @@ class DroneLoss:
             ctl_dt (float): 控制时间步长，用于缩放导数计算。
             window_size (int): 速度平均窗口大小。
             loss_v_mode (str): 速度损失模式。
-                'mse'        — 参考项目式，SmoothL1(||v̄−target_v||₂)，惩罚所有方向（默认）
+                'mse'        — SmoothL1(||v̄−target_v||₂)，惩罚所有方向（默认）
                 'decomposed' — 分解式，只罚前向速度不足，横向完全免罚
                 'adaptive'   — 自适应式，前向跟踪＋指数衰减制动（终点强制悬停）
             adaptive_decay_rate (float): adaptive 模式的指数衰减率 λ。
                 alpha = exp(-λ * V_target)。λ 越大制动越快开始，默认 2.0。
+            ga_z_ceiling (float): 高度天花板 (ROS Z 轴, 米)。仅在高度 > 此值时产生惩罚梯度。
+                默认 5.0，适用于 spawn_z_max=3 的场景（上方留 2m 余量）。
         """
         self.coefs = {
             'v': coef_v,
@@ -83,6 +87,7 @@ class DroneLoss:
         self.window_size = window_size
         self.loss_v_mode = loss_v_mode
         self.adaptive_decay_rate = adaptive_decay_rate
+        self.ga_z_ceiling = ga_z_ceiling
 
     def barrier(self, x: torch.Tensor, v_to_pt: torch.Tensor) -> torch.Tensor:
         """
@@ -150,8 +155,11 @@ class DroneLoss:
 
         # 损失计算
 
-        # 地面亲和损失：惩罚Z > 0的位置
-        loss_ground_affinity = p_history[..., 2].relu().pow(2).mean()
+        # 高度天花板损失：仅惩罚超过 z_ceiling 的飞行高度
+        # 旧实现 z.relu().pow(2) 惩罚所有高度（含正常飞行高度 1-3m），
+        # 贡献约 40% 总损失，完全淹没导航信号导致训练崩溃。
+        # 新实现：(z - z_ceiling).relu().pow(2)，正常高度梯度为零。
+        loss_ground_affinity = (p_history[..., 2] - self.ga_z_ceiling).relu().pow(2).mean()
         metrics['loss_ground_affinity'] = loss_ground_affinity
 
         # ==================== 速度跟踪损失 ====================
@@ -304,10 +312,15 @@ class DroneLoss:
         metrics['loss_collide'] = loss_collide
 
         # 无人机间碰撞损失 (多机场景)
+        # 与障碍物碰撞损失使用一致的速度加权公式：
+        #   接近中的无人机对 → v_to_drone 大 → 强惩罚
+        #   正在分离的无人机对 → v_to_drone 夹紧为 1 → 仅基础惩罚
+        # 消除旧实现中无速度加权导致的高方差尖峰 (0~2.5 波动)
         if inter_drone_dist_history is not None:
-            drone_dist = to_tensor(inter_drone_dist_history)
-            # softplus(-32 * d) 在 d<0 时急剧增长, 惩罚碰撞
-            loss_drone_collide = F.softplus(drone_dist.mul(-32)).mean()
+            drone_dist = to_tensor(inter_drone_dist_history)  # (T, B)
+            with torch.no_grad():
+                v_to_drone = (-torch.diff(drone_dist, 1, 0) * (1.0 / self.ctl_dt)).clamp_min(1)
+            loss_drone_collide = F.softplus(drone_dist[1:].mul(-32)).mul(v_to_drone).mean()
         else:
             loss_drone_collide = p_history.new_tensor(0.0)
         metrics['loss_drone_collide'] = loss_drone_collide
@@ -335,8 +348,12 @@ class DroneLoss:
         # 附加指标
         with torch.no_grad():
             speed_history = v_history.norm(2, -1)
-            success = torch.all(distance.flatten(0, 1) > 0)
-            metrics['success_rate'] = float(success)
+            # per-drone 碰撞率 (distance 可能有子步维度)
+            if distance.dim() == 3:  # (T, S, B)
+                no_collision = (distance.flatten(0, 1) > 0).all(dim=0)  # (B,)
+            else:  # (T, B)
+                no_collision = (distance > 0).all(dim=0)  # (B,)
+            metrics['success_rate'] = no_collision.float().mean().item()
             metrics['avg_speed'] = speed_history.mean().item()
             metrics['max_speed'] = speed_history.max().item()
 
