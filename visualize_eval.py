@@ -93,8 +93,8 @@ def parse_args():
     # 环境参数 - 渲染（与训练保持一致）
     parser.add_argument('--cam_angle', type=float, default=10,
                         help='相机俯仰角 (度)')
-    parser.add_argument('--min_spawn_inter_distance', type=float, default=1.0,
-                        help='出生/目标点之间的最小间距 (米)')
+    parser.add_argument('--min_spawn_inter_distance', type=float, default=0.0,
+                        help='无人机之间的最小出生间距 (米)。0=自动计算,基于 2*margin_max+0.5')
     parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度，正值=左倾)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度，正值=左转)')
     parser.add_argument('--cam_mode', type=str, default='auto', choices=['auto', 'manual'],
@@ -265,6 +265,16 @@ class EvalRunner:
         print(f"[Camera] 模型相机 HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
+        # 自动计算最小出生间距
+        margin_max = getattr(args, 'margin_max', 0.8)
+        min_sid = getattr(args, 'min_spawn_inter_distance', 0.0)
+        safe_min_sid = 2.0 * margin_max + 0.5
+        if min_sid <= 0:
+            min_sid = safe_min_sid
+        elif min_sid < safe_min_sid:
+            min_sid = safe_min_sid
+        args.min_spawn_inter_distance = min_sid
+
         # ---------- 仿真环境 ----------
         self.env = DroneSimulator(
             batch_size=args.batch_size,
@@ -309,7 +319,7 @@ class EvalRunner:
                 getattr(args, 'dynamic_obs_scale_max', 0.8),
             ),
             # 出生点/目标点间距约束
-            min_spawn_inter_distance=getattr(args, 'min_spawn_inter_distance', 0.0),
+            min_spawn_inter_distance=args.min_spawn_inter_distance,
             # 相机安装参数
             cam_mode=getattr(args, 'cam_mode', 'auto'),
             cam_extrinsic=getattr(args, 'cam_extrinsic', None),

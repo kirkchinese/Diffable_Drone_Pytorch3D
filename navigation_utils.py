@@ -53,6 +53,10 @@ def compute_navigation_metrics_torch(
     collision_history = collision_history.bool()
     speed_history = speed_history.float()
 
+    # collision_history 可能是 (T, B) 或 (T, S, B) (子步细分);
+    # 必须先折叠到 (T*S, B) 再沿 dim=0 取 any，否则结果形状错误
+    if collision_history.dim() == 3:
+        collision_history = collision_history.flatten(0, 1)
     collision_free = ~collision_history.any(dim=0)
     reached_target = (target_dist_history <= reach_radius).any(dim=0)
     success = collision_free & reached_target
