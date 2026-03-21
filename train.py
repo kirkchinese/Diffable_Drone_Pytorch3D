@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
-    parser.add_argument('--render_interval', type=int, default=2, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
+    parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
     
     # 损失函数权重
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')

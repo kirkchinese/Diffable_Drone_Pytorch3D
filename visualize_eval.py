@@ -1003,7 +1003,9 @@ class EvalRunner:
                 coll = int(rec['collision'][t, sample_idx])
                 d2t = rec['dist_to_target'][t, sample_idx]
                 reached = int(d2t <= self.args.reach_radius)
-                prog = max(0.0, min(100.0, nav['progress'] * 100))
+                # 每步进度 = (初始距离 - 当前距离) / 初始距离
+                init_dist = rec['dist_to_target'][0, sample_idx]
+                prog = max(0.0, min(100.0, (1.0 - d2t / max(init_dist, 1e-6)) * 100))
                 dpct = rec['depth_valid_pct'][t, sample_idx]
                 f.write(f'{t},{t * self.ctl_dt:.4f},'
                         f'{p[0]:.4f},{p[1]:.4f},{p[2]:.4f},'
