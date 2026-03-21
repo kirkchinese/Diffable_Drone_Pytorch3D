@@ -200,7 +200,7 @@ class DroneLoss:
 
             else:  # adaptive
                 # ---- 自适应式 ----
-                # Part 1: 前向速度不足惩罚（同 decomposed，横向免罚）
+                # Part 1: 前向速度不足惩罚
                 target_speed = target_slice.norm(p=2, dim=-1)          # (T', B)
                 target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
                 v_fwd = (v_history_avg * target_unit).sum(dim=-1)      # (T', B)
@@ -210,7 +210,7 @@ class DroneLoss:
 
                 # Part 2: 指数衰减制动 — 目标速度越低，制动惩罚越强
                 # alpha = exp(-λ * V_target)
-                #   V_target≈3 m/s (路途) → alpha≈0.002 → 几乎不制动,横向自由
+                #   V_target≈3 m/s (路途) → alpha≈0.002 → 几乎不制动
                 #   V_target≈0   (终点) → alpha≈1.0   → 惩罚全部速度分量
                 alpha = torch.exp(-self.adaptive_decay_rate * target_speed)  # (T', B)
                 v_total = v_history_avg.norm(p=2, dim=-1)                   # (T', B)
@@ -219,7 +219,17 @@ class DroneLoss:
                 loss_v_brake = (alpha * brake_elem).mean()
 
                 loss_v = loss_v_fwd + loss_v_brake
-                loss_lateral = p_history.new_tensor(0.0)
+
+                # Part 3: 横向速度惩罚 — 约束垂直于目标方向的漂移
+                # 修复: adaptive 模式之前横向损失恒为 0 导致无人机飞高逃避障碍物
+                if self.coefs['lateral'] > 0:
+                    v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
+                    loss_lateral = F.smooth_l1_loss(
+                        v_perp.norm(p=2, dim=-1),
+                        torch.zeros(v_perp.shape[:-1], device=v_perp.device))
+                else:
+                    loss_lateral = p_history.new_tensor(0.0)
+
                 metrics['loss_v_fwd'] = loss_v_fwd
                 metrics['loss_v_brake'] = loss_v_brake
         else:
