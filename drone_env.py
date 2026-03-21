@@ -540,6 +540,9 @@ class DroneSimulator:
         """
         按组渲染：每组相机仅看到同组无人机 + 动态障碍物。
 
+        优化：直接使用 render_with_mesh 避免每组 set_dynamic_meshes 使 extend
+        缓存失效的开销，预构建 join_meshes_as_scene + extend 后直接光栅化。
+
         Args:
             renderer: DroneRenderer 或 DroneRendererVariant。
             R_camera: (B, 3, 3) 相机旋转矩阵。
@@ -549,37 +552,73 @@ class DroneSimulator:
         Returns:
             (rgb, depth): 拼接后的 (B, H, W, 3) 和 (B, H, W)。
         """
+        from pytorch3d.structures import join_meshes_as_scene
+
         parent = renderer.parent if hasattr(renderer, 'parent') else renderer
         G = self.n_drones_per_group
         n_groups = len(self._per_group_drone_meshes)
         obs_meshes = self._frame_obs_meshes
         obs_pcds = self._frame_obs_pcds if self._frame_obs_pcds else None
+        base_mesh = parent.mesh  # 静态场景
+
+        # 判断是否可走快速路径 (主渲染器 + tensor 输出)
+        use_fast = (
+            not hasattr(renderer, 'parent')
+            and render_kw.get('return_tensor', False)
+        )
 
         rgb_parts = []
         depth_parts = []
 
-        for g in range(n_groups):
-            sl = slice(g * G, g * G + G)
-            group_meshes = self._per_group_drone_meshes[g] + obs_meshes
-            parent.set_dynamic_meshes(group_meshes, obs_pcds)
-            rgb_g, depth_g = renderer.render(
-                R=R_camera[sl], T=T_camera[sl], **render_kw)
-            if rgb_g is not None:
-                rgb_parts.append(rgb_g)
-            if depth_g is not None:
-                depth_parts.append(depth_g)
+        if use_fast:
+            rw_kw = {k: v for k, v in render_kw.items()
+                     if k in ('return_rgb', 'return_depth')}
 
-        # 不整除的尾部（无对应组，只渲染障碍物）
-        remainder = self.B - n_groups * G
-        if remainder > 0:
-            sl = slice(n_groups * G, self.B)
-            parent.set_dynamic_meshes(obs_meshes or [], obs_pcds)
-            rgb_g, depth_g = renderer.render(
-                R=R_camera[sl], T=T_camera[sl], **render_kw)
-            if rgb_g is not None:
-                rgb_parts.append(rgb_g)
-            if depth_g is not None:
-                depth_parts.append(depth_g)
+            for g in range(n_groups):
+                sl = slice(g * G, g * G + G)
+                group_meshes = self._per_group_drone_meshes[g] + obs_meshes
+                scene_mesh = join_meshes_as_scene([base_mesh] + group_meshes)
+                mesh_ext = scene_mesh.extend(G)
+                rgb_g, depth_g = parent.render_with_mesh(
+                    mesh_ext, R_camera[sl], T_camera[sl], **rw_kw)
+                if rgb_g is not None:
+                    rgb_parts.append(rgb_g)
+                if depth_g is not None:
+                    depth_parts.append(depth_g)
+
+            remainder = self.B - n_groups * G
+            if remainder > 0:
+                sl = slice(n_groups * G, self.B)
+                scene_mesh = join_meshes_as_scene([base_mesh] + obs_meshes) if obs_meshes else base_mesh
+                mesh_ext = scene_mesh.extend(remainder)
+                rgb_g, depth_g = parent.render_with_mesh(
+                    mesh_ext, R_camera[sl], T_camera[sl], **rw_kw)
+                if rgb_g is not None:
+                    rgb_parts.append(rgb_g)
+                if depth_g is not None:
+                    depth_parts.append(depth_g)
+        else:
+            for g in range(n_groups):
+                sl = slice(g * G, g * G + G)
+                group_meshes = self._per_group_drone_meshes[g] + obs_meshes
+                parent.set_dynamic_meshes(group_meshes, obs_pcds)
+                rgb_g, depth_g = renderer.render(
+                    R=R_camera[sl], T=T_camera[sl], **render_kw)
+                if rgb_g is not None:
+                    rgb_parts.append(rgb_g)
+                if depth_g is not None:
+                    depth_parts.append(depth_g)
+
+            remainder = self.B - n_groups * G
+            if remainder > 0:
+                sl = slice(n_groups * G, self.B)
+                parent.set_dynamic_meshes(obs_meshes or [], obs_pcds)
+                rgb_g, depth_g = renderer.render(
+                    R=R_camera[sl], T=T_camera[sl], **render_kw)
+                if rgb_g is not None:
+                    rgb_parts.append(rgb_g)
+                if depth_g is not None:
+                    depth_parts.append(depth_g)
 
         # 最终恢复：设置障碍物 PCD 供碰撞检测 (full_obstacle_pcd) 使用
         parent.set_dynamic_meshes(obs_meshes or [], obs_pcds)
@@ -906,7 +945,7 @@ class DroneSimulator:
         _, vecs = self._knn_query(p)
         return vecs
 
-    def vec_to_obj_subdivided(self, n_subdiv=10, dt=None):
+    def vec_to_obj_subdivided(self, n_subdiv=5, dt=None):
         """
         在子步插值位置上计算到最近障碍物的向量（参考项目 find_vec_to_nearest_pt 的实现）。
 
@@ -1026,7 +1065,7 @@ class DroneSimulator:
 
         return min_dist, min_vec
 
-    def inter_drone_vec_subdivided(self, n_subdiv=10, dt=None):
+    def inter_drone_vec_subdivided(self, n_subdiv=5, dt=None):
         """
         子步细分版本的无人机间距离计算（全向量化，无 Python 循环）。
 
@@ -1072,7 +1111,7 @@ class DroneSimulator:
 
         return vecs
 
-    def combined_vec_to_nearest(self, n_subdiv=10, dt=None):
+    def combined_vec_to_nearest(self, n_subdiv=5, dt=None):
         """
         计算到最近障碍物（包括其他无人机）的向量 (子步细分)。
 

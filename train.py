@@ -9,7 +9,6 @@ import gc
 import argparse
 import subprocess
 from collections import defaultdict
-from random import normalvariate
 from datetime import datetime
 
 import torch
@@ -47,7 +46,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
-    parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
+    parser.add_argument('--render_interval', type=int, default=2, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
     
     # 损失函数权重
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
@@ -225,6 +224,11 @@ class DroneTrainer:
         else:
             self.device = torch.device('cpu')
         print(f"Using device: {self.device}")
+        
+        # GPU 性能优化
+        torch.backends.cudnn.benchmark = True   # 自动选择最快的 cuDNN 卷积算法
+        torch.backends.cuda.matmul.allow_tf32 = True   # 允许 TF32 加速矩阵乘法
+        torch.backends.cudnn.allow_tf32 = True          # 允许 cuDNN TF32
         
         # 控制时间步长 (参考项目使用 1/15 秒)
         self.ctl_dt = getattr(args, 'ctl_dt', 1/15)
@@ -711,9 +715,19 @@ class DroneTrainer:
         prev_decay = None  # 首步使用默认 grad_decay
         decay_history = []
         
+        # 预生成全部时间步的随机 dt (GPU tensor, 避免每步 CPU normalvariate)
+        dt_all = torch.normal(
+            mean=self.ctl_dt,
+            std=self.ctl_dt * 0.1,
+            size=(args.timesteps,),
+            device=self.device,
+        ).clamp(min=self.ctl_dt * 0.5)  # 下限防止负值
+        
+        # 视频帧缓存 (在循环外收集, 避免 save iter 时热循环中的 GPU→CPU 同步)
+        vid_depth_indices = []
+        
         for t in range(args.timesteps):
-            # 随机化控制间隔 (参考项目: mean=ctl_dt, std=0.1*ctl_dt)
-            current_dt = normalvariate(self.ctl_dt, self.ctl_dt * 0.1)
+            current_dt = dt_all[t].item()
             
             # 渲染深度图 - 使用 no_grad() 避免 PyTorch3D 透视投影反向传播的数值问题
             # 这里这个是个大坑，参考项目也是这么做的，我之前没有注意到，不这么做，会导致梯度爆炸，这个问题是在pytorch3d中产生的，问题很隐蔽，查了我很久。
@@ -739,9 +753,9 @@ class DroneTrainer:
                 drone_dist, _ = self.env.inter_drone_distances()
                 inter_drone_dist_list.append(drone_dist)
             
-            # 保存可视化帧 (第5个样本)
+            # 标记需要保存的帧 (延迟到循环结束后批量 CPU 转移)
             if is_save_iter(iteration) and B > 4:
-                vid.append(depth[4].detach().cpu().clone())
+                vid_depth_indices.append((t, depth[4].detach().clone()))
             
             # 更新目标向量 (可选航向漂移)
             if args.yaw_drift:
@@ -792,6 +806,10 @@ class DroneTrainer:
         vec_to_pt_history = torch.stack(vec_to_pt_history)  # (T, B, 3)
         v_preds = torch.stack(v_preds)              # (T, B, 3)
         act_buffer_stacked = torch.stack(act_buffer)  # (T + lag + 1, B, 3)
+        
+        # 批量 GPU→CPU 转移视频帧 (不在热循环中做)
+        for _, frame_gpu in vid_depth_indices:
+            vid.append(frame_gpu.cpu())
 
         # 无人机间碰撞距离历史
         inter_drone_dist_history = torch.stack(inter_drone_dist_list) if inter_drone_dist_list else None

@@ -195,17 +195,17 @@ class DroneRenderer:
         self.mesh = self._load_mesh(mesh_path, subdivide_times=subdivide_times)
         
         # 配置光栅化设置
-        # bin_size=0 → naive 光栅化：跳过 coarse binning 阶段，
-        # 对小分辨率 (48x64) 速度相当且不会 bin 溢出。
-        # 场景障碍物多时（20-40 个，数万面片），默认 binning 容量不够会报
-        # "Bin size was too small in the coarse rasterization phase" 错误。
+        # bin_size=None → auto：PyTorch3D 自动选择 coarse binning 大小，
+        # 配合 max_faces_per_bin 防止 bin 溢出。
+        # 相比 bin_size=0（naive O(F×P)），coarse-to-fine 在面片多时显著更快。
         self.raster_settings = RasterizationSettings(
             image_size=self.image_size, 
             blur_radius=0.0, 
             faces_per_pixel=1, 
             perspective_correct=True,
-            z_clip_value=z_clip_value,  # 近平面裁剪: 解决跨越 z=0 的三角形投影异常
-            bin_size=0,  # naive 光栅化，避免 bin 溢出
+            z_clip_value=z_clip_value,
+            bin_size=None,           # auto coarse-to-fine（替代 naive）
+            max_faces_per_bin=50000, # 防止场景障碍物多时 bin 溢出
         )
         
         # 初始化光照
@@ -481,6 +481,29 @@ class DroneRenderer:
             depth_out = depth_maps.detach().cpu().numpy()
         
         return rgb_out, depth_out
+
+    def render_with_mesh(self, mesh_extended, R, T,
+                         return_rgb=True, return_depth=True):
+        """
+        直接使用预扩展的 mesh 渲染，跳过 extend 缓存机制。
+        用于 per-group 渲染优化：调用方预先构建好 mesh.extend(G)
+        避免每组重复 set_dynamic_meshes → join → extend 的开销。
+        """
+        cameras = PerspectiveCameras(
+            focal_length=self.focal_length,
+            principal_point=self.principal_point,
+            image_size=self.image_size_tensor,
+            in_ndc=False, R=R, T=T, device=self.device,
+        )
+        fragments = self.rasterizer(mesh_extended, cameras=cameras)
+        rgb_images = None
+        depth_maps = None
+        if return_rgb:
+            images = self.shader(fragments, mesh_extended, cameras=cameras)
+            rgb_images = images[..., :3]
+        if return_depth:
+            depth_maps = fragments.zbuf[..., 0]
+        return rgb_images, depth_maps
 
     def compute_view_matrix(self, p_ros, R_ros, camera_pitch_deg=None,
                             cam_offset_body=None, cam_mount_R=None):
