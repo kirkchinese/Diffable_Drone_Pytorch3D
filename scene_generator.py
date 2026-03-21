@@ -817,6 +817,58 @@ class SceneGenerator:
 # 跨地图出生/目标点采样
 # ============================================================
 
+def _greedy_accept_separated(candidates, existing, min_dist):
+    """
+    贪心接受：从 candidates 中选出互相间距 ≥ min_dist 且离 existing 也足够远的点。
+
+    核心优化：在 GPU 上一次性算完所有距离矩阵，再在 CPU 上做贪心选取，
+    避免原来每个候选调 .item() 的 GPU→CPU 同步瓶颈。
+
+    Args:
+        candidates: (C, 3) GPU tensor, 候选点
+        existing:   (M, 3) GPU tensor, 已接受的点 (M 可为 0)
+        min_dist:   float, 最小间距
+
+    Returns:
+        accepted_indices: list[int], 在 candidates 中被接受的索引
+    """
+    C = candidates.shape[0]
+    if C == 0:
+        return []
+
+    # 1) 若有 existing，过滤掉离 existing 太近的候选 (全 GPU)
+    if existing.shape[0] > 0:
+        d_to_ex = torch.cdist(candidates, existing)       # (C, M) GPU
+        far_mask = d_to_ex.min(dim=1).values >= min_dist   # (C,) GPU
+        valid_idx = torch.where(far_mask)[0]
+        if valid_idx.shape[0] == 0:
+            return []
+        candidates_sub = candidates[valid_idx]
+    else:
+        valid_idx = torch.arange(C, device=candidates.device)
+        candidates_sub = candidates
+
+    # 2) 候选间两两距离 (全 GPU，一次性)
+    pair_dist_gpu = torch.cdist(candidates_sub, candidates_sub)  # (C', C')
+
+    # 3) 转 CPU 做贪心 (矩阵很小 ≤ 256×256，转移 <0.1ms)
+    pair_dist = pair_dist_gpu.cpu()
+    Cs = pair_dist.shape[0]
+    accepted_local = []
+    for i in range(Cs):
+        ok = True
+        for j in accepted_local:
+            if pair_dist[i, j].item() < min_dist:
+                ok = False
+                break
+        if ok:
+            accepted_local.append(i)
+
+    # 映射回原始 candidates 索引
+    valid_idx_cpu = valid_idx.cpu()
+    return [int(valid_idx_cpu[i]) for i in accepted_local]
+
+
 @torch.no_grad()
 def sample_cross_map_spawn_target(
     obstacle_pcd,
@@ -885,13 +937,10 @@ def sample_cross_map_spawn_target(
         if not spawn_found.all():
             idx = torch.where(~spawn_found)[0]
             n = idx.shape[0]
-            n_cand = max(n * 4, 32)
+            n_cand = max(n * 8, 64)
 
-            # 沿穿越方向：[-0.9R, -0.2R]（靠近一个边缘）
             along = -(torch.rand(n_cand, device=device) * 0.7 + 0.2) * R
-            # 垂直方向：[-0.8R, 0.8R]
             perp = (torch.rand(n_cand, device=device) - 0.5) * 1.6 * R
-            # 候选点从 idx 中循环取穿越方向
             idx_rep = idx.repeat((n_cand + n - 1) // n)[:n_cand]
             cx = along * cos_t[idx_rep] - perp * sin_t[idx_rep]
             cz = along * sin_t[idx_rep] + perp * cos_t[idx_rep]
@@ -903,32 +952,32 @@ def sample_cross_map_spawn_target(
             dists = knn_points(candidates.unsqueeze(0), obstacle_pcd, K=1).dists.squeeze(0).squeeze(-1).sqrt()
             safe = dists > current_clearance
 
-            # 分配到对应的 batch 元素
-            for k, global_idx in enumerate(idx):
-                # 取该 batch 元素对应的候选点
-                mask_k = (idx_rep == global_idx) & safe
-                safe_cands = candidates[mask_k]
-                if safe_cands.shape[0] > 0 and not spawn_found[global_idx]:
-                    # 检查与已接受出生点的距离
-                    if min_inter_distance > 0 and spawn_found.any():
-                        existing = spawn[spawn_found]
-                        chosen = None
-                        for ci in range(safe_cands.shape[0]):
-                            if (existing - safe_cands[ci]).norm(dim=1).min().item() >= min_inter_distance:
-                                chosen = safe_cands[ci]
-                                break
-                        if chosen is None:
-                            continue
-                        spawn[global_idx] = chosen
-                    else:
+            if min_inter_distance > 0:
+                # 收集所有安全候选（不分 batch 元素），做向量化贪心
+                safe_cands = candidates[safe]
+                if safe_cands.shape[0] > 0:
+                    existing = spawn[spawn_found]
+                    accepted_idx = _greedy_accept_separated(safe_cands, existing, min_inter_distance)
+                    # 分配接受的候选点到对应 batch 元素
+                    safe_idx_rep = idx_rep[safe]
+                    for ai in accepted_idx:
+                        gid = safe_idx_rep[ai].item()
+                        if not spawn_found[gid]:
+                            spawn[gid] = safe_cands[ai]
+                            spawn_found[gid] = True
+            else:
+                for k, global_idx in enumerate(idx):
+                    mask_k = (idx_rep == global_idx) & safe
+                    safe_cands = candidates[mask_k]
+                    if safe_cands.shape[0] > 0 and not spawn_found[global_idx]:
                         spawn[global_idx] = safe_cands[0]
-                    spawn_found[global_idx] = True
+                        spawn_found[global_idx] = True
 
         # ---- 目标点：在穿越方向的"正侧" ----
         if not target_found.all():
             idx = torch.where(~target_found)[0]
             n = idx.shape[0]
-            n_cand = max(n * 4, 32)
+            n_cand = max(n * 8, 64)
 
             along = (torch.rand(n_cand, device=device) * 0.7 + 0.2) * R
             perp = (torch.rand(n_cand, device=device) - 0.5) * 1.6 * R
@@ -943,24 +992,24 @@ def sample_cross_map_spawn_target(
             dists = knn_points(candidates.unsqueeze(0), obstacle_pcd, K=1).dists.squeeze(0).squeeze(-1).sqrt()
             safe = dists > current_clearance
 
-            for k, global_idx in enumerate(idx):
-                mask_k = (idx_rep == global_idx) & safe
-                safe_cands = candidates[mask_k]
-                if safe_cands.shape[0] > 0 and not target_found[global_idx]:
-                    # 检查与已接受目标点的距离
-                    if min_inter_distance > 0 and target_found.any():
-                        existing = target[target_found]
-                        chosen = None
-                        for ci in range(safe_cands.shape[0]):
-                            if (existing - safe_cands[ci]).norm(dim=1).min().item() >= min_inter_distance:
-                                chosen = safe_cands[ci]
-                                break
-                        if chosen is None:
-                            continue
-                        target[global_idx] = chosen
-                    else:
+            if min_inter_distance > 0:
+                safe_cands = candidates[safe]
+                if safe_cands.shape[0] > 0:
+                    existing = target[target_found]
+                    accepted_idx = _greedy_accept_separated(safe_cands, existing, min_inter_distance)
+                    safe_idx_rep = idx_rep[safe]
+                    for ai in accepted_idx:
+                        gid = safe_idx_rep[ai].item()
+                        if not target_found[gid]:
+                            target[gid] = safe_cands[ai]
+                            target_found[gid] = True
+            else:
+                for k, global_idx in enumerate(idx):
+                    mask_k = (idx_rep == global_idx) & safe
+                    safe_cands = candidates[mask_k]
+                    if safe_cands.shape[0] > 0 and not target_found[global_idx]:
                         target[global_idx] = safe_cands[0]
-                    target_found[global_idx] = True
+                        target_found[global_idx] = True
 
         if spawn_found.all() and target_found.all():
             break
@@ -1071,16 +1120,13 @@ def sample_safe_points(
 
         if safe_points.shape[0] > 0:
             if min_inter_distance > 0:
-                # 贪心接受：逐点检查与已接受点的距离
-                for j in range(safe_points.shape[0]):
+                # 向量化贪心：GPU 批量距离 + CPU 贪心选取
+                existing = torch.stack(accepted) if accepted else safe_points.new_zeros(0, 3)
+                idxs = _greedy_accept_separated(safe_points, existing, min_inter_distance)
+                for i in idxs:
                     if len(accepted) >= num_points:
                         break
-                    pt = safe_points[j]
-                    if len(accepted) > 0:
-                        stack = torch.stack(accepted)  # (M, 3)
-                        if (stack - pt).norm(dim=1).min().item() < min_inter_distance:
-                            continue
-                    accepted.append(pt)
+                    accepted.append(safe_points[i])
             else:
                 n_take = min(safe_points.shape[0], n_needed)
                 for j in range(n_take):
@@ -1197,17 +1243,25 @@ def sample_safe_targets(
 
         safe = dists > current_clearance
 
-        # 更新已找到的目标
+        # 更新已找到的目标 — 向量化贪心
         remaining_indices = torch.where(remaining_mask)[0]
-        for i, idx in enumerate(remaining_indices):
-            if safe[i] and not found[idx]:
-                # 检查与已接受目标点的距离
-                if min_inter_distance > 0 and found.any():
-                    existing = targets[found]
-                    if (existing - candidates[i]).norm(dim=1).min().item() < min_inter_distance:
-                        continue
-                targets[idx] = candidates[i]
-                found[idx] = True
+        safe_cand = candidates[safe]
+        safe_rem_idx = remaining_indices[safe]
+        if safe_cand.shape[0] > 0:
+            if min_inter_distance > 0:
+                existing = targets[found] if found.any() else safe_cand.new_zeros(0, 3)
+                accepted_idxs = _greedy_accept_separated(safe_cand, existing, min_inter_distance)
+                for ai in accepted_idxs:
+                    idx = safe_rem_idx[ai]
+                    if not found[idx]:
+                        targets[idx] = safe_cand[ai]
+                        found[idx] = True
+            else:
+                for i in range(safe_cand.shape[0]):
+                    idx = safe_rem_idx[i]
+                    if not found[idx]:
+                        targets[idx] = safe_cand[i]
+                        found[idx] = True
 
     # 对于未找到的，使用高空后备
     if not found.all():

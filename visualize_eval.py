@@ -269,6 +269,11 @@ class EvalRunner:
         margin_max = getattr(args, 'margin_max', 0.8)
         min_sid = getattr(args, 'min_spawn_inter_distance', 0.0)
         safe_min_sid = 2.0 * margin_max + 0.5
+        # 几何上限：cross-map spawn区域 ≈ 2R² 面积中填 N 架无人机
+        arena_r = getattr(args, 'arena_range', 6.0)
+        geo_max = (2.0 * arena_r ** 2 / args.batch_size) ** 0.5
+        if safe_min_sid > geo_max:
+            safe_min_sid = geo_max
         if min_sid <= 0:
             min_sid = safe_min_sid
         elif min_sid < safe_min_sid:
