@@ -287,7 +287,9 @@ class DroneLoss:
                 S = distance.shape[1]
                 v_to_pt = (-torch.diff(distance, 1, 1) * ((S - 1) / self.ctl_dt)).clamp_min(1)
             else:
-                # 单点：沿时间轴 (dim=0) 差分，乘以 9/ctl_dt (= 135 @ 15Hz)
+                # 单点：沿时间轴 (dim=0) 差分
+                # 9.0 因子 = 参考项目默认 S=10 的 (S-1)，使无子步时与有子步时
+                # 产生等量级的碰撞梯度 (参考项目硬编码 *135 = 9/ctl_dt @ 15Hz)
                 v_to_pt = (-torch.diff(distance, 1, 0) * (1.0 / self.ctl_dt) * 9.0).clamp_min(1)
 
         if has_subdiv:

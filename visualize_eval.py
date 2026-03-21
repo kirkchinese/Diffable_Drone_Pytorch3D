@@ -95,8 +95,8 @@ def parse_args():
                         help='相机俯仰角 (度)')
     parser.add_argument('--min_spawn_inter_distance', type=float, default=1.0,
                         help='出生/目标点之间的最小间距 (米)')
-    parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度)')
-    parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度)')
+    parser.add_argument('--cam_mount_roll', type=float, default=0.0, help='相机安装 roll (度，正值=左倾)')
+    parser.add_argument('--cam_mount_yaw', type=float, default=0.0, help='相机安装 yaw (度，正值=左转)')
     parser.add_argument('--cam_mode', type=str, default='auto', choices=['auto', 'manual'],
                         help='相机安装模式: auto=网格比例自动计算, manual=用户3×4外参矩阵')
     parser.add_argument('--cam_extrinsic', type=float, nargs=12, default=None,

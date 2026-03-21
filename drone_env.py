@@ -649,8 +649,9 @@ class DroneSimulator:
                 group_indices = self._per_group_drone_meshes[g]
                 group_meshes = [drone_meshes_lazy[i] for i in group_indices] + obs_meshes
                 parent.set_dynamic_meshes(group_meshes, obs_pcds)
+                g_sl = slice(g * G, (g + 1) * G)
                 rgb_g, depth_g = renderer.render(
-                    R=R_camera[sl], T=T_camera[sl], **render_kw)
+                    R=R_camera[g_sl], T=T_camera[g_sl], **render_kw)
                 if rgb_g is not None:
                     rgb_parts.append(rgb_g)
                 if depth_g is not None:

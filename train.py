@@ -75,9 +75,9 @@ def parse_args():
     # 环境参数 - 渲染
     parser.add_argument('--cam_angle', type=int, default=10, help='相机俯仰角')
     parser.add_argument('--cam_mount_roll', type=float, default=0.0,
-                        help='相机安装横滚角 (度，正值=右倾)')
+                        help='相机安装横滚角 (度，正值=左倾)')
     parser.add_argument('--cam_mount_yaw', type=float, default=0.0,
-                        help='相机安装偏航角 (度，正值=右转)')
+                        help='相机安装偏航角 (度，正值=左转)')
     parser.add_argument('--cam_mode', type=str, default='auto', choices=['auto', 'manual'],
                         help='相机安装模式: auto=网格比例自动计算+随机化, manual=用户3×4外参矩阵')
     parser.add_argument('--cam_extrinsic', type=float, nargs=12, default=None,
@@ -725,12 +725,14 @@ class DroneTrainer:
             size=(args.timesteps,),
             device=self.device,
         ).clamp(min=self.ctl_dt * 0.5)  # 下限防止负值
+        # 一次性转 CPU，避免循环内每步 .item() 触发 GPU→CPU 同步
+        dt_all_cpu = dt_all.tolist()
         
         # 视频帧缓存 (在循环外收集, 避免 save iter 时热循环中的 GPU→CPU 同步)
         vid_depth_indices = []
         
         for t in range(args.timesteps):
-            current_dt = dt_all[t].item()
+            current_dt = dt_all_cpu[t]
             
             # 渲染深度图 - 使用 no_grad() 避免 PyTorch3D 透视投影反向传播的数值问题
             # 这里这个是个大坑，参考项目也是这么做的，我之前没有注意到，不这么做，会导致梯度爆炸，这个问题是在pytorch3d中产生的，问题很隐蔽，查了我很久。
