@@ -281,10 +281,18 @@ class DroneTrainer:
         margin_max = getattr(args, 'margin_max', 0.8)
         min_sid = getattr(args, 'min_spawn_inter_distance', 0.0)
         safe_min_sid = 2.0 * margin_max + 0.5  # 留 0.5m 余量
+        # 几何上限：cross-map spawn区域 ≈ 2R² 面积中填 N 架无人机
+        arena_r = getattr(args, 'arena_range', 6.0)
+        geo_max = (2.0 * arena_r ** 2 / args.batch_size) ** 0.5
+        if safe_min_sid > geo_max:
+            print(f"[Info] min_spawn_inter_distance: 碰撞安全值 {safe_min_sid:.2f}m "
+                  f"> 几何上限 {geo_max:.2f}m (N={args.batch_size}, R={arena_r}), "
+                  f"裁剪至 {geo_max:.2f}m")
+            safe_min_sid = geo_max
         if min_sid <= 0:
             min_sid = safe_min_sid
         elif min_sid < safe_min_sid:
-            print(f"[Warn] min_spawn_inter_distance={min_sid:.1f}m < 2*margin_max+0.5={safe_min_sid:.1f}m, "
+            print(f"[Warn] min_spawn_inter_distance={min_sid:.1f}m < 安全值={safe_min_sid:.1f}m, "
                   f"自动提升至 {safe_min_sid:.1f}m 以避免出生即碰撞")
             min_sid = safe_min_sid
         args.min_spawn_inter_distance = min_sid
