@@ -157,11 +157,11 @@ class DroneLoss:
         # ==================== 速度跟踪损失 ====================
         # 三种模式 (loss_v_mode):
         #   'mse'        — 参考项目式: SmoothL1(||v̄ − target_v||₂)
-        #                  惩罚所有方向偏差（含横向），容易在障碍物前悬停
-        #   'decomposed' — 分解式: SmoothL1(relu(V_target − v_fwd))
-        #                  横向完全免罚，打破悬停局部最优，但终点会绕圈
-        #   'adaptive'   — 自适应式: 前向跟踪 + exp(-λ·V_target) 制动
-        #                  路途横向免罚 + 终点强制悬停，兼顾避障与制动
+        #                  惩罚所有方向偏差（含横向），向量耦合
+        #   'decomposed' — 分解式: SmoothL1(v_fwd, target_speed)
+        #                  前向双向惩罚 + 独立可调的横向惩罚
+        #   'adaptive'   — 自适应式: 前向双向跟踪 + exp(-λ·V_target) 制动
+        #                  路途速度跟踪 + 终点强制制动，横向独立可调
         if T > self.window_size:
             v_history_cum = v_history.cumsum(0)
             v_history_avg = (v_history_cum[self.window_size:] - v_history_cum[:-self.window_size]) / self.window_size
@@ -183,12 +183,12 @@ class DroneLoss:
 
             elif self.loss_v_mode == 'decomposed':
                 # ---- 分解式 ----
+                # 修复: 与adaptive同理，原 relu 单向裁剪导致超速零梯度
                 target_speed = target_slice.norm(p=2, dim=-1)
                 target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
                 v_fwd = (v_history_avg * target_unit).sum(dim=-1)
 
-                shortfall = F.relu(target_speed - v_fwd)
-                loss_v = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
+                loss_v = F.smooth_l1_loss(v_fwd, target_speed)
 
                 if self.coefs['lateral'] > 0:
                     v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
@@ -200,13 +200,15 @@ class DroneLoss:
 
             else:  # adaptive
                 # ---- 自适应式 ----
-                # Part 1: 前向速度不足惩罚
+                # Part 1: 前向速度跟踪（双向惩罚）
+                # 修复: 原 relu(target_speed - v_fwd) 单向裁剪导致超速零梯度
+                #   超速2.5倍时 MSE=2.24, 原adaptive≈0.11 → 超速不受罚
+                #   改为双向 smooth_l1(v_fwd, target_speed)，超速和不足均惩罚
                 target_speed = target_slice.norm(p=2, dim=-1)          # (T', B)
                 target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
                 v_fwd = (v_history_avg * target_unit).sum(dim=-1)      # (T', B)
 
-                shortfall = F.relu(target_speed - v_fwd)
-                loss_v_fwd = F.smooth_l1_loss(shortfall, torch.zeros_like(shortfall))
+                loss_v_fwd = F.smooth_l1_loss(v_fwd, target_speed)
 
                 # Part 2: 指数衰减制动 — 目标速度越低，制动惩罚越强
                 # alpha = exp(-λ * V_target)
