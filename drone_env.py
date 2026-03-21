@@ -80,6 +80,7 @@ class DroneSimulator:
                  # 无人机网格参数
                  drone_mesh_path=None,
                  aero_margin=0.05,
+                 max_drone_faces=500,
                  # 多无人机交互参数
                  n_drones_per_group=1,
                  # 动态障碍物参数
@@ -159,7 +160,8 @@ class DroneSimulator:
             drone_mesh_path = self._resolve_path(drone_mesh_path)
             if os.path.exists(drone_mesh_path):
                 self.drone_mesh, self._drone_centroid, self.drone_bounding_radius = \
-                    load_drone_mesh(drone_mesh_path, device=self.device)
+                    load_drone_mesh(drone_mesh_path, device=self.device,
+                                    max_faces=max_drone_faces)
                 centered = self.drone_mesh.verts_packed() - self._drone_centroid
                 # OBJ Y-up → ROS Z-up 旋转 (等效于绕 X 轴旋转 -90°)：
                 #   body_X = obj_X, body_Y = -obj_Z, body_Z = obj_Y
@@ -175,6 +177,7 @@ class DroneSimulator:
                     device=self.device,
                 )
                 print(f"[DroneSimulator] 无人机网格已加载: {drone_mesh_path}, "
+                      f"faces={self.drone_mesh.faces_packed().shape[0]}, "
                       f"包围球半径={self.drone_bounding_radius:.3f}m, "
                       f"安全半径={self.drone_bounding_radius + aero_margin:.3f}m, "
                       f"相机基准偏移(未缩放)={self._mesh_cam_offset_base.tolist()}")
@@ -506,13 +509,15 @@ class DroneSimulator:
             self._frame_obs_pcds.append(obs.get_transformed_pcd())
 
         # --- 无人机机体网格（按组分） ---
+        self._frame_drone_verts_all = None  # (B, V, 3) 快速路径张量
         if self.drone_mesh is not None and self.n_drones_per_group > 1:
-            all_drone_meshes = self._compose_drone_meshes()
+            verts_all = self._compute_drone_verts()  # (B, V, 3) 纯张量
             G = self.n_drones_per_group
             if self.B <= G:
                 # 单组模式：所有无人机互相可见，直接写入主渲染器，
                 # 便于调试/高分辨率派生渲染器与当前场景状态保持一致。
                 self._per_group_drone_meshes = None
+                all_drone_meshes = self._verts_to_meshes(verts_all)
                 self.renderer.set_dynamic_meshes(
                     all_drone_meshes + self._frame_obs_meshes,
                     self._frame_obs_pcds if self._frame_obs_pcds else None,
@@ -520,8 +525,9 @@ class DroneSimulator:
                 return
 
             n_groups = self.B // G
+            self._frame_drone_verts_all = verts_all  # 缓存供快速路径使用
             self._per_group_drone_meshes = [
-                all_drone_meshes[g * G : g * G + G] for g in range(n_groups)
+                list(range(g * G, g * G + G)) for g in range(n_groups)
             ]
         else:
             self._per_group_drone_meshes = None
@@ -540,8 +546,8 @@ class DroneSimulator:
         """
         按组渲染：每组相机仅看到同组无人机 + 动态障碍物。
 
-        优化：直接使用 render_with_mesh 避免每组 set_dynamic_meshes 使 extend
-        缓存失效的开销，预构建 join_meshes_as_scene + extend 后直接光栅化。
+        快速路径直接用张量拼接构建每组场景网格，跳过 join_meshes_as_scene 和
+        中间 Meshes 对象创建，消除 ~28ms/帧 的 Python 开销。
 
         Args:
             renderer: DroneRenderer 或 DroneRendererVariant。
@@ -552,7 +558,7 @@ class DroneSimulator:
         Returns:
             (rgb, depth): 拼接后的 (B, H, W, 3) 和 (B, H, W)。
         """
-        from pytorch3d.structures import join_meshes_as_scene
+        from pytorch3d.structures import Meshes, join_meshes_as_scene
 
         parent = renderer.parent if hasattr(renderer, 'parent') else renderer
         G = self.n_drones_per_group
@@ -561,10 +567,11 @@ class DroneSimulator:
         obs_pcds = self._frame_obs_pcds if self._frame_obs_pcds else None
         base_mesh = parent.mesh  # 静态场景
 
-        # 判断是否可走快速路径 (主渲染器 + tensor 输出)
+        # 判断是否可走快速路径 (主渲染器 + tensor 输出 + 有缓存的顶点张量)
         use_fast = (
             not hasattr(renderer, 'parent')
             and render_kw.get('return_tensor', False)
+            and self._frame_drone_verts_all is not None
         )
 
         rgb_parts = []
@@ -574,13 +581,49 @@ class DroneSimulator:
             rw_kw = {k: v for k, v in render_kw.items()
                      if k in ('return_rgb', 'return_depth')}
 
+            # ---- 快速路径：张量拼接构建每组场景 ----
+            base_verts = base_mesh.verts_packed()   # (V_b, 3)
+            base_faces = base_mesh.faces_packed()   # (F_b, 3)
+            V_b = base_verts.shape[0]
+
+            # 预拼接动态障碍物网格（所有组共享）
+            if obs_meshes:
+                obs_verts_list = [m.verts_packed() for m in obs_meshes]
+                obs_faces_list = []
+                offset = V_b
+                for m in obs_meshes:
+                    obs_faces_list.append(m.faces_packed() + offset)
+                    offset += m.verts_packed().shape[0]
+                shared_verts = torch.cat([base_verts] + obs_verts_list)
+                shared_faces = torch.cat([base_faces] + obs_faces_list)
+                V_shared = shared_verts.shape[0]
+            else:
+                shared_verts = base_verts
+                shared_faces = base_faces
+                V_shared = V_b
+
+            # 无人机面片模板 + 顶点数
+            drone_faces_tpl = self.drone_mesh.faces_packed()  # (F_d, 3)
+            verts_all = self._frame_drone_verts_all           # (B, V_d, 3)
+            V_d = verts_all.shape[1]
+
+            # 预计算所有组共享的面片偏移
+            drone_offsets = V_shared + torch.arange(
+                G, device=self.device, dtype=torch.long).view(G, 1, 1) * V_d
+            drone_faces_block = (drone_faces_tpl.unsqueeze(0).expand(G, -1, -1)
+                                 + drone_offsets).reshape(-1, 3)  # (G*F_d, 3)
+
             for g in range(n_groups):
-                sl = slice(g * G, g * G + G)
-                group_meshes = self._per_group_drone_meshes[g] + obs_meshes
-                scene_mesh = join_meshes_as_scene([base_mesh] + group_meshes)
+                group_indices = self._per_group_drone_meshes[g]  # list of int
+                # (G, V_d, 3) → (G*V_d, 3)
+                drone_verts_cat = verts_all[group_indices].reshape(-1, 3)
+                combined_verts = torch.cat([shared_verts, drone_verts_cat])
+                combined_faces = torch.cat([shared_faces, drone_faces_block])
+
+                scene_mesh = Meshes(verts=[combined_verts], faces=[combined_faces])
                 mesh_ext = scene_mesh.extend(G)
                 rgb_g, depth_g = parent.render_with_mesh(
-                    mesh_ext, R_camera[sl], T_camera[sl], **rw_kw)
+                    mesh_ext, R_camera[g*G:(g+1)*G], T_camera[g*G:(g+1)*G], **rw_kw)
                 if rgb_g is not None:
                     rgb_parts.append(rgb_g)
                 if depth_g is not None:
@@ -589,7 +632,7 @@ class DroneSimulator:
             remainder = self.B - n_groups * G
             if remainder > 0:
                 sl = slice(n_groups * G, self.B)
-                scene_mesh = join_meshes_as_scene([base_mesh] + obs_meshes) if obs_meshes else base_mesh
+                scene_mesh = Meshes(verts=[shared_verts], faces=[shared_faces])
                 mesh_ext = scene_mesh.extend(remainder)
                 rgb_g, depth_g = parent.render_with_mesh(
                     mesh_ext, R_camera[sl], T_camera[sl], **rw_kw)
@@ -598,9 +641,13 @@ class DroneSimulator:
                 if depth_g is not None:
                     depth_parts.append(depth_g)
         else:
+            # 慢路径：为 DroneRendererVariant 等需要 set_dynamic_meshes 的场景
+            # 按需从缓存的顶点张量创建 Meshes 对象
+            verts_all = self._frame_drone_verts_all
+            drone_meshes_lazy = self._verts_to_meshes(verts_all) if verts_all is not None else []
             for g in range(n_groups):
-                sl = slice(g * G, g * G + G)
-                group_meshes = self._per_group_drone_meshes[g] + obs_meshes
+                group_indices = self._per_group_drone_meshes[g]
+                group_meshes = [drone_meshes_lazy[i] for i in group_indices] + obs_meshes
                 parent.set_dynamic_meshes(group_meshes, obs_pcds)
                 rgb_g, depth_g = renderer.render(
                     R=R_camera[sl], T=T_camera[sl], **render_kw)
@@ -641,6 +688,35 @@ class DroneSimulator:
         return renderer.render(R=R_camera, T=T_camera, **render_kw)
 
     @torch.no_grad()
+    def _compute_drone_verts(self):
+        """
+        批量计算所有无人机的变换后顶点（PyTorch3D 坐标系, 纯张量操作）。
+
+        Returns:
+            verts_all (Tensor): (B, V, 3) 每个无人机的世界坐标顶点。
+        """
+        base_verts = self._drone_verts_centered  # (V, 3)
+        p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3)
+        base_safety = self.drone_bounding_radius + self.aero_margin
+
+        R_pt3d = transform_rot_ros2pt3d(self.R)  # (B, 3, 3)
+        scales = (self.margin / base_safety).view(self.B, 1, 1)  # (B, 1, 1)
+        verts_all = torch.bmm(
+            base_verts.unsqueeze(0).expand(self.B, -1, -1) * scales,
+            R_pt3d.transpose(1, 2)
+        ) + p_pt3d.unsqueeze(1)  # (B, V, 3)
+        return verts_all
+
+    @torch.no_grad()
+    def _verts_to_meshes(self, verts_all):
+        """将 (B, V, 3) 的顶点张量转换为 Meshes 列表（慢路径/单组模式使用）。"""
+        from pytorch3d.structures import Meshes
+        base_faces = self.drone_mesh.faces_packed()
+        base_tex = self.drone_mesh.textures
+        return [Meshes(verts=[verts_all[b]], faces=[base_faces], textures=base_tex)
+                for b in range(self.B)]
+
+    @torch.no_grad()
     def _compose_drone_meshes(self):
         """
         在所有无人机当前位置生成变换后的无人机网格（PyTorch3D 坐标系）。
@@ -648,24 +724,7 @@ class DroneSimulator:
         Returns:
             list[Meshes]: B 个变换后的无人机网格。
         """
-        from pytorch3d.structures import Meshes
-
-        base_verts = self._drone_verts_centered  # (V, 3)
-        base_faces = self.drone_mesh.faces_packed()
-        base_tex = self.drone_mesh.textures
-        p_pt3d = transform_pos_ros2pt3d(self.p)  # (B, 3)
-        base_safety = self.drone_bounding_radius + self.aero_margin
-
-        # 批量计算所有无人机的世界坐标顶点
-        R_pt3d = transform_rot_ros2pt3d(self.R)  # (B, 3, 3)
-        scales = (self.margin / base_safety).view(self.B, 1, 1)  # (B, 1, 1)
-        verts_all = torch.bmm(
-            base_verts.unsqueeze(0).expand(self.B, -1, -1) * scales,
-            R_pt3d.transpose(1, 2)
-        ) + p_pt3d.unsqueeze(1)  # (B, V, 3)
-
-        return [Meshes(verts=[verts_all[b]], faces=[base_faces], textures=base_tex)
-                for b in range(self.B)]
+        return self._verts_to_meshes(self._compute_drone_verts())
 
     def _step_dynamic_obstacles(self, dt):
         """推进所有动态障碍物一步。"""

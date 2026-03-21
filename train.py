@@ -146,13 +146,15 @@ def parse_args():
     parser.add_argument('--disable_airmode', action='store_true', default=False, help='禁用 Airmode')
     
     # 无人机网格与多机交互
-    parser.add_argument('--drone_mesh_path', type=str, default=None,
+    parser.add_argument('--drone_mesh_path', type=str, default="./data/base_model/drone.obj",
                         help='无人机网格路径 (如 ./data/base_model/drone.obj)，'
                              '用于计算安全半径和未来的无人机间渲染')
     parser.add_argument('--n_drones_per_group', type=int, default=None,
                         help='多机分组大小 (默认=batch_size, 即组内全部交互; 1=禁用碰撞检测)')
     parser.add_argument('--aero_margin', type=float, default=0.05,
                         help='无人机包围球之外的气动安全余量 (m)')
+    parser.add_argument('--max_drone_faces', type=int, default=500,
+                        help='无人机网格最大面片数 (超过自动简化, 0=不简化)')
 
     # 动态障碍物
     parser.add_argument('--enable_dynamic_obstacles', action='store_true', default=False,
@@ -314,6 +316,7 @@ class DroneTrainer:
             # 无人机网格与多机交互
             drone_mesh_path=getattr(args, 'drone_mesh_path', None),
             aero_margin=getattr(args, 'aero_margin', 0.05),
+            max_drone_faces=getattr(args, 'max_drone_faces', 500),
             n_drones_per_group=args.n_drones_per_group if args.n_drones_per_group is not None else args.batch_size,
             # 动态障碍物
             enable_dynamic_obstacles=getattr(args, 'enable_dynamic_obstacles', False),

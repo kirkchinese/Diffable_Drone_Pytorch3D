@@ -732,14 +732,18 @@ def compute_drone_safety_radius(drone_mesh_path, device=None, aero_margin=0.05):
     return bounding_radius + aero_margin
 
 
-def load_drone_mesh(drone_mesh_path, device=None, scale=1.0):
+def load_drone_mesh(drone_mesh_path, device=None, scale=1.0, max_faces=500):
     """
     加载无人机网格并返回 Meshes 对象 + 包围球信息。
+
+    面片数超过 max_faces 时自动简化，避免多机渲染时面片爆炸。
+    例: 原始 drone.obj 有 8924 面，16 机 = 142K 面，简化到 500 面后仅 8K 面。
 
     Args:
         drone_mesh_path: .obj 文件路径。
         device: 计算设备。
         scale: 缩放因子 (随机化用)。
+        max_faces: 最大面片数，超过则自动简化。默认 500。
 
     Returns:
         tuple: (mesh, centroid, bounding_radius)
@@ -751,9 +755,18 @@ def load_drone_mesh(drone_mesh_path, device=None, scale=1.0):
         verts = mesh.verts_list()[0]
         verts_rgb = torch.ones_like(verts)[None]
         mesh.textures = TexturesVertex(verts_features=verts_rgb)
+    # 包围球信息必须在简化之前计算，保证物理碰撞半径不受简化影响
     verts = mesh.verts_packed()
     centroid = verts.mean(dim=0)
     bounding_radius = float((verts - centroid).norm(dim=1).max().item())
+    # 面片简化（渲染用低模，碰撞半径保持原始精度）
+    n_faces = mesh.faces_packed().shape[0]
+    if max_faces and max_faces > 0 and n_faces > max_faces:
+        from scene_generator import _decimate_mesh
+        mesh = _decimate_mesh(mesh, max_faces, device=device)
+        n_after = mesh.faces_packed().shape[0]
+        print(f"  [DroneMesh] 简化: {n_faces} → {n_after} faces "
+              f"({(1 - n_after/n_faces)*100:.0f}% 减少)")
     return mesh, centroid, bounding_radius
 
 
