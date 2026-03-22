@@ -33,7 +33,7 @@ class DroneLoss:
                  coef_ground_affinity=0.0,
                  coef_bias=0.0,
                  coef_lateral=0.0,
-                 coef_drone_collide=5.0,
+                 coef_drone_collide=0.0,
                  ctl_dt=0.02,
                  window_size=30,
                  loss_v_mode='mse',
