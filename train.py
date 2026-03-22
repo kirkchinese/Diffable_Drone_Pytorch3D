@@ -34,9 +34,18 @@ from training_monitor import TrainingMonitor
 from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
 
 
+class _ArgParser(argparse.ArgumentParser):
+    """支持 @file 语法从文件读取参数，一行一条，支持整行和行内 # 注释"""
+    def convert_arg_line_to_args(self, line):
+        line = line.split('#')[0].strip()   # 去除行内注释
+        if not line:
+            return []
+        return line.split()
+
+
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='无人机避障训练脚本')
+    parser = _ArgParser(description='无人机避障训练脚本', fromfile_prefix_chars='@')
     
     # 训练参数
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
@@ -62,8 +71,10 @@ def parse_args():
                         help='高度天花板 (m), 仅在 z > 此值时产生惩罚梯度 (默认 5.0)')
     parser.add_argument('--coef_bias', type=float, default=0.0, help='方向偏差损失权重')
     parser.add_argument('--coef_lateral', type=float, default=0.0, help='横向运动惩罚权重 (速度分解loss中的横向分量，0=横向免罚)')
-    parser.add_argument('--coef_drone_collide', type=float, default=5.0,
-                        help='无人机间碰撞损失权重 (仅多机模式生效，参考项目使用5.0)')
+    parser.add_argument('--coef_drone_collide', type=float, default=0.0,
+                        help='[已废弃] 无人机间碰撞损失权重。默认 0.0：无人机碰撞已由 combined_vec_to_nearest '
+                             '统一纳入 collide + obj_avoidance，与参考项目一致。'
+                             '设置 >0 会导致双重惩罚')
     parser.add_argument('--window_size', type=int, default=30, help='速度平均窗口大小')
     parser.add_argument('--loss_v_mode', type=str, default='mse',
                         choices=['mse', 'decomposed', 'adaptive'],
@@ -93,17 +104,18 @@ def parse_args():
                         help='相机 roll/yaw 随机化半径 (度) (仅auto模式)')
     parser.add_argument('--image_height', type=int, default=48, help='图像高度')
     parser.add_argument('--image_width', type=int, default=64, help='图像宽度')
-    parser.add_argument('--hfov', type=float, default=90.0,
-                        help='相机水平视场角 (度)，默认90°。焦距由 FOV 和图像宽度自动计算')
+    parser.add_argument('--hfov', type=float, default=79.0,
+                        help='相机水平视场角 (度)。默认 79° 对齐参考项目多机配置 '
+                             '(fov_x_half_tan=0.82 → 78.7°)。焦距由 FOV 和图像宽度自动计算')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj', help='障碍物网格路径')
     parser.add_argument('--num_samples', type=int, default=100000, help='障碍物点云采样数')
     parser.add_argument('--subdivide_times', type=int, default=0,
                         help='网格细分次数 (默认0, 配合z_clip无质量损失且渲染快)')
     parser.add_argument('--depth_min', type=float, default=0.3,
                         help='深度图近截断距离 (米)，近于此的深度被截断。同时也是渲染器近平面裁剪值')
-    parser.add_argument('--depth_max', type=float, default=10.0,
+    parser.add_argument('--depth_max', type=float, default=24.0,
                         help='深度图远截断距离 (米)，远于此的深度被截断。'
-                             '参考项目使用 24.0；过小会导致模型"近视"来不及避障')
+                             '对齐参考项目 24.0')
     # parser.add_argument('--depth_dilate', type=int, default=0,
     #                     help='深度图障碍物膨胀核大小 (奇数, 0=禁用)。'
     #                          'stride=1 max_pool2d 使障碍物在深度图中向外扩展，'
@@ -642,7 +654,6 @@ class DroneTrainer:
         target_v_history = []
         target_dist_history = []
         vec_to_pt_history = []
-        inter_drone_dist_list = []
         v_preds = []
         vid = []
         
@@ -757,8 +768,10 @@ class DroneTrainer:
         for t in range(args.timesteps):
             current_dt = dt_all_cpu[t]
             
-            # 渲染深度图 - 使用 no_grad() 避免 PyTorch3D 透视投影反向传播的数值问题
-            # 这里这个是个大坑，参考项目也是这么做的，我之前没有注意到，不这么做，会导致梯度爆炸，这个问题是在pytorch3d中产生的，问题很隐蔽，查了我很久。
+            # 渲染深度图 - no_grad()
+            # 参考项目验证：渲染管线不参与梯度反向传播。参考项目 CUDA raycasting
+            # 写入 torch.empty (切断计算图)，梯度仅通过物理模拟路径回传。
+            # PyTorch3D 同理：深度图仅作为 sensor（状态→观测），不是可微路径。
             # 跳帧优化: 深度图不参与梯度计算, 相邻帧变化很小, 可隔帧渲染节省开销
             if t % args.render_interval == 0:
                 with torch.no_grad():
@@ -775,11 +788,6 @@ class DroneTrainer:
             # 记录 step 之前的状态 (与参考项目一致)
             p_history.append(self.env.p)
             vec_to_pt_history.append(self.env.combined_vec_to_nearest(dt=current_dt))
-
-            # 无人机间碰撞距离（用于专用的无人机碰撞损失）
-            if self.env.n_drones_per_group > 1:
-                drone_dist, _ = self.env.inter_drone_distances()
-                inter_drone_dist_list.append(drone_dist)
             
             # 标记需要保存的帧 (延迟到循环结束后批量 CPU 转移)
             if is_save_iter(iteration) and B > 4:
@@ -814,13 +822,6 @@ class DroneTrainer:
                         prev_decay = self.decay_controller(img_feat.detach())
                     decay_history.append(prev_decay)
 
-            # Truncated BPTT: 每 30 步截断隐状态梯度
-            if t > 0 and t % 30 == 0:
-                if isinstance(h, tuple):
-                    h = tuple(t_.detach() for t_ in h)
-                else:
-                    h = h.detach()
-            
             v_preds.append(v_pred)
             act_buffer.append(act_cmd)
             
@@ -839,8 +840,6 @@ class DroneTrainer:
         for _, frame_gpu in vid_depth_indices:
             vid.append(frame_gpu.cpu())
 
-        # 无人机间碰撞距离历史
-        inter_drone_dist_history = torch.stack(inter_drone_dist_list) if inter_drone_dist_list else None
         
         # CMA-ES LossGuide: 注入进化的损失系数
         if self.loss_guide is not None:
@@ -862,7 +861,7 @@ class DroneTrainer:
             v_preds=v_preds,
             env_margin=self.env.margin,
             env_g_std=self.g_std,
-            inter_drone_dist_history=inter_drone_dist_history,
+            inter_drone_dist_history=None,
         )
         
         # 计算额外指标
@@ -964,10 +963,9 @@ class DroneTrainer:
                     print("Loss is NaN, exiting...")
                     break
                 
-                # 反向传播
+                # 反向传播 (参考项目不使用梯度裁剪)
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
                 self.scheduler.step()
             except torch.cuda.OutOfMemoryError:

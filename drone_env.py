@@ -245,6 +245,18 @@ class DroneSimulator:
         low, high = self.init_margin_range
         self.margin = torch.rand((self.B,), device=self.device) * (high - low) + low
 
+        # Per-sample 域随机化（对齐参考项目 env_cuda.py）
+        # pitch_ctl_delay: 正态分布 N(12, 1.2²), 形状 (B, 1) 供 dynamics 广播
+        self._pitch_ctl_delay_sample = (
+            self.pitch_ctl_delay
+            + 1.2 * torch.randn((self.B, 1), device=self.device)
+        )
+        # drag_coef_lin: 均匀分布 U[0.3, 0.45], 形状 (B, 1)
+        # 参考项目: drag_2 = rand(B,2)*0.15+0.3; drag_2[:,0]=0 (二次项=0, 线性项∈[0.3,0.45])
+        self._drag_coef_lin_sample = (
+            torch.rand((self.B, 1), device=self.device) * 0.15 + 0.3
+        )
+
         return self._get_state()
 
     def get_scaled_cam_offset(self):
@@ -451,9 +463,9 @@ class DroneSimulator:
             dg=self.dg,
             v_wind=v_wind,
             grad_decay=override_grad_decay if override_grad_decay is not None else self.grad_decay,
-            # 完整暴露参数
-            pitch_ctl_delay=self.pitch_ctl_delay,
-            drag_coef_lin=self.drag_coef_lin,
+            # 完整暴露参数（使用 per-sample 域随机化值）
+            pitch_ctl_delay=self._pitch_ctl_delay_sample,
+            drag_coef_lin=self._drag_coef_lin_sample,
             drag_coef_quad=self.drag_coef_quad,
             z_drag_coef=self.z_drag_coef,
             rotor_drag_coef=self.rotor_drag_coef,
@@ -1005,7 +1017,7 @@ class DroneSimulator:
         _, vecs = self._knn_query(p)
         return vecs
 
-    def vec_to_obj_subdivided(self, n_subdiv=5, dt=None):
+    def vec_to_obj_subdivided(self, n_subdiv=10, dt=None):
         """
         在子步插值位置上计算到最近障碍物的向量（参考项目 find_vec_to_nearest_pt 的实现）。
 
@@ -1125,15 +1137,22 @@ class DroneSimulator:
 
         return min_dist, min_vec
 
-    def inter_drone_vec_subdivided(self, n_subdiv=5, dt=None):
+    def inter_drone_vec_subdivided(self, n_subdiv=10, dt=None):
         """
         子步细分版本的无人机间距离计算（全向量化，无 Python 循环）。
 
         沿轨迹 p + v * t 均匀采样 n_subdiv 个点，
         计算每个子步位置处到同组最近无人机的向量。
 
+        与参考项目 CUDA kernel nearest_pt_cuda_kernel 对齐：
+        1. 使用椭球距离 sqrt(dx²+dy²+4·dz²) 作为距离度量
+        2. 减去对方无人机的包围球半径（参考项目硬编码 0.15）
+        3. 返回的向量 L2 范数 = 椭球距离 - 对方半径，方向沿中心连线
+           → 使 loss 中 norm(vec) 直接得到与参考项目一致的距离
+
         Returns:
-            vecs: (S, B, 3) 各子步位置到最近同组无人机的向量。
+            vecs: (S, B, 3) 各子步位置到最近同组无人机的调整向量。
+                  norm(vec) = ellipsoid_distance - drone_bounding_radius
         """
         if self.n_drones_per_group <= 1:
             current_dt = dt if dt is not None else self.dt
@@ -1158,9 +1177,16 @@ class DroneSimulator:
             self._inter_drone_eye_mask = torch.eye(G, device=self.device, dtype=torch.bool).unsqueeze(0)
         ellipsoid_dist = ellipsoid_dist.masked_fill(self._inter_drone_eye_mask, 1e6)
 
-        _, min_idx = ellipsoid_dist.min(dim=2)  # (S*n_groups, G)
+        min_ell_dist, min_idx = ellipsoid_dist.min(dim=2)  # (S*n_groups, G)
         min_idx_exp = min_idx.unsqueeze(-1).expand(-1, -1, 3)
         min_vec_grouped = diff.gather(2, min_idx_exp.unsqueeze(2)).squeeze(2)  # (S*n_groups, G, 3)
+
+        # 对齐参考项目: dist = max(1e-3, ellipsoid_dist - drone_r)
+        # 将向量缩放使其 L2 范数 = adjusted ellipsoid distance
+        center_dist = min_vec_grouped.norm(dim=-1, keepdim=True)  # (S*n_groups, G, 1)
+        adjusted_dist = (min_ell_dist.unsqueeze(-1) - self.drone_bounding_radius).clamp(min=1e-3)
+        scale = adjusted_dist / (center_dist + 1e-8)
+        min_vec_grouped = min_vec_grouped * scale
 
         # 还原: (S*n_groups, G, 3) -> (S, n_groups*G, 3)
         vecs = min_vec_grouped.view(S, n_groups * G, 3)
@@ -1171,12 +1197,15 @@ class DroneSimulator:
 
         return vecs
 
-    def combined_vec_to_nearest(self, n_subdiv=5, dt=None):
+    def combined_vec_to_nearest(self, n_subdiv=10, dt=None):
         """
         计算到最近障碍物（包括其他无人机）的向量 (子步细分)。
 
         融合静态障碍物和动态无人机的最近点查询：
         对每个子步取两者中距离更近者。
+
+        与参考项目一致：无人机碰撞统一通过 collide + obj_avoidance 处理，
+        无需额外的 drone_collide 损失项（避免双重计数）。
 
         Returns:
             vecs: (S, B, 3) 到最近物体（障碍物或无人机）的向量。

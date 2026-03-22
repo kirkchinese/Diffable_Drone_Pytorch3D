@@ -1,0 +1,53 @@
+# 多机编队配置 (8机/组)
+# 对齐参考项目 multi_agent.args (DiffPhysDrone)
+# 用法: python train.py @configs/multi_agent.args --save_dir ./checkpoints/xxx --gpu 0
+
+# ── 编队规模 ──────────────────────────────────────────────────────────
+--n_drones_per_group 8
+--batch_size 64
+
+# ── 训练超参 ──────────────────────────────────────────────────────────
+--num_iters 5000
+--timesteps 180
+--lr 1e-3
+--grad_decay 0.4
+
+# ── 场景生成 ──────────────────────────────────────────────────────────
+--random_scene
+--safe_spawn
+--safe_clearance 1.0
+--force_cross_map
+--spawn_z_max 3.0
+--arena_range 10.0
+--num_samples 50000
+--enable_dynamic_obstacles
+
+# ── 相机 / 渲染 ───────────────────────────────────────────────────────
+--image_height 48
+--image_width 64
+--hfov 79
+--depth_max 24.0
+--cam_angle 10
+--cam_rand_rpy 2.0
+--cam_rand_xy 0.02
+
+# ── 损失函数权重 (对齐参考项目多机值) ───────────────────────────────
+--coef_v 1.0
+--coef_v_pred 2.0
+--coef_collide 5.0
+--coef_obj_avoidance 2.0
+--coef_d_acc 0.01
+--coef_d_jerk 0.001
+--coef_lateral 0.5
+
+# ── 自适应损失 ────────────────────────────────────────────────────────
+--loss_v_mode adaptive
+--adaptive_decay_rate 2.0
+--window_size 30
+--margin_min 0.3
+--margin_max 0.8
+--noise_std 0.04
+
+# ── 其他 ──────────────────────────────────────────────────────────────
+--random_init_yaw
+--save_freq 100
