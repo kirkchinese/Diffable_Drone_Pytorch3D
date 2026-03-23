@@ -4,7 +4,7 @@
 
 # ── 编队规模 ──────────────────────────────────────────────────────────
 --n_drones_per_group 8
---batch_size 64
+--batch_size 32
 
 # ── 训练超参 ──────────────────────────────────────────────────────────
 --num_iters 5000
@@ -19,6 +19,7 @@
 --force_cross_map
 --spawn_z_max 3.0
 --arena_range 10.0
+--ground_ratio 0.6
 --num_samples 50000
 --enable_dynamic_obstacles
 
@@ -51,3 +52,6 @@
 # ── 其他 ──────────────────────────────────────────────────────────────
 --random_init_yaw
 --save_freq 100
+--ga_z_ceiling 3 
+--coef_ground_affinity 0.01
+

@@ -186,7 +186,13 @@ class DroneSimulator:
 
         # 渲染器初始化
         mesh_path = self._resolve_path(mesh_path)
-        print(f"Loading mesh from: {mesh_path}")
+        # random_scene 模式下，初始网格仅作为渲染器骨架，首帧前即被 randomize_scene() 替换
+        # 跳过昂贵的点云采样 (num_samples 个点)，改为最小采样
+        init_num_samples = 1 if enable_random_scene else num_samples
+        if enable_random_scene:
+            print(f"[Renderer] 加载占位网格: {mesh_path} (随机场景模式, 跳过点云采样)")
+        else:
+            print(f"Loading mesh from: {mesh_path}")
         self.renderer = DroneRenderer(
             mesh_path=mesh_path,
             device=self.device,
@@ -194,7 +200,7 @@ class DroneSimulator:
             focal_length=focal_length,
             principal_point=principal_point,
             lights_location=lights_location,
-            num_samples=num_samples,
+            num_samples=init_num_samples,
             subdivide_times=subdivide_times,
             z_clip_value=z_clip_value,
         )
