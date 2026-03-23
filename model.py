@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class Model(nn.Module):
@@ -498,6 +499,10 @@ class DecayController(nn.Module):
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
+        # 所有参数冻结 — 仅由 CMA-ES 进化
+        for p in self.parameters():
+            p.requires_grad_(False)
+
     def forward(self, img_feat):
         """
         Args:
@@ -566,6 +571,10 @@ class LossGuide(nn.Module):
 
         self.raw = nn.Parameter(torch.zeros(len(self.COEFF_NAMES)))
 
+        # 所有参数冻结 — 仅由 CMA-ES 进化
+        for p in self.parameters():
+            p.requires_grad_(False)
+
     def forward(self):
         """Returns dict of {name: bounded_coefficient_value}."""
         bounded = self.mins + self.ranges * torch.sigmoid(self.raw)
@@ -580,6 +589,255 @@ class LossGuide(nn.Module):
     @property
     def num_params(self):
         return self.raw.numel()
+
+
+# ================================================================
+# MetaController — A-网络实现
+# ================================================================
+
+class MetaController(nn.Module):
+    """
+    A-网络 (Meta Controller): 元控制器。
+
+    生物学类比:
+      - 参数在个体"生命周期"（= 一轮训练）内固定，仅由种群级进化 (CMA-ES) 更新
+      - 观察"个体"（= 策略网络）的训练状态，动态输出学习信号的调制
+      - 状态性 (stateful): 内部维护训练统计的指数移动平均，
+        使得相同参数在训练的不同阶段产生不同输出
+
+    与 LossGuide 的核心区别:
+      - LossGuide: f() → 固定常数 (无输入, 12D 查找表)
+      - MetaController: f(training_state) → 动态调制 (有输入, 条件响应网络)
+
+    架构: Linear(N_IN, hidden) + Tanh + Linear(hidden, N_OUT)
+    默认 8 输入 × 4 隐层 × 6 输出 = 66 参数, CMA-ES 高效搜索范围内。
+    """
+
+    # 输出系数名与边界
+    OUTPUT_KEYS = ['v', 'collide', 'obj_avoidance', 'd_acc', 'lateral', 'grad_decay']
+    OUTPUT_BOUNDS = {
+        'v':              (0.1, 5.0),
+        'collide':        (0.5, 15.0),
+        'obj_avoidance':  (0.3, 8.0),
+        'd_acc':          (0.001, 0.1),
+        'lateral':        (0.0, 2.0),
+        'grad_decay':     (0.2, 0.8),
+    }
+
+    # 输入特征名 (供外部参考)
+    INPUT_KEYS = [
+        'progress',         # 训练进度 [0, 1]
+        'loss_v',           # 速度损失 EMA (log1p 归一化)
+        'loss_collide',     # 碰撞损失 EMA (log1p 归一化)
+        'loss_obj',         # 障碍物回避损失 EMA (log1p 归一化)
+        'success_rate',     # 成功率 EMA [0, 1]
+        'collision_rate',   # 碰撞率 EMA [0, 1] (= 1 - collision_free_rate)
+        'avg_speed',        # 平均速度 EMA (归一化至 ~[0,1])
+        'goal_progress',    # 目标进度 EMA [0, 1]
+    ]
+    N_INPUT = len(INPUT_KEYS)
+    N_OUTPUT = len(OUTPUT_KEYS)
+
+    def __init__(self, hidden: int = 4, ema_alpha: float = 0.1):
+        super().__init__()
+        bounds = self.OUTPUT_BOUNDS
+
+        mins = torch.tensor([bounds[k][0] for k in self.OUTPUT_KEYS])
+        maxs = torch.tensor([bounds[k][1] for k in self.OUTPUT_KEYS])
+        self.register_buffer('mins', mins)
+        self.register_buffer('ranges', maxs - mins)
+
+        # 小型 MLP — 参数由 CMA-ES 进化
+        self.fc1 = nn.Linear(self.N_INPUT, hidden)
+        self.fc2 = nn.Linear(hidden, self.N_OUTPUT)
+        nn.init.zeros_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+        # 所有参数冻结 — 仅由 CMA-ES 进化
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        # 训练状态 EMA 追踪 (不是模型参数，不参与 CMA-ES)
+        self.ema_alpha = ema_alpha
+        self._ema: dict[str, float] = {}
+
+    def reset_ema(self):
+        """新一轮训练/评估前重置 EMA 统计"""
+        self._ema.clear()
+
+    def update_ema(self, metrics: dict):
+        """用 episode 结果更新训练状态 EMA"""
+        alpha = self.ema_alpha
+        for key in ('loss_v', 'loss_collide', 'loss_obj_avoidance',
+                     'success_rate', 'collision_free_rate', 'avg_speed', 'goal_progress'):
+            val = metrics.get(key)
+            if val is None:
+                continue
+            v = val.item() if isinstance(val, torch.Tensor) else float(val)
+            if key in self._ema:
+                self._ema[key] = (1 - alpha) * self._ema[key] + alpha * v
+            else:
+                self._ema[key] = v
+
+    def _build_input(self, progress: float) -> torch.Tensor:
+        """将 EMA 统计 + 训练进度组装为网络输入张量 (GPU-only)"""
+        device = self.mins.device
+        raw = torch.tensor([
+            progress,
+            self._ema.get('loss_v', 1.0),
+            self._ema.get('loss_collide', 1.0),
+            self._ema.get('loss_obj_avoidance', 0.5),
+            self._ema.get('success_rate', 0.0),
+            1.0 - self._ema.get('collision_free_rate', 0.5),  # collision_rate
+            min(self._ema.get('avg_speed', 0.5) / 3.0, 1.0),  # 归一化
+            self._ema.get('goal_progress', 0.0),
+        ], dtype=torch.float32, device=device)
+        # log1p 归一化: 索引 1,2,3 (loss_v, loss_collide, loss_obj)
+        raw[1:4] = torch.log1p(raw[1:4])
+        return raw
+
+    def forward(self, progress: float) -> dict:
+        """
+        Args:
+            progress: 当前训练迭代 / 总迭代数, [0, 1]
+        Returns:
+            dict of {name: bounded_value} — loss 系数 + grad_decay
+        """
+        x = self._build_input(progress)
+        h = torch.tanh(self.fc1(x))
+        raw = self.fc2(h)
+        bounded = self.mins + self.ranges * torch.sigmoid(raw)
+        return {k: bounded[i] for i, k in enumerate(self.OUTPUT_KEYS)}
+
+    # ---- CMA-ES 接口 ----
+    def get_params_vector(self):
+        return torch.cat([p.data.flatten() for p in self.parameters()])
+
+    def set_params_vector(self, vector):
+        offset = 0
+        for p in self.parameters():
+            n = p.numel()
+            p.data.copy_(vector[offset:offset + n].reshape(p.shape))
+            offset += n
+
+    @property
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+
+# ================================================================
+# LossNetwork — A-网络: 进化的损失函数
+# ================================================================
+
+class LossNetwork(nn.Module):
+    """
+    A-网络 (Loss Network): 进化的损失函数。
+
+    生物学类比:
+      - 多巴胺/血清素等神经调质系统的"连线方式"由基因决定 (进化固定)
+      - 这些系统不直接产生行为, 而是调制突触可塑性 (= B-网络的学习规则)
+      - LossNetwork 正是这种调制: 它接收训练信号, 输出标量损失,
+        梯度通过它流向策略网络 — 它 **定义** 了策略网络"如何学习"
+
+    与 MetaController 的核心区别:
+      - MetaController: 输出系数 → 仍然是预定义损失项的线性组合 Σ c_i × L_i
+      - LossNetwork: 本身就是损失函数 → 可以学习任意非线性损失组合,
+        包括: 条件权重 (碰撞时降低速度惩罚), 交互项 (speed × collision),
+        训练阶段自适应等, 远超线性加权的表达力
+
+    架构: Linear(13, hidden) + LeakyReLU(0.1) + Linear(hidden, 1)
+    输入: 12个损失分量 (可微, 在计算图中) + 训练进度 (标量上下文)
+    输出: 标量损失值 — 梯度通过此输出回传到策略网络 (B-网络)
+
+    关键设计:
+      - requires_grad=False: 参数不参与梯度优化, 仅由 CMA-ES 进化
+      - 前向传播在计算图中: 梯度必须流过此网络到达策略网络 (不能 no_grad)
+      - LeakyReLU: 正输入为恒等映射, 保证温启动时精确复现线性组合
+      - 温启动: 初始行为 = Σ coef_i × loss_i (恒等初始化 + 默认系数)
+        CMA-ES 从此起点搜索非线性改进
+    """
+
+    LOSS_KEYS = [
+        'v', 'lateral', 'speed', 'v_pred', 'collide',
+        'obj_avoidance', 'd_acc', 'd_jerk', 'd_snap',
+        'ground_affinity', 'bias', 'drone_collide',
+    ]
+    N_LOSS = len(LOSS_KEYS)  # 12
+
+    def __init__(self, hidden: int = 16, default_coefs: dict = None):
+        super().__init__()
+        dim_in = self.N_LOSS + 1  # 12 losses + 1 progress
+        self.fc1 = nn.Linear(dim_in, hidden)
+        self.fc2 = nn.Linear(hidden, 1, bias=False)
+
+        # ---- 温启动初始化 ----
+        # fc1: 前 N_LOSS 个隐层神经元 = 损失项的恒等映射
+        #   weight[i, i] = 1.0, 其余 = 0
+        #   → h_i = LeakyReLU(loss_i) = loss_i (因为 loss_i ≥ 0)
+        # fc2: 对应默认系数
+        #   weight[0, i] = coef_i
+        # 初始行为: output = Σ coef_i × loss_i = 精确等于当前线性组合
+        # 额外 (hidden - N_LOSS) 个神经元: 全零, CMA-ES 可激活用于交互项
+        nn.init.zeros_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)
+
+        if default_coefs is None:
+            default_coefs = {}
+        for i, key in enumerate(self.LOSS_KEYS):
+            if i < hidden:
+                self.fc1.weight.data[i, i] = 1.0
+                self.fc2.weight.data[0, i] = default_coefs.get(key, 0.0)
+
+        # 所有参数冻结 — 仅由 CMA-ES 进化
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, loss_dict: dict, progress: float) -> torch.Tensor:
+        """
+        组合各损失分量为标量损失。
+
+        IMPORTANT: 此方法在计算图中执行 — 不要包在 torch.no_grad() 中!
+        梯度流: LossNetwork 输出 → 各损失分量 → 轨迹 → 策略网络 (B-网络)
+
+        Args:
+            loss_dict: DroneLoss.forward() 返回的 metrics dict,
+                       其中 loss_* 条目是在计算图中的张量
+            progress: 训练进度 [0, 1]
+        Returns:
+            标量损失张量 (在计算图中, 可 .backward())
+        """
+        parts = []
+        for key in self.LOSS_KEYS:
+            val = loss_dict.get(f'loss_{key}')
+            if val is not None and isinstance(val, torch.Tensor):
+                parts.append(val)
+            else:
+                # 确保 fallback 在正确 device 上 (GPU-only)
+                parts.append(self.fc1.weight.new_zeros(()))
+        # progress 作为上下文输入 (不在计算图中, 但不影响梯度流向损失分量)
+        parts.append(self.fc1.weight.new_tensor(progress))
+        x = torch.stack(parts)  # (dim_in,)
+
+        h = F.leaky_relu(self.fc1(x), negative_slope=0.1)  # (hidden,)
+        return self.fc2(h).squeeze(-1)  # scalar
+
+    # ---- CMA-ES 接口 ----
+    def get_params_vector(self) -> torch.Tensor:
+        return torch.cat([p.data.flatten() for p in self.parameters()])
+
+    def set_params_vector(self, vector: torch.Tensor):
+        offset = 0
+        for p in self.parameters():
+            n = p.numel()
+            p.data.copy_(vector[offset:offset + n].reshape(p.shape))
+            offset += n
+
+    @property
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
 
 if __name__ == '__main__':

@@ -71,8 +71,17 @@ from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov, build_ca
 # 参数解析
 # ================================================================
 
+class _ArgParser(argparse.ArgumentParser):
+    """支持 @file 语法从文件读取参数，一行一条，支持整行和行内 # 注释"""
+    def convert_arg_line_to_args(self, line):
+        line = line.split('#')[0].strip()
+        if not line:
+            return []
+        return line.split()
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='无人机飞行可视化验证')
+    parser = _ArgParser(description='无人机飞行可视化验证', fromfile_prefix_chars='@')
 
     # 核心
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -106,8 +115,8 @@ def parse_args():
                         help='渲染图像高度')
     parser.add_argument('--image_width', type=int, default=64,
                         help='渲染图像宽度')
-    parser.add_argument('--hfov', type=float, default=90.0,
-                        help='模型相机水平视场角 (度)，需与训练时一致，默认90°')
+    parser.add_argument('--hfov', type=float, default=79.0,
+                        help='模型相机水平视场角 (度)，需与训练时一致，默认79°')
     parser.add_argument('--mesh_path', type=str, default='./data/sample/sample4.obj',
                         help='障碍物网格路径 (仅在非随机场景时使用)')
     parser.add_argument('--num_samples', type=int, default=50000,
@@ -116,8 +125,8 @@ def parse_args():
                         help='网格细分次数')
     parser.add_argument('--depth_min', type=float, default=0.3,
                         help='深度图近截断距离 (米)，同时也是渲染器近平面裁剪值')
-    parser.add_argument('--depth_max', type=float, default=10.0,
-                        help='深度图远截断距离 (米)，须与训练时一致，train.py 默认 10.0')
+    parser.add_argument('--depth_max', type=float, default=24.0,
+                        help='深度图远截断距离 (米)，须与训练时一致，train.py 默认 24.0')
 
     # 高分辨率渲染选项（用于可视化输出，不影响模型输入）
     parser.add_argument('--viz_height', type=int, default=480,
@@ -140,7 +149,7 @@ def parse_args():
                         help='障碍物最小缩放')
     parser.add_argument('--obstacle_scale_max', type=float, default=1.5,
                         help='障碍物最大缩放')
-    parser.add_argument('--arena_range', type=float, default=6.0,
+    parser.add_argument('--arena_range', type=float, default=10.0,
                         help='场景 X/Y 范围')
     parser.add_argument('--ground_ratio', type=float, default=0.6,
                         help='接地物体比例 (0~1)')
@@ -152,12 +161,12 @@ def parse_args():
                         help='安全出生点到障碍物的最小距离')
     parser.add_argument('--force_cross_map', action='store_true', default=False,
                         help='强制出生/目标点在场景对向两侧')
-    parser.add_argument('--spawn_z_max', type=float, default=1.5,
+    parser.add_argument('--spawn_z_max', type=float, default=3.0,
                         help='出生/目标点最大高度')
 
     # 无人机物理（与训练保持一致）
-    parser.add_argument('--init_p_range', type=float, default=6.0,
-                        help='初始位置范围')
+    parser.add_argument('--init_p_range', type=float, default=8.0,
+                        help='初始位置范围（与训练一致）')
     parser.add_argument('--margin_min', type=float, default=0.3,
                         help='无人机安全半径最小值')
     parser.add_argument('--margin_max', type=float, default=0.8,
@@ -172,8 +181,8 @@ def parse_args():
     parser.add_argument('--airmode_coef', type=float, default=0.5)
 
     # 无人机网格与多机交互
-    parser.add_argument('--drone_mesh_path', type=str, default=None,
-                        help='无人机网格路径 (如 ./data/base_model/drone.obj)')
+    parser.add_argument('--drone_mesh_path', type=str, default='./data/base_model/drone.obj',
+                        help='无人机网格路径')
     parser.add_argument('--n_drones_per_group', type=int, default=None,
                         help='多机分组大小 (默认=batch_size, 即组内全部交互; 1=禁用碰撞检测)')
     parser.add_argument('--aero_margin', type=float, default=0.05,
@@ -224,7 +233,10 @@ def parse_args():
     parser.add_argument('--random_init_yaw', action=argparse.BooleanOptionalAction, default=True,
                         help='是否在 reset 时随机化无人机初始偏航角')
 
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f'[visualize_eval] 忽略未知参数（训练专用）: {unknown}')
+    return args
 
 
 # ================================================================

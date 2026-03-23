@@ -187,7 +187,14 @@ class DroneLoss:
                 # 等价于惩罚速度向量误差的模长，横向偏移也受罚
                 delta_v = (v_history_avg - target_slice).norm(p=2, dim=-1)
                 loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
-                loss_lateral = p_history.new_tensor(0.0)
+                # 始终计算 lateral (即使系数为 0), 为 LossNetwork 提供完整信号
+                target_speed = target_slice.norm(p=2, dim=-1)
+                target_unit = target_slice / (target_speed.unsqueeze(-1) + 1e-6)
+                v_fwd = (v_history_avg * target_unit).sum(dim=-1)
+                v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
+                loss_lateral = F.smooth_l1_loss(
+                    v_perp.norm(p=2, dim=-1),
+                    torch.zeros(v_perp.shape[:-1], device=v_perp.device))
 
             elif self.loss_v_mode == 'decomposed':
                 # ---- 分解式 ----
@@ -198,13 +205,10 @@ class DroneLoss:
 
                 loss_v = F.smooth_l1_loss(v_fwd, target_speed)
 
-                if self.coefs['lateral'] > 0:
-                    v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
-                    loss_lateral = F.smooth_l1_loss(
-                        v_perp.norm(p=2, dim=-1),
-                        torch.zeros(v_perp.shape[:-1], device=v_perp.device))
-                else:
-                    loss_lateral = p_history.new_tensor(0.0)
+                v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
+                loss_lateral = F.smooth_l1_loss(
+                    v_perp.norm(p=2, dim=-1),
+                    torch.zeros(v_perp.shape[:-1], device=v_perp.device))
 
             else:  # adaptive
                 # ---- 自适应式 ----
@@ -230,15 +234,11 @@ class DroneLoss:
 
                 loss_v = loss_v_fwd + loss_v_brake
 
-                # Part 3: 横向速度惩罚 — 约束垂直于目标方向的漂移
-                # 修复: adaptive 模式之前横向损失恒为 0 导致无人机飞高逃避障碍物
-                if self.coefs['lateral'] > 0:
-                    v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
-                    loss_lateral = F.smooth_l1_loss(
-                        v_perp.norm(p=2, dim=-1),
-                        torch.zeros(v_perp.shape[:-1], device=v_perp.device))
-                else:
-                    loss_lateral = p_history.new_tensor(0.0)
+                # Part 3: 横向速度惩罚
+                v_perp = v_history_avg - v_fwd.unsqueeze(-1) * target_unit
+                loss_lateral = F.smooth_l1_loss(
+                    v_perp.norm(p=2, dim=-1),
+                    torch.zeros(v_perp.shape[:-1], device=v_perp.device))
 
                 metrics['loss_v_fwd'] = loss_v_fwd
                 metrics['loss_v_brake'] = loss_v_brake

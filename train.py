@@ -22,7 +22,7 @@ from drone_env import DroneSimulator
 from model import (
     Model, Model_bigger, Model_adaptive,
     Model_attention, Model_multiscale, Model_residual, Model_lightweight,
-    DecayController, LossGuide,
+    DecayController, LossGuide, MetaController, LossNetwork,
 )
 from loss import DroneLoss
 from navigation_utils import (
@@ -199,8 +199,9 @@ def parse_args():
     parser.add_argument('--use_cmaes', action='store_true', default=False,
                         help='启用 CMA-ES 进化优化（与梯度训练双重循环）')
     parser.add_argument('--cma_mode', type=str, default='guide',
-                        choices=['decay', 'guide'],
-                        help='CMA-ES 模式: decay=进化梯度衰减控制器, guide=进化损失系数')
+                        choices=['decay', 'guide', 'meta', 'loss_net'],
+                        help='CMA-ES 模式: decay=进化梯度衰减控制器, guide=进化损失系数, '
+                             'meta=A-网络元控制器, loss_net=A-网络损失函数')
     parser.add_argument('--cma_pop_size', type=int, default=20, help='CMA-ES 种群大小')
     parser.add_argument('--cma_sigma0', type=float, default=0.5, help='CMA-ES 初始步长')
     parser.add_argument('--cma_eval_interval', type=int, default=50,
@@ -219,6 +220,10 @@ def parse_args():
                         help='判定到达目标点的半径阈值 (米)')
     parser.add_argument('--random_init_yaw', action=argparse.BooleanOptionalAction, default=True,
                         help='是否在 reset 时随机化无人机初始偏航角')
+    parser.add_argument('--reset_lr', action='store_true', default=False,
+                        help='Resume 时重置学习率调度器 (从 lr 开始新的 cosine 周期)。'
+                             '当 resume 后改变训练参数 (场景/损失权重等) 时应启用此选项，'
+                             '否则 lr 会从上次衰减终点 (~lr*0.01) 缓慢回升，前1000步几乎无学习能力')
     
     return parser.parse_args()
 
@@ -436,6 +441,9 @@ class DroneTrainer:
         self.cma_mode = getattr(args, 'cma_mode', 'guide')
         self.decay_controller = None
         self.loss_guide = None
+        self.meta_controller = None
+        self.loss_network = None
+        self._cma_target = None  # 当前 CMA-ES 目标对象引用 (消除多态 if/elif 分支)
         self.cma_es = None
         
         if self.use_cmaes:
@@ -462,10 +470,26 @@ class DroneTrainer:
                 if n_params > 50:
                     print(f"[CMA-ES] ⚠ 警告: DecayController 有 {n_params} 参数，"
                           f"CMA-ES 在 >50 维空间效率极低，建议使用 guide 模式或简化参数化")
-            else:  # guide
+            elif self.cma_mode == 'guide':
                 self.loss_guide = LossGuide().to(self.device)
                 x0 = self.loss_guide.get_params_vector().cpu().numpy()
                 print(f"[CMA-ES] LossGuide: {self.loss_guide.num_params} params (损失系数进化)")
+            elif self.cma_mode == 'meta':
+                self.meta_controller = MetaController(hidden=4, ema_alpha=0.1).to(self.device)
+                x0 = self.meta_controller.get_params_vector().cpu().numpy()
+                print(f"[CMA-ES] MetaController (A-网络): {self.meta_controller.num_params} params, "
+                      f"输入={MetaController.N_INPUT}D 训练状态, 输出={MetaController.N_OUTPUT}D 调制信号")
+            else:  # loss_net
+                self.loss_network = LossNetwork(
+                    hidden=16, default_coefs=dict(self.losser.coefs),
+                ).to(self.device)
+                x0 = self.loss_network.get_params_vector().cpu().numpy()
+                print(f"[CMA-ES] LossNetwork (A-网络/损失函数): {self.loss_network.num_params} params, "
+                      f"输入={LossNetwork.N_LOSS}+1D, 激活=LeakyReLU, 温启动=线性组合")
+            
+            # 统一引用: 所有 CMA-ES 模式共享 get/set_params_vector 接口
+            self._cma_target = (self.decay_controller or self.loss_guide
+                                or self.meta_controller or self.loss_network)
             
             cma_options = {
                 'popsize': getattr(args, 'cma_pop_size', 20),
@@ -476,7 +500,39 @@ class DroneTrainer:
             self.cma_es = _cma.CMAEvolutionStrategy(x0.tolist(), args.cma_sigma0, cma_options)
             print(f"[CMA-ES] pop_size={args.cma_pop_size}, sigma0={args.cma_sigma0}, "
                   f"eval_interval={args.cma_eval_interval}")
+
+            # 从 checkpoint 恢复 CMA-ES 控制器参数 (控制器必须已创建)
+            resume_ckpt = getattr(self, '_resume_ckpt', None)
+            if resume_ckpt is not None:
+                if self.decay_controller is not None and 'decay_controller' in resume_ckpt:
+                    self.decay_controller.load_state_dict(resume_ckpt['decay_controller'])
+                    print(f"[Resume] DecayController 参数已恢复")
+                if self.loss_guide is not None and 'loss_guide' in resume_ckpt:
+                    self.loss_guide.load_state_dict(resume_ckpt['loss_guide'])
+                    print(f"[Resume] LossGuide 参数已恢复")
+                if self.meta_controller is not None and 'meta_controller' in resume_ckpt:
+                    self.meta_controller.load_state_dict(resume_ckpt['meta_controller'])
+                    if 'meta_controller_ema' in resume_ckpt:
+                        self.meta_controller._ema = resume_ckpt['meta_controller_ema']
+                    print(f"[Resume] MetaController 参数已恢复 (含 EMA)")
+                if self.loss_network is not None and 'loss_network' in resume_ckpt:
+                    self.loss_network.load_state_dict(resume_ckpt['loss_network'])
+                    print(f"[Resume] LossNetwork 参数已恢复")
+                # 恢复 CMA-ES 完整内部状态 (sigma, 协方差, 进化路径)
+                if 'cma_es_state' in resume_ckpt:
+                    import pickle
+                    self.cma_es = pickle.loads(resume_ckpt['cma_es_state'])
+                    print(f"[Resume] CMA-ES 内部状态已恢复 (sigma={self.cma_es.sigma:.4f})")
+                else:
+                    # 旧 checkpoint 无 CMA-ES 状态, 用恢复的参数重建
+                    x0_restored = self._cma_target.get_params_vector().cpu().numpy()
+                    self.cma_es = _cma.CMAEvolutionStrategy(x0_restored.tolist(), args.cma_sigma0, cma_options)
+                    print(f"[Resume] CMA-ES 起点已更新为恢复的参数 (旧格式, 无内部状态)")
         
+        # 释放 checkpoint 缓存 (CMA-ES 控制器恢复已在上方完成)
+        if hasattr(self, '_resume_ckpt'):
+            del self._resume_ckpt
+
         # TensorBoard
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         log_path = os.path.join(args.log_dir, f'drone_train_{timestamp}')
@@ -536,6 +592,15 @@ class DroneTrainer:
             ckpt['decay_controller'] = self.decay_controller.state_dict()
         if self.loss_guide is not None:
             ckpt['loss_guide'] = self.loss_guide.state_dict()
+        if self.meta_controller is not None:
+            ckpt['meta_controller'] = self.meta_controller.state_dict()
+            ckpt['meta_controller_ema'] = dict(self.meta_controller._ema)
+        if self.loss_network is not None:
+            ckpt['loss_network'] = self.loss_network.state_dict()
+        # CMA-ES 优化器内部状态 (sigma, 协方差矩阵, 进化路径等)
+        if self.cma_es is not None:
+            import pickle
+            ckpt['cma_es_state'] = pickle.dumps(self.cma_es)
         if extra:
             ckpt.update(extra)
         return ckpt
@@ -581,12 +646,18 @@ class DroneTrainer:
         ckpt = getattr(self, '_resume_ckpt', None)
         if ckpt is None:
             return
-        if 'optimizer_state_dict' in ckpt:
-            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            print(f"[Resume] 优化器状态已恢复")
-        if 'scheduler_state_dict' in ckpt:
-            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
+        reset_lr = getattr(self.args, 'reset_lr', False)
+        if reset_lr:
+            # 参考项目方式: 只恢复模型权重, optimizer/scheduler 从头开始
+            # 适用于改变训练参数后的 fine-tune 场景
+            print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期")
+        else:
+            if 'optimizer_state_dict' in ckpt:
+                self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                print(f"[Resume] 优化器状态已恢复")
+            if 'scheduler_state_dict' in ckpt:
+                self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
         # 恢复 best metric 追踪
         if 'best_ar' in ckpt:
             self.best_ar = ckpt['best_ar']
@@ -596,16 +667,20 @@ class DroneTrainer:
             self.best_task_score = ckpt['best_task_score']
             self.best_task_iter = ckpt.get('best_task_iter', -1)
             print(f"[Resume] best_task_score={self.best_task_score:.4f} @ iter {self.best_task_iter}")
-        del self._resume_ckpt  # 释放引用
+        # 注意: 不在此处删除 _resume_ckpt，CMA-ES 控制器状态在控制器创建后恢复
     
     def _smooth_dict(self, ori_dict):
         """平滑指标记录"""
         for k, v in ori_dict.items():
             self.scaler_q[k].append(float(v))
     
-    def run_episode(self, iteration):
+    def run_episode(self, iteration, skip_scene_gen=False):
         """
         运行一个 episode 并返回损失
+        
+        Args:
+            iteration: 当前迭代号，-1 表示 CMA-ES 评估
+            skip_scene_gen: 跳过场景/动态障碍物生成（CMA-ES 评估时复用当前场景）
         """
         args = self.args
         B = args.batch_size
@@ -615,11 +690,12 @@ class DroneTrainer:
         self.model.reset()
         
         # 随机场景生成 (如果启用)
-        if self.env.enable_random_scene and self.env.scene_generator is not None:
+        # skip_scene_gen=True 时跳过，CMA-ES 评估复用训练 episode 的场景
+        if not skip_scene_gen and self.env.enable_random_scene and self.env.scene_generator is not None:
             self.env.randomize_scene()
 
         # 动态障碍物随机化 (如果启用)
-        if self.env.enable_dynamic_obstacles:
+        if not skip_scene_gen and self.env.enable_dynamic_obstacles:
             self.env.randomize_dynamic_obstacles(
                 arena_range=getattr(self.args, 'arena_range', 6.0),
             )
@@ -751,6 +827,23 @@ class DroneTrainer:
         # CMA-ES DecayController 跟踪
         prev_decay = None  # 首步使用默认 grad_decay
         decay_history = []
+
+        # CMA-ES MetaController (A-网络): 在 episode 开始前查询,
+        # 同时设置 grad_decay (物理仿真用) 和 loss 系数 (损失计算用)
+        self._meta_grad_decay = None
+        if self.meta_controller is not None:
+            progress = iteration / max(self.args.num_iters, 1) if iteration >= 0 else 0.5
+            with torch.no_grad():
+                meta_out = self.meta_controller(progress)
+            merged = dict(self._base_coefs)
+            for k, v in meta_out.items():
+                val = v.item() if isinstance(v, torch.Tensor) else v
+                if k == 'grad_decay':
+                    self._meta_grad_decay = val
+                    prev_decay = val  # 全局标量, broadcast 到所有 sample
+                elif k in merged:
+                    merged[k] = val
+            self.losser.coefs = merged
         
         # 预生成全部时间步的随机 dt (GPU tensor, 避免每步 CPU normalvariate)
         dt_all = torch.normal(
@@ -864,6 +957,12 @@ class DroneTrainer:
             inter_drone_dist_history=None,
         )
         
+        # A-网络 LossNetwork: 用进化的神经网络替代线性损失组合
+        # 注意: 此处 **不能** 用 torch.no_grad(), 梯度必须流过 LossNetwork 到策略网络
+        if self.loss_network is not None:
+            progress = iteration / max(self.args.num_iters, 1) if iteration >= 0 else 0.5
+            loss = self.loss_network(metrics, progress)
+        
         # 计算额外指标
         with torch.no_grad():
             distance = torch.norm(vec_to_pt_history, 2, -1) - self.env.margin
@@ -882,6 +981,21 @@ class DroneTrainer:
                 decay_vals = torch.stack(decay_history)
                 metrics['decay_mean'] = decay_vals.mean().item()
                 metrics['decay_std'] = decay_vals.std().item()
+
+            # MetaController (A-网络): 更新训练状态 EMA + 记录当前调制值
+            if self.meta_controller is not None:
+                self.meta_controller.update_ema(metrics)
+                # 记录所有 meta 输出到 metrics
+                progress = iteration / max(self.args.num_iters, 1) if iteration >= 0 else 0.5
+                with torch.no_grad():
+                    meta_out = self.meta_controller(progress)
+                for k, v in meta_out.items():
+                    val = v.item() if isinstance(v, torch.Tensor) else v
+                    metrics[f'meta_{k}'] = val
+
+            # LossNetwork: 记录网络输出的损失值 (区别于线性组合的损失)
+            if self.loss_network is not None:
+                metrics['loss_net_output'] = loss.item() if isinstance(loss, torch.Tensor) else loss
         
         # 非保存迭代时 detach debug_data，避免计算图被引用残留到下一轮
         debug_out = (
@@ -935,16 +1049,49 @@ class DroneTrainer:
         return per_sample.mean().item()
     
     def evaluate_cma_individual(self, params_vector):
-        """评估单个 CMA-ES 个体的 fitness"""
+        """评估单个 CMA-ES 个体的 fitness（复用当前场景，不重新生成）"""
         vec = torch.tensor(params_vector, dtype=torch.float32, device=self.device)
-        if self.cma_mode == 'decay':
-            self.decay_controller.set_params_vector(vec)
-        else:
-            self.loss_guide.set_params_vector(vec)
+        self._cma_target.set_params_vector(vec)
         
         with torch.no_grad():
-            _, _, _, extra = self.run_episode(iteration=-1)
+            _, _, _, extra = self.run_episode(iteration=-1, skip_scene_gen=True)
         return self.compute_fitness(extra)
+
+    def _evaluate_cma_solutions(self, solutions):
+        """
+        批量评估 CMA-ES 种群。
+
+        loss_net / guide 模式: A-网络不影响轨迹仿真，只影响损失函数。
+        每个个体仍需独立 episode 以获取无偏 fitness (不同初始条件 → 不同轨迹质量)。
+        场景复用 (skip_scene_gen=True) 避免重复生成障碍物。
+
+        decay / meta 模式: A-网络影响物理仿真 (grad_decay)，
+        不同个体产生不同轨迹，必须逐个运行。
+
+        Returns:
+            list[float]: CMA-ES 适应度值 (已取负, 待 CMA 最小化)
+        """
+        # 保存 MetaController EMA, 防止评估 episode 污染训练状态
+        ema_backup = None
+        if self.meta_controller is not None:
+            ema_backup = dict(self.meta_controller._ema)
+
+        save_vec = self._cma_target.get_params_vector().clone()
+        fitnesses = []
+        for sol in solutions:
+            try:
+                fit = self.evaluate_cma_individual(sol)
+                fitnesses.append(-fit)
+            except torch.cuda.OutOfMemoryError:
+                gc.collect()
+                torch.cuda.empty_cache()
+                fitnesses.append(0.0)
+
+        # 恢复评估前参数和 EMA
+        self._cma_target.set_params_vector(save_vec)
+        if ema_backup is not None:
+            self.meta_controller._ema = ema_backup
+        return fitnesses
     
     def train(self):
         """主训练循环"""
@@ -979,21 +1126,10 @@ class DroneTrainer:
             
             # CMA-ES 外层循环: 每 N 步进化一代
             if self.use_cmaes and (i + 1) % args.cma_eval_interval == 0 and not self.cma_es.stop():
-                if self.cma_mode == 'decay':
-                    best_before = self.decay_controller.get_params_vector().clone()
-                else:
-                    best_before = self.loss_guide.get_params_vector().clone()
+                best_before = self._cma_target.get_params_vector().clone()
                 
                 solutions = self.cma_es.ask()
-                fitnesses = []
-                for sol in solutions:
-                    try:
-                        fit = self.evaluate_cma_individual(sol)
-                        fitnesses.append(-fit)  # CMA-ES 最小化，fitness 取负
-                    except torch.cuda.OutOfMemoryError:
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        fitnesses.append(0.0)
+                fitnesses = self._evaluate_cma_solutions(solutions)
                 
                 self.cma_es.tell(solutions, fitnesses)
                 cma_gen += 1
@@ -1002,15 +1138,9 @@ class DroneTrainer:
                 best = self.cma_es.result.xbest
                 if best is not None:
                     vec = torch.tensor(best, dtype=torch.float32, device=self.device)
-                    if self.cma_mode == 'decay':
-                        self.decay_controller.set_params_vector(vec)
-                    else:
-                        self.loss_guide.set_params_vector(vec)
+                    self._cma_target.set_params_vector(vec)
                 else:
-                    if self.cma_mode == 'decay':
-                        self.decay_controller.set_params_vector(best_before)
-                    else:
-                        self.loss_guide.set_params_vector(best_before)
+                    self._cma_target.set_params_vector(best_before)
                 
                 # 记录 CMA-ES 指标
                 best_fitness = -min(fitnesses)
@@ -1026,6 +1156,15 @@ class DroneTrainer:
                     for name, val in current_coefs.items():
                         v = val.item() if isinstance(val, torch.Tensor) else val
                         metrics[f'guide_{name}'] = v
+
+                # MetaController (A-网络) 模式: 记录当前调制输出
+                if self.meta_controller is not None:
+                    progress = (i + 1) / max(self.args.num_iters, 1)
+                    with torch.no_grad():
+                        current_meta = self.meta_controller(progress)
+                    for name, val in current_meta.items():
+                        v = val.item() if isinstance(val, torch.Tensor) else val
+                        metrics[f'meta_{name}'] = v
             
             # 记录当前学习率到 metrics
             metrics['lr'] = self.scheduler.get_last_lr()[0]
