@@ -22,6 +22,7 @@ from drone_env import DroneSimulator
 from model import (
     Model, Model_bigger, Model_adaptive,
     Model_attention, Model_multiscale, Model_residual, Model_lightweight,
+    Model_lidar, Model_fusion,
     DecayController, LossGuide, MetaController, LossNetwork,
 )
 from loss import DroneLoss
@@ -32,6 +33,7 @@ from navigation_utils import (
 from scene_generator import SceneGenerator
 from training_monitor import TrainingMonitor
 from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov
+from lidar_sensor import LiDARSensor
 
 
 class _ArgParser(argparse.ArgumentParser):
@@ -189,9 +191,18 @@ def parse_args():
     # 模型参数
     parser.add_argument('--no_odom', default=False, action='store_true', help='不使用里程计速度作为输入')
     parser.add_argument('--model_type', type=str, default='bigger',
-                        choices=['base', 'bigger', 'adaptive', 'attention', 'multiscale', 'residual', 'lightweight'],
+                        choices=['base', 'bigger', 'adaptive', 'attention', 'multiscale',
+                                 'residual', 'lightweight', 'lidar', 'fusion'],
                         help='模型类型: base=Model, bigger=Model_bigger, adaptive=Model_adaptive, '
-                             'attention=注意力, multiscale=多尺度, residual=残差+LSTM, lightweight=轻量级')
+                             'attention=注意力, multiscale=多尺度, residual=残差+LSTM, '
+                             'lightweight=轻量级, lidar=LiDAR距离图, fusion=深度+LiDAR融合')
+    parser.add_argument('--sensor_mode', type=str, default='depth',
+                        choices=['depth', 'lidar', 'fusion'],
+                        help='传感器模式: depth=仅深度图, lidar=仅LiDAR距离图, fusion=双分支融合')
+    parser.add_argument('--lidar_beams', type=int, default=16,
+                        help='LiDAR 垂直光束数 (仿 VLP-16)')
+    parser.add_argument('--lidar_points', type=int, default=64,
+                        help='LiDAR 每条光束水平采样点数')
     parser.add_argument('--yaw_drift', default=False, action='store_true', help='启用航向漂移')
     parser.add_argument('--debug', default=False, action='store_true', help='启用 anomaly detection 调试模式')
     
@@ -383,6 +394,8 @@ class DroneTrainer:
             'multiscale': Model_multiscale,
             'residual': Model_residual,
             'lightweight': Model_lightweight,
+            'lidar': Model_lidar,
+            'fusion': Model_fusion,
         }
         model_type = getattr(args, 'model_type', 'bigger')
         ModelClass = model_map[model_type]
@@ -396,6 +409,20 @@ class DroneTrainer:
         # 重力标准向量
         self.g_std = torch.tensor([0.0, 0.0, -9.80665], device=self.device)
 
+        # LiDAR 传感器（sensor_mode 含 LiDAR 时创建）
+        sensor_mode = getattr(args, 'sensor_mode', 'depth')
+        self.lidar_sensor = None
+        if sensor_mode in ('lidar', 'fusion'):
+            self.lidar_sensor = LiDARSensor(
+                num_beams=getattr(args, 'lidar_beams', 16),
+                points_per_beam=getattr(args, 'lidar_points', 64),
+                max_range=args.depth_max,
+                min_range=args.depth_min,
+                device=self.device,
+            ).setup(focal_length, args.image_height, args.image_width)
+            print(f"[LiDAR] {self.lidar_sensor.num_beams}×{self.lidar_sensor.points_per_beam} "
+                  f"range [{self.lidar_sensor.min_range}, {self.lidar_sensor.max_range}]m")
+
         # 策略适配器（封装 obs 构造 / 模型前向 / 动作后处理）
         self.policy = DronePolicy(
             model=self.model,
@@ -403,6 +430,8 @@ class DroneTrainer:
             depth_min=args.depth_min,
             depth_max=args.depth_max,
             no_odom=args.no_odom,
+            sensor_mode=sensor_mode,
+            lidar_sensor=self.lidar_sensor,
         )
         
         # 优化器和调度器

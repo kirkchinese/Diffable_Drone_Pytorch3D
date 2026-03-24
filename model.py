@@ -478,6 +478,116 @@ class Model_lightweight(nn.Module):
 
 
 # ================================================================
+# LiDAR 距离图模型 — 处理 (B, 1, num_beams, points_per_beam) 输入
+# ================================================================
+
+class Model_lidar(nn.Module):
+    """
+    激光雷达距离图模型 — 输入为 LiDAR 距离图像 (B, 1, V, H_l)。
+
+    默认 V=16 (光束数), H_l=64 (每光束采样点数)。
+    使用 AdaptiveAvgPool2d 兼容其他参数配置。
+    隐层维度与 Model_bigger 一致 (256)，便于公平对比。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1,  32, 3, stride=(1, 2), padding=1, bias=False),  # V 方向不下采样
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.LeakyReLU(0.05),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((2, 4))
+        self.stem_fc = nn.Linear(256 * 2 * 4, hidden_dim, bias=False)
+
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x, v, hx=None):
+        feat = self.conv(x)
+        feat = self.pool(feat).flatten(1)
+        img_feat = self.stem_fc(feat)
+        fused = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(fused, hx)
+        return self.fc(self.act(hx)), img_feat, hx
+
+
+class Model_fusion(nn.Module):
+    """
+    深度-LiDAR 双分支融合模型。
+
+    两路 CNN 分别提取深度图和距离图特征，
+    拼接后通过融合层 + GRU 输出动作。
+    总参数量与 Model_bigger 可比。
+    """
+    def __init__(self, dim_obs=10, dim_action=6, hidden_dim=256):
+        super().__init__()
+        half = hidden_dim // 2  # 每个分支的特征维度
+
+        # --- 深度图分支 (48×64) ---
+        self.depth_conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(128, 128, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+        )
+        self.depth_pool = nn.AdaptiveAvgPool2d((3, 4))
+        self.depth_fc = nn.Linear(128 * 3 * 4, half, bias=False)
+
+        # --- LiDAR 距离图分支 (16×64) ---
+        self.lidar_conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, (1, 2), 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.LeakyReLU(0.05),
+        )
+        self.lidar_pool = nn.AdaptiveAvgPool2d((2, 4))
+        self.lidar_fc = nn.Linear(128 * 2 * 4, half, bias=False)
+
+        # --- 融合 ---
+        self.v_proj = nn.Linear(dim_obs, hidden_dim)
+        self.v_proj.weight.data.mul_(0.5)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, dim_action, bias=False)
+        self.fc.weight.data.mul_(0.01)
+        self.act = nn.LeakyReLU(0.05)
+
+    def reset(self):
+        pass
+
+    def forward(self, x_depth, x_lidar, v, hx=None):
+        """
+        Args:
+            x_depth: (B, 1, H, W)   预处理后的深度图
+            x_lidar: (B, 1, V, H_l) 预处理后的距离图
+            v:       (B, dim_obs)    状态向量
+            hx:      GRU 隐状态
+        """
+        d_feat = self.depth_conv(x_depth)
+        d_feat = self.depth_pool(d_feat).flatten(1)
+        d_feat = self.depth_fc(d_feat)
+
+        l_feat = self.lidar_conv(x_lidar)
+        l_feat = self.lidar_pool(l_feat).flatten(1)
+        l_feat = self.lidar_fc(l_feat)
+
+        img_feat = torch.cat([d_feat, l_feat], dim=1)         # (B, hidden_dim)
+        fused = self.act(img_feat + self.v_proj(v))
+        hx = self.gru(fused, hx)
+        return self.fc(self.act(hx)), img_feat, hx
+
+
+# ================================================================
 # CMA-ES 控制器
 # ================================================================
 

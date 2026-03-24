@@ -2,6 +2,9 @@ import torch
 
 _FALLBACK_FWD = None  # 缓存的 fallback 向量（延迟初始化，第一次调用时创建）
 
+# sensor_mode → 需要 LiDAR 的模式集合（避免重复字符串比较）
+_LIDAR_MODES = frozenset({'lidar', 'fusion'})
+
 
 def compute_local_frame(R: torch.Tensor) -> torch.Tensor:
     """根据机体姿态构造与训练一致的局部水平坐标系。"""
@@ -123,21 +126,35 @@ class DronePolicy:
 
     任意满足 ``forward(x, v, hx) -> (act, aux, hx)`` 的模型均可即插即用。
     训练/评估循环只需调用 ``policy.infer(...)`` 即可获得推力指令。
+
+    sensor_mode:
+      - 'depth':  仅深度图输入（默认，向后兼容）
+      - 'lidar':  仅 LiDAR 距离图输入
+      - 'fusion': 深度图 + LiDAR 双分支输入
     """
 
-    def __init__(self, model, g_std, depth_min, depth_max, no_odom=False):
+    def __init__(self, model, g_std, depth_min, depth_max, no_odom=False,
+                 sensor_mode='depth', lidar_sensor=None):
         """
         Args:
             model: nn.Module，接口 forward(x, v, hx) -> (act_raw, aux, hx)
             g_std: (3,) 重力向量
             depth_min, depth_max: 深度图裁剪范围
             no_odom: 是否省略里程计速度观测
+            sensor_mode: 'depth' | 'lidar' | 'fusion'
+            lidar_sensor: LiDARSensor 实例（sensor_mode 含 LiDAR 时必填）
         """
         self.model = model
         self.g_std = g_std
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.no_odom = no_odom
+        self.sensor_mode = sensor_mode
+        self.lidar_sensor = lidar_sensor
+
+        if sensor_mode in _LIDAR_MODES:
+            assert lidar_sensor is not None, \
+                f"sensor_mode='{sensor_mode}' 需要提供 lidar_sensor 实例"
 
     # ---- 主接口 ----
 
@@ -183,12 +200,27 @@ class DronePolicy:
             parts.insert(0, local_v)
         state = torch.cat(parts, dim=-1)
 
-        # 深度图预处理
-        x = preprocess_depth_for_model(
-            depth, self.depth_min, self.depth_max, depth_noise_std)
+        # ---- 根据 sensor_mode 构造模型输入并前向 ----
+        if self.sensor_mode == 'depth':
+            x = preprocess_depth_for_model(
+                depth, self.depth_min, self.depth_max, depth_noise_std)
+            act_raw, img_feat, hx = self.model(x, state, hx)
 
-        # 模型前向
-        act_raw, img_feat, hx = self.model(x, state, hx)
+        elif self.sensor_mode == 'lidar':
+            range_img = self.lidar_sensor.depth_to_range_image(depth)
+            x_lidar = self.lidar_sensor.preprocess(range_img, depth_noise_std)
+            act_raw, img_feat, hx = self.model(x_lidar, state, hx)
+
+        elif self.sensor_mode == 'fusion':
+            x_depth = preprocess_depth_for_model(
+                depth, self.depth_min, self.depth_max, depth_noise_std)
+            range_img = self.lidar_sensor.depth_to_range_image(depth)
+            x_lidar = self.lidar_sensor.preprocess(range_img, depth_noise_std)
+            act_raw, img_feat, hx = self.model(x_depth, x_lidar, state, hx)
+
+        else:
+            raise ValueError(f"未知 sensor_mode: {self.sensor_mode}")
+
         self._last_img_feat = img_feat  # 供 CMA-ES DecayController 使用
 
         # 动作后处理：local→world + 推力换算
