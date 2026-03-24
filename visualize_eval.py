@@ -58,13 +58,18 @@ except ImportError:
     HAS_IMAGEIO = False
 
 from drone_env import DroneSimulator
-from model import Model, Model_bigger, Model_adaptive
+from model import (
+    Model, Model_bigger, Model_adaptive,
+    Model_attention, Model_multiscale, Model_residual, Model_lightweight,
+    Model_lidar, Model_fusion,
+)
 from navigation_utils import (
     compute_navigation_metrics_np,
     DronePolicy,
 )
 from scene_generator import SceneGenerator, obj_to_ros, sample_cross_map_spawn_target
 from drone_renderer import hfov_to_focal, focal_to_hfov, focal_to_vfov, build_cam_mount_R
+from lidar_sensor import LiDARSensor
 
 
 # ================================================================
@@ -210,8 +215,14 @@ def parse_args():
     parser.add_argument('--no_odom', action='store_true', default=False,
                         help='不使用里程计速度作为输入')
     parser.add_argument('--model_type', type=str, default='bigger',
-                        choices=['bigger', 'adaptive', 'base'],
-                        help='模型类型 (bigger/adaptive/base)，需与训练时一致')
+                        choices=['base', 'bigger', 'adaptive', 'attention', 'multiscale',
+                                 'residual', 'lightweight', 'lidar', 'fusion'],
+                        help='模型类型，需与训练时一致')
+    parser.add_argument('--sensor_mode', type=str, default='depth',
+                        choices=['depth', 'lidar', 'fusion'],
+                        help='传感器模式，需与训练时一致')
+    parser.add_argument('--lidar_beams', type=int, default=16)
+    parser.add_argument('--lidar_points', type=int, default=64)
 
     # 目标点设置
     parser.add_argument('--max_speed', type=float, default=2.5,
@@ -354,17 +365,35 @@ class EvalRunner:
 
         # ---------- 模型 ----------
         dim_obs = 7 if args.no_odom else 10
-        _model_map = {'bigger': Model_bigger, 'adaptive': Model_adaptive, 'base': Model}
+        _model_map = {
+            'base': Model, 'bigger': Model_bigger, 'adaptive': Model_adaptive,
+            'attention': Model_attention, 'multiscale': Model_multiscale,
+            'residual': Model_residual, 'lightweight': Model_lightweight,
+            'lidar': Model_lidar, 'fusion': Model_fusion,
+        }
         ModelClass = _model_map[getattr(args, 'model_type', 'bigger')]
         self.model = ModelClass(dim_obs=dim_obs, dim_action=6).to(self.device)
         self._load_checkpoint(args.checkpoint)
         self.model.eval()
+
+        # ---------- LiDAR 传感器 ----------
+        sensor_mode = getattr(args, 'sensor_mode', 'depth')
+        self.lidar_sensor = None
+        if sensor_mode in ('lidar', 'fusion'):
+            self.lidar_sensor = LiDARSensor(
+                num_beams=getattr(args, 'lidar_beams', 16),
+                points_per_beam=getattr(args, 'lidar_points', 64),
+                max_range=args.depth_max, min_range=args.depth_min,
+                device=self.device,
+            ).setup(focal_length, args.image_height, args.image_width)
 
         # ---------- 策略封装 ----------
         self.policy = DronePolicy(
             model=self.model, g_std=self.g_std,
             depth_min=args.depth_min, depth_max=args.depth_max,
             no_odom=args.no_odom,
+            sensor_mode=sensor_mode,
+            lidar_sensor=self.lidar_sensor,
         )
 
         # ---------- 输出目录 ----------
