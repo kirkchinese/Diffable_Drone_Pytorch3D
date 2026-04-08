@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument('--timesteps', type=int, default=150, help='每次迭代的模拟步数')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--grad_decay', type=float, default=0.4, help='梯度衰减系数')
+    parser.add_argument('--grad_clip_norm', type=float, default=0.0,
+                        help='梯度裁剪最大范数。>0 时启用 clip_grad_norm_ 防止梯度爆炸导致策略退化。推荐值 1.0')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
     parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
     
@@ -84,6 +86,17 @@ def parse_args():
                              'mse=参考项目式(惩罚全方向,默认), '
                              'decomposed=分解式(横向免罚), '
                              'adaptive=自适应(终点指数衰减制动)')
+    parser.add_argument('--loss_curriculum', action='store_true', default=False,
+                        help='启用损失课程学习: 前期用 mse 损失(稳定学习基础飞行), '
+                             '后期切换到 adaptive 损失(优化制动和达标精度)')
+    parser.add_argument('--curriculum_transition', type=float, default=0.4,
+                        help='损失课程转换点 (占总训练比例, 默认 0.4 = 40%% 时切换)')
+    parser.add_argument('--coef_goal_reaching', type=float, default=0.0,
+                        help='目标达成辅助损失系数。>0 时添加终点距离目标的直接梯度信号，'
+                        '补充密集速度跟踪损失。推荐值 0.1-0.5')
+    parser.add_argument('--ema_decay', type=float, default=0.0,
+                        help='策略权重 EMA 衰减率。>0 时维护影子参数 θ_ema=α*θ_ema+(1-α)*θ, '
+                        '缓解训练后期性能退化。推荐值 0.999 或 0.9995')
     parser.add_argument('--adaptive_decay_rate', type=float, default=2.0,
                         help='adaptive模式的指数衰减率λ, alpha=exp(-λ*V_target), 默认2.0')
     
@@ -217,18 +230,12 @@ def parse_args():
     parser.add_argument('--cma_sigma0', type=float, default=0.5, help='CMA-ES 初始步长')
     parser.add_argument('--cma_eval_interval', type=int, default=50,
                         help='CMA-ES 评估间隔 (每 N 个训练步进行一次进化)')
+    parser.add_argument('--cma_warmup', type=int, default=0,
+                        help='CMA-ES 预热期: 前 N 步仅用标准损失训练，之后再激活进化。'
+                             '解决冷启动问题: 策略先学会基本飞行，CMA-ES 才有有效信号。')
     parser.add_argument('--decay_min', type=float, default=0.2, help='DecayController 最小衰减因子')
     parser.add_argument('--decay_max', type=float, default=1.0, help='DecayController 最大衰减因子')
-
-    # 速度参数
-    parser.add_argument('--max_speed_lo', type=float, default=0.75,
-                        help='随机最大速度下界 (m/s)。每个 episode 从 [lo, hi) 均匀采样。'
-                             '对应参考项目 0.75 m/s 下界')
-    parser.add_argument('--max_speed_hi', type=float, default=3.75,
-                        help='随机最大速度上界 (m/s)。参考项目默认 3.25 (=0.75+2.5)，'
-                             '当前默认 3.75 (=0.75+3.0)。'
-                             '增大此值可覆盖更大场景，但要结合 timesteps 确保物理可达性')
-
+    
     # 保存参数
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
     parser.add_argument('--save_freq', type=int, default=100, help='模型保存频率 (迭代次数)')
@@ -446,17 +453,15 @@ class DroneTrainer:
         # 优化器和调度器
         self.optimizer = AdamW(self.model.parameters(), lr=args.lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, args.num_iters, eta_min=args.lr * 0.01)
-        
-        # Best AR / EMA / start_iter 默认值（必须在 _restore_training_state 之前初始化）
-        self.best_ar = -1.0
-        self.best_ar_iter = -1
-        self.ar_ema = 0.0
-        self.ar_ema_alpha = 0.05
-        self.best_task_score = -1.0
-        self.best_task_iter = -1
-        self.task_score_ema = 0.0
-        self.start_iter = 0
 
+        # EMA 影子参数: 指数移动平均缓解训练后期性能退化
+        self.ema_decay = getattr(args, 'ema_decay', 0.0)
+        if self.ema_decay > 0:
+            self.ema_shadow = {k: v.clone() for k, v in self.model.state_dict().items()}
+            print(f"[EMA] decay={self.ema_decay}, shadow params initialized")
+        else:
+            self.ema_shadow = None
+        
         # 恢复优化器 / 调度器 / best-metric 状态（必须在 optimizer/scheduler 创建之后）
         if args.resume:
             self._restore_training_state()
@@ -581,12 +586,11 @@ class DroneTrainer:
         if hasattr(self, '_resume_ckpt'):
             del self._resume_ckpt
 
-        # TensorBoard — 使用实验名作为目录名（resume 时复用同一目录）
-        exp_name = os.path.basename(args.save_dir)
-        log_path = os.path.join(args.log_dir, exp_name)
-        purge = self.start_iter if self.start_iter > 0 else None
-        self.writer = SummaryWriter(log_path, purge_step=purge)
-        print(f"TensorBoard logs: {log_path}" + (f" (purge_step={purge})" if purge else ""))
+        # TensorBoard
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        log_path = os.path.join(args.log_dir, f'drone_train_{timestamp}')
+        self.writer = SummaryWriter(log_path)
+        print(f"TensorBoard logs: {log_path}")
         
         # 训练监控器（CSV 日志 + 损失曲线 PNG + 控制台摘要），输出到检查点目录
         self.monitor = TrainingMonitor(
@@ -595,7 +599,6 @@ class DroneTrainer:
             csv_flush_interval=25,
             curve_save_interval=500,
             console_summary_interval=100,
-            resume_step=self.start_iter,
         )
         
         # 确保保存目录存在
@@ -604,6 +607,16 @@ class DroneTrainer:
         # 指标平滑队列
         self.scaler_q = defaultdict(list)
 
+        # Best AR 追踪（用于保存最佳策略 checkpoint）
+        # AR = success_rate × avg_speed，综合衡量"安全且高效"的行为质量
+        self.best_ar = -1.0
+        self.best_ar_iter = -1
+        self.ar_ema = 0.0           # 指数移动平均，减少单次波动
+        self.ar_ema_alpha = 0.05    # EMA 平滑系数
+        self.best_task_score = -1.0
+        self.best_task_iter = -1
+        self.task_score_ema = 0.0
+        
     @staticmethod
     def _get_git_hash():
         """获取当前 git commit hash，失败时返回 'unknown'。"""
@@ -626,12 +639,6 @@ class DroneTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'iteration': iteration,
             'args': vars(self.args),
-            'ar_ema': self.ar_ema,
-            'task_score_ema': self.task_score_ema,
-            'best_ar': self.best_ar,
-            'best_ar_iter': self.best_ar_iter,
-            'best_task_score': self.best_task_score,
-            'best_task_iter': self.best_task_iter,
         }
         # CMA-ES 状态
         if self.decay_controller is not None:
@@ -647,6 +654,9 @@ class DroneTrainer:
         if self.cma_es is not None:
             import pickle
             ckpt['cma_es_state'] = pickle.dumps(self.cma_es)
+        # EMA 影子参数
+        if self.ema_shadow is not None:
+            ckpt['ema_state_dict'] = {k: v.cpu() for k, v in self.ema_shadow.items()}
         if extra:
             ckpt.update(extra)
         return ckpt
@@ -696,8 +706,7 @@ class DroneTrainer:
         if reset_lr:
             # 参考项目方式: 只恢复模型权重, optimizer/scheduler 从头开始
             # 适用于改变训练参数后的 fine-tune 场景
-            # start_iter 保持 0：reset_lr 是有意从头训练一个新 cosine 周期
-            print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期 (从 iter 0 开始)")
+            print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期")
         else:
             if 'optimizer_state_dict' in ckpt:
                 self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -705,16 +714,7 @@ class DroneTrainer:
             if 'scheduler_state_dict' in ckpt:
                 self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                 print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
-            # 恢复 EMA 状态 (仅 crash resume 恢复, reset_lr 时重置)
-            if 'ar_ema' in ckpt:
-                self.ar_ema = ckpt['ar_ema']
-                self.task_score_ema = ckpt.get('task_score_ema', 0.0)
-            # 恢复迭代起点：crash resume 从 checkpoint 的 iteration 继续
-            saved_iter = ckpt.get('iteration', 0)
-            if isinstance(saved_iter, int) and saved_iter > 0:
-                self.start_iter = saved_iter
-                print(f"[Resume] 从 iteration {saved_iter} 继续训练 (剩余 {self.args.num_iters - saved_iter} 步)")
-        # best metric 始终恢复（无论是否 reset_lr）
+        # 恢复 best metric 追踪
         if 'best_ar' in ckpt:
             self.best_ar = ckpt['best_ar']
             self.best_ar_iter = ckpt.get('best_ar_iter', -1)
@@ -723,6 +723,12 @@ class DroneTrainer:
             self.best_task_score = ckpt['best_task_score']
             self.best_task_iter = ckpt.get('best_task_iter', -1)
             print(f"[Resume] best_task_score={self.best_task_score:.4f} @ iter {self.best_task_iter}")
+        # EMA 影子参数恢复
+        if 'ema_state_dict' in ckpt and self.ema_shadow is not None:
+            for k in self.ema_shadow:
+                if k in ckpt['ema_state_dict']:
+                    self.ema_shadow[k].copy_(ckpt['ema_state_dict'][k].to(self.device))
+            print(f"[Resume] EMA 影子参数已恢复")
         # 注意: 不在此处删除 _resume_ckpt，CMA-ES 控制器状态在控制器创建后恢复
     
     def _smooth_dict(self, ori_dict):
@@ -834,9 +840,7 @@ class DroneTrainer:
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
-        _ms_lo = getattr(args, 'max_speed_lo', 0.75)
-        _ms_hi = getattr(args, 'max_speed_hi', 3.75)
-        max_speed = _ms_lo + (_ms_hi - _ms_lo) * torch.rand((B, 1), device=self.device)
+        max_speed = 0.75 + 3 * torch.rand((B, 1), device=self.device)  # 随机范围 [0.75, 3.75) m/s
         # max_speed = torch.full((B, 1), 6.0, device=self.device)  # 固定最大速度 6.0 m/s
         
         # 推力估计误差 (模拟真实无人机的推力不确定性)
@@ -1021,6 +1025,15 @@ class DroneTrainer:
             progress = iteration / max(self.args.num_iters, 1) if iteration >= 0 else 0.5
             loss = self.loss_network(metrics, progress)
         
+        # 目标达成辅助损失: 直接优化终点与目标的距离
+        # 补充密集速度损失(每步指导)与稀疏终端信号(全局目标)的双重监督
+        coef_goal = getattr(self.args, 'coef_goal_reaching', 0.0)
+        if coef_goal > 0:
+            final_dist = (p_target - p_history[-1]).norm(dim=-1)  # (B,)
+            loss_goal_reaching = final_dist.mean()
+            loss = loss + coef_goal * loss_goal_reaching
+            metrics['loss_goal_reaching'] = loss_goal_reaching
+        
         # 计算额外指标
         with torch.no_grad():
             distance = torch.norm(vec_to_pt_history, 2, -1) - self.env.margin
@@ -1155,17 +1168,18 @@ class DroneTrainer:
         """主训练循环"""
         args = self.args
         
-        total = args.num_iters
-        start = self.start_iter
-        if start > 0:
-            print(f"[Train] 跳过前 {start} 步 (已完成), 训练 [{start}, {total})")
-        pbar = tqdm(range(start, total), initial=start, total=total,
-                    ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
-        cma_gen = self.cma_es.countiter if self.cma_es is not None else 0
+        pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
+        cma_gen = 0
         
         for i in pbar:
             try:
                 # 运行一个 episode
+                # 损失课程学习: 在训练前期使用稳定的 MSE 损失，后期切换到 adaptive
+                if getattr(args, 'loss_curriculum', False):
+                    progress = i / max(args.num_iters, 1)
+                    transition = getattr(args, 'curriculum_transition', 0.4)
+                    self.losser.loss_v_mode = 'mse' if progress < transition else 'adaptive'
+
                 loss, metrics, debug_data, extra = self.run_episode(i)
                 
                 # 检查 NaN
@@ -1173,11 +1187,18 @@ class DroneTrainer:
                     print("Loss is NaN, exiting...")
                     break
                 
-                # 反向传播 (参考项目不使用梯度裁剪)
+                # 反向传播
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if getattr(args, 'grad_clip_norm', 0) > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.grad_clip_norm)
                 self.optimizer.step()
                 self.scheduler.step()
+                # EMA 影子参数更新
+                if self.ema_shadow is not None:
+                    with torch.no_grad():
+                        for k, v in self.model.state_dict().items():
+                            self.ema_shadow[k].mul_(self.ema_decay).add_(v, alpha=1 - self.ema_decay)
             except torch.cuda.OutOfMemoryError:
                 # OOM 时 Python traceback 会持有 run_episode 内所有局部变量的引用
                 # （包括计算图、历史 tensor 等），必须先 gc.collect() 打断引用链
@@ -1187,8 +1208,9 @@ class DroneTrainer:
                 print(f"\n[OOM] iter {i}: episode OOM, skipping")
                 continue
             
-            # CMA-ES 外层循环: 每 N 步进化一代
-            if self.use_cmaes and (i + 1) % args.cma_eval_interval == 0 and not self.cma_es.stop():
+            # CMA-ES 外层循环: 预热期后每 N 步进化一代
+            cma_warmup = getattr(args, 'cma_warmup', 0)
+            if self.use_cmaes and (i + 1) >= cma_warmup and (i + 1) % args.cma_eval_interval == 0 and not self.cma_es.stop():
                 best_before = self._cma_target.get_params_vector().clone()
                 
                 solutions = self.cma_es.ask()
@@ -1259,6 +1281,11 @@ class DroneTrainer:
                 self.best_ar_iter = i + 1
                 best_path = os.path.join(args.save_dir, 'best_ar.pth')
                 torch.save(self._make_checkpoint(i + 1, {'best_ar': self.best_ar}), best_path)
+                # EMA 版 best checkpoint: 用影子参数替换 model_state_dict
+                if self.ema_shadow is not None:
+                    ema_ckpt = self._make_checkpoint(i + 1, {'best_ar': self.best_ar})
+                    ema_ckpt['model_state_dict'] = {k: v.cpu() for k, v in self.ema_shadow.items()}
+                    torch.save(ema_ckpt, os.path.join(args.save_dir, 'best_ar_ema.pth'))
                 # 同时记录到 TensorBoard
                 self.writer.add_scalar('best_ar', self.best_ar, i + 1)
 
@@ -1277,13 +1304,21 @@ class DroneTrainer:
                 self.scaler_q.clear()
         
         # 保存最终模型
-        final_path = os.path.join(args.save_dir, 'checkpoint_final.pth')
-        torch.save(self._make_checkpoint(args.num_iters, {
+        final_extra = {
             'best_ar': self.best_ar,
             'best_ar_iter': self.best_ar_iter,
             'best_task_score': self.best_task_score,
             'best_task_iter': self.best_task_iter,
-        }), final_path)
+        }
+        final_path = os.path.join(args.save_dir, 'checkpoint_final.pth')
+        torch.save(self._make_checkpoint(args.num_iters, final_extra), final_path)
+        # EMA 版最终 checkpoint
+        if self.ema_shadow is not None:
+            ema_final = self._make_checkpoint(args.num_iters, final_extra)
+            ema_final['model_state_dict'] = {k: v.cpu() for k, v in self.ema_shadow.items()}
+            ema_final_path = os.path.join(args.save_dir, 'checkpoint_final_ema.pth')
+            torch.save(ema_final, ema_final_path)
+            print(f"EMA final checkpoint saved to {ema_final_path}")
         print(f"Training complete. Final checkpoint saved to {final_path}")
         if self.best_ar_iter > 0:
             print(f"Best AR model: best_ar.pth (AR={self.best_ar:.4f} @ iter {self.best_ar_iter})")

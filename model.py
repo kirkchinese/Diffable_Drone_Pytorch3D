@@ -888,7 +888,9 @@ class LossNetwork(nn.Module):
         #   → h_i = LeakyReLU(loss_i) = loss_i (因为 loss_i ≥ 0)
         # fc2: 对应默认系数
         #   weight[0, i] = coef_i
-        # 初始行为: output = Σ coef_i × loss_i = 精确等于当前线性组合
+        # 最终输出 = softplus(Σ coef_i × loss_i)
+        #   对于典型损失值 (>1), softplus(x) ≈ x, 温启动精度不受影响
+        #   softplus 保证输出恒正, 防止 CMA-ES 突变致负值损失→梯度反转→策略崩溃
         # 额外 (hidden - N_LOSS) 个神经元: 全零, CMA-ES 可激活用于交互项
         nn.init.zeros_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
@@ -912,6 +914,9 @@ class LossNetwork(nn.Module):
         IMPORTANT: 此方法在计算图中执行 — 不要包在 torch.no_grad() 中!
         梯度流: LossNetwork 输出 → 各损失分量 → 轨迹 → 策略网络 (B-网络)
 
+        输出约束: softplus 保证输出恒正，防止 CMA-ES 突变导致负值 loss
+        使梯度方向反转、策略网络崩溃。softplus(x) ≈ x (x≫0) 不影响温启动。
+
         Args:
             loss_dict: DroneLoss.forward() 返回的 metrics dict,
                        其中 loss_* 条目是在计算图中的张量
@@ -932,7 +937,9 @@ class LossNetwork(nn.Module):
         x = torch.stack(parts)  # (dim_in,)
 
         h = F.leaky_relu(self.fc1(x), negative_slope=0.1)  # (hidden,)
-        return self.fc2(h).squeeze(-1)  # scalar
+        raw = self.fc2(h).squeeze(-1)  # scalar
+        # softplus: 保证输出恒正，梯度 = sigmoid(raw) ∈ (0,1)，平滑且稳定
+        return F.softplus(raw)
 
     # ---- CMA-ES 接口 ----
     def get_params_vector(self) -> torch.Tensor:
