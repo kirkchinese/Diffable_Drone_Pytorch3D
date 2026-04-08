@@ -219,7 +219,16 @@ def parse_args():
                         help='CMA-ES 评估间隔 (每 N 个训练步进行一次进化)')
     parser.add_argument('--decay_min', type=float, default=0.2, help='DecayController 最小衰减因子')
     parser.add_argument('--decay_max', type=float, default=1.0, help='DecayController 最大衰减因子')
-    
+
+    # 速度参数
+    parser.add_argument('--max_speed_lo', type=float, default=0.75,
+                        help='随机最大速度下界 (m/s)。每个 episode 从 [lo, hi) 均匀采样。'
+                             '对应参考项目 0.75 m/s 下界')
+    parser.add_argument('--max_speed_hi', type=float, default=3.75,
+                        help='随机最大速度上界 (m/s)。参考项目默认 3.25 (=0.75+2.5)，'
+                             '当前默认 3.75 (=0.75+3.0)。'
+                             '增大此值可覆盖更大场景，但要结合 timesteps 确保物理可达性')
+
     # 保存参数
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='模型保存目录')
     parser.add_argument('--save_freq', type=int, default=100, help='模型保存频率 (迭代次数)')
@@ -438,6 +447,16 @@ class DroneTrainer:
         self.optimizer = AdamW(self.model.parameters(), lr=args.lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, args.num_iters, eta_min=args.lr * 0.01)
         
+        # Best AR / EMA / start_iter 默认值（必须在 _restore_training_state 之前初始化）
+        self.best_ar = -1.0
+        self.best_ar_iter = -1
+        self.ar_ema = 0.0
+        self.ar_ema_alpha = 0.05
+        self.best_task_score = -1.0
+        self.best_task_iter = -1
+        self.task_score_ema = 0.0
+        self.start_iter = 0
+
         # 恢复优化器 / 调度器 / best-metric 状态（必须在 optimizer/scheduler 创建之后）
         if args.resume:
             self._restore_training_state()
@@ -562,11 +581,12 @@ class DroneTrainer:
         if hasattr(self, '_resume_ckpt'):
             del self._resume_ckpt
 
-        # TensorBoard
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        log_path = os.path.join(args.log_dir, f'drone_train_{timestamp}')
-        self.writer = SummaryWriter(log_path)
-        print(f"TensorBoard logs: {log_path}")
+        # TensorBoard — 使用实验名作为目录名（resume 时复用同一目录）
+        exp_name = os.path.basename(args.save_dir)
+        log_path = os.path.join(args.log_dir, exp_name)
+        purge = self.start_iter if self.start_iter > 0 else None
+        self.writer = SummaryWriter(log_path, purge_step=purge)
+        print(f"TensorBoard logs: {log_path}" + (f" (purge_step={purge})" if purge else ""))
         
         # 训练监控器（CSV 日志 + 损失曲线 PNG + 控制台摘要），输出到检查点目录
         self.monitor = TrainingMonitor(
@@ -575,6 +595,7 @@ class DroneTrainer:
             csv_flush_interval=25,
             curve_save_interval=500,
             console_summary_interval=100,
+            resume_step=self.start_iter,
         )
         
         # 确保保存目录存在
@@ -583,16 +604,6 @@ class DroneTrainer:
         # 指标平滑队列
         self.scaler_q = defaultdict(list)
 
-        # Best AR 追踪（用于保存最佳策略 checkpoint）
-        # AR = success_rate × avg_speed，综合衡量"安全且高效"的行为质量
-        self.best_ar = -1.0
-        self.best_ar_iter = -1
-        self.ar_ema = 0.0           # 指数移动平均，减少单次波动
-        self.ar_ema_alpha = 0.05    # EMA 平滑系数
-        self.best_task_score = -1.0
-        self.best_task_iter = -1
-        self.task_score_ema = 0.0
-        
     @staticmethod
     def _get_git_hash():
         """获取当前 git commit hash，失败时返回 'unknown'。"""
@@ -615,6 +626,12 @@ class DroneTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'iteration': iteration,
             'args': vars(self.args),
+            'ar_ema': self.ar_ema,
+            'task_score_ema': self.task_score_ema,
+            'best_ar': self.best_ar,
+            'best_ar_iter': self.best_ar_iter,
+            'best_task_score': self.best_task_score,
+            'best_task_iter': self.best_task_iter,
         }
         # CMA-ES 状态
         if self.decay_controller is not None:
@@ -679,7 +696,8 @@ class DroneTrainer:
         if reset_lr:
             # 参考项目方式: 只恢复模型权重, optimizer/scheduler 从头开始
             # 适用于改变训练参数后的 fine-tune 场景
-            print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期")
+            # start_iter 保持 0：reset_lr 是有意从头训练一个新 cosine 周期
+            print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期 (从 iter 0 开始)")
         else:
             if 'optimizer_state_dict' in ckpt:
                 self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -687,7 +705,16 @@ class DroneTrainer:
             if 'scheduler_state_dict' in ckpt:
                 self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                 print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
-        # 恢复 best metric 追踪
+            # 恢复 EMA 状态 (仅 crash resume 恢复, reset_lr 时重置)
+            if 'ar_ema' in ckpt:
+                self.ar_ema = ckpt['ar_ema']
+                self.task_score_ema = ckpt.get('task_score_ema', 0.0)
+            # 恢复迭代起点：crash resume 从 checkpoint 的 iteration 继续
+            saved_iter = ckpt.get('iteration', 0)
+            if isinstance(saved_iter, int) and saved_iter > 0:
+                self.start_iter = saved_iter
+                print(f"[Resume] 从 iteration {saved_iter} 继续训练 (剩余 {self.args.num_iters - saved_iter} 步)")
+        # best metric 始终恢复（无论是否 reset_lr）
         if 'best_ar' in ckpt:
             self.best_ar = ckpt['best_ar']
             self.best_ar_iter = ckpt.get('best_ar_iter', -1)
@@ -807,7 +834,9 @@ class DroneTrainer:
         
         # 个体随机化最大速度 (参考项目逻辑: 0.75 + 2.5 * rand) 我给他弄快了一点
         # 重要：这个值在整个 episode 中应保持不变
-        max_speed = 0.75 + 3 * torch.rand((B, 1), device=self.device)  # 随机范围 [0.75, 3.75) m/s
+        _ms_lo = getattr(args, 'max_speed_lo', 0.75)
+        _ms_hi = getattr(args, 'max_speed_hi', 3.75)
+        max_speed = _ms_lo + (_ms_hi - _ms_lo) * torch.rand((B, 1), device=self.device)
         # max_speed = torch.full((B, 1), 6.0, device=self.device)  # 固定最大速度 6.0 m/s
         
         # 推力估计误差 (模拟真实无人机的推力不确定性)
@@ -1126,8 +1155,13 @@ class DroneTrainer:
         """主训练循环"""
         args = self.args
         
-        pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
-        cma_gen = 0
+        total = args.num_iters
+        start = self.start_iter
+        if start > 0:
+            print(f"[Train] 跳过前 {start} 步 (已完成), 训练 [{start}, {total})")
+        pbar = tqdm(range(start, total), initial=start, total=total,
+                    ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
+        cma_gen = self.cma_es.countiter if self.cma_es is not None else 0
         
         for i in pbar:
             try:
