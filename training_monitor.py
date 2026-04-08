@@ -48,7 +48,8 @@ class TrainingMonitor:
                  csv_flush_interval=25,
                  curve_save_interval=500,
                  console_summary_interval=100,
-                 key_metrics=None):
+                 key_metrics=None,
+                 resume_step=0):
         
         self.log_dir = log_dir
         self.smoothing_window = smoothing_window
@@ -83,6 +84,10 @@ class TrainingMonitor:
         self._start_time = time.time()
         self._last_step_time = time.time()
         self._step_times = deque(maxlen=100)  # 最近 100 步的耗时
+        
+        # Resume: 从已有 CSV 恢复历史数据
+        if resume_step > 0:
+            self._load_existing_csv(resume_step)
         
         print(f"[TrainingMonitor] CSV 日志: {self._csv_path}")
         print(f"[TrainingMonitor] 损失曲线: {self._curve_dir}/")
@@ -157,6 +162,82 @@ class TrainingMonitor:
         return sum(w) / len(w)
     
     # ---- 内部方法 ----
+    
+    def _load_existing_csv(self, resume_step):
+        """从已有 CSV 恢复历史数据（保留 step ≤ resume_step 的行），然后以追加模式打开。"""
+        if not os.path.exists(self._csv_path):
+            return
+        
+        try:
+            rows_to_keep = []
+            columns = None
+            with open(self._csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                columns = reader.fieldnames
+                if not columns or 'step' not in columns:
+                    return
+                for row in reader:
+                    try:
+                        step = int(row['step'])
+                    except (ValueError, TypeError):
+                        continue
+                    if step <= resume_step:
+                        rows_to_keep.append(row)
+            
+            if not columns:
+                return
+            
+            self._csv_columns = columns
+            
+            # 重建内存中的历史数据
+            for row in rows_to_keep:
+                step = int(row['step'])
+                self._history_steps.append(step)
+                for k in columns:
+                    if k == 'step':
+                        continue
+                    val_str = row.get(k, '')
+                    if val_str:
+                        try:
+                            val = float(val_str)
+                            self._history[k].append(val)
+                        except (ValueError, TypeError):
+                            pass
+            
+            # 用最近 N 行填充滑动窗口
+            tail = rows_to_keep[-self.smoothing_window:]
+            for row in tail:
+                for k in columns:
+                    if k == 'step':
+                        continue
+                    val_str = row.get(k, '')
+                    if val_str:
+                        try:
+                            self._windows[k].append(float(val_str))
+                        except (ValueError, TypeError):
+                            pass
+            
+            # 将截断后的数据重写到文件（丢弃 step > resume_step 的残余行）
+            with open(self._csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(rows_to_keep)
+            
+            # 以追加模式打开，后续 _flush_csv 直接 append
+            self._csv_file = open(self._csv_path, 'a', newline='')
+            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=columns,
+                                               extrasaction='ignore')
+            
+            n = len(self._history_steps)
+            if n > 0:
+                print(f"[TrainingMonitor] 从 CSV 恢复 {n} 步历史 (step 1-{self._history_steps[-1]})")
+            else:
+                print(f"[TrainingMonitor] CSV 中无 step ≤ {resume_step} 的记录, 从空白开始")
+        except Exception as e:
+            print(f"[TrainingMonitor] 警告: CSV 恢复失败 ({e}), 将重新创建")
+            self._csv_file = None
+            self._csv_writer = None
+            self._csv_columns = None
     
     def _format_tqdm(self, step):
         """生成 tqdm 后缀字符串：平滑损失 + 关键指标。"""
