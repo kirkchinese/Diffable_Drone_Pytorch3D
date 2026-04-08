@@ -239,6 +239,8 @@ def parse_args():
 
     # 硬件
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='固定随机种子（用于可复现评估）')
     parser.add_argument('--reach_radius', type=float, default=0.5,
                         help='判定到达目标点的半径阈值 (米)')
     parser.add_argument('--random_init_yaw', action=argparse.BooleanOptionalAction, default=True,
@@ -1164,6 +1166,16 @@ class EvalRunner:
 
 def main():
     args = parse_args()
+
+    # 固定随机种子
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"  随机种子:   {args.seed}")
 
     # 打印参数
     print("=" * 60)
