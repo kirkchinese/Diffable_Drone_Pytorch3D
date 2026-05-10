@@ -1,0 +1,26 @@
+# PyTorch (install first, matching your CUDA version)
+# pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1
+
+# PyTorch3D (requires PyTorch installed first)
+pytorch3d==0.7.8
+
+# Core dependencies
+numpy==2.0.1
+matplotlib==3.9.2
+tensorboard==2.20.0
+tqdm==4.67.1
+cma==4.4.4
+
+# Test & analysis scripts
+pandas==2.3.3
+scipy==1.13.1
+opencv-python==4.12.0.88
+
+# Visualization (optional)
+moviepy==2.2.1
+pillow==11.3.0
+
+# PyTorch3D dependencies
+iopath==0.1.10
+networkx==3.2.1

@@ -16,4 +16,5 @@ viz_results/
 .sisyphus/
 testscript/
 .opencode/
+.venv/
 docs/
