@@ -359,11 +359,14 @@ class EvalRunner:
         )
 
         # ---------- 高分辨率广角渲染器 (使用 create_variant 共享 mesh/lights) ----------
-        self.hires_renderer = self.env.renderer.create_variant(
-            hfov_deg=args.viz_fov,
-            image_size=(args.viz_height, args.viz_width),
-            z_clip_value=getattr(args, 'viz_z_clip', 0.02),
-        )
+        if not args.no_video:
+            self.hires_renderer = self.env.renderer.create_variant(
+                hfov_deg=args.viz_fov,
+                image_size=(args.viz_height, args.viz_width),
+                z_clip_value=getattr(args, 'viz_z_clip', 0.02),
+            )
+        else:
+            self.hires_renderer = None
 
         # ---------- 模型 ----------
         dim_obs = 7 if args.no_odom else 10
@@ -535,25 +538,26 @@ class EvalRunner:
             )
 
             # ---------- 高分辨率可视化渲染 ----------
-            # cam_offset 由 cam_mode 决定: manual 用外参 t, auto 用网格比例偏移
-            _hires_offset = (self.env._cam_manual_t
-                             if self.env.cam_mode == 'manual' and self.env._cam_manual_t is not None
-                             else self.env.get_scaled_cam_offset())
-            R_cam, T_cam = self.env.renderer.compute_view_matrix(
-                p_ros=self.env.p,
-                R_ros=self.env.R,
-                cam_mount_R=cam_mount_R,
-                cam_offset_body=_hires_offset,
-            )
-            rgb_hi, depth_hi = self.env.render_with_renderer(
-                self.hires_renderer, R_cam, T_cam,
-                return_tensor=True, return_rgb=True, return_depth=True)
+            if self.hires_renderer is not None:
+                # cam_offset 由 cam_mode 决定: manual 用外参 t, auto 用网格比例偏移
+                _hires_offset = (self.env._cam_manual_t
+                                 if self.env.cam_mode == 'manual' and self.env._cam_manual_t is not None
+                                 else self.env.get_scaled_cam_offset())
+                R_cam, T_cam = self.env.renderer.compute_view_matrix(
+                    p_ros=self.env.p,
+                    R_ros=self.env.R,
+                    cam_mount_R=cam_mount_R,
+                    cam_offset_body=_hires_offset,
+                )
+                rgb_hi, depth_hi = self.env.render_with_renderer(
+                    self.hires_renderer, R_cam, T_cam,
+                    return_tensor=True, return_rgb=True, return_depth=True)
 
-            # 转 numpy
-            rgb_np = (rgb_hi.clamp(0, 1) * 255).byte().cpu().numpy()
-            depth_np = depth_hi.cpu().numpy()
-            rec['rgb_frames'].append(rgb_np)
-            rec['depth_frames'].append(depth_np)
+                # 转 numpy
+                rgb_np = (rgb_hi.clamp(0, 1) * 255).byte().cpu().numpy()
+                depth_np = depth_hi.cpu().numpy()
+                rec['rgb_frames'].append(rgb_np)
+                rec['depth_frames'].append(depth_np)
 
             # ---------- 记录状态 ----------
             rec['p'].append(self.env.p.cpu().numpy().copy())
