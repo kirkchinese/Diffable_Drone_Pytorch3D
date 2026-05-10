@@ -1190,6 +1190,12 @@ class DroneTrainer:
                 # 反向传播
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                # 记录裁剪前的梯度范数（用于分析梯度爆炸现象）
+                _total_norm_sq = 0.0
+                for _p in self.model.parameters():
+                    if _p.grad is not None:
+                        _total_norm_sq += _p.grad.data.norm(2).item() ** 2
+                metrics['grad_norm'] = _total_norm_sq ** 0.5
                 if getattr(args, 'grad_clip_norm', 0) > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.grad_clip_norm)
                 self.optimizer.step()
