@@ -1,28 +1,24 @@
-参考项目/
-data/
-查看ssh密钥
-坐标系定义与相机位置记录.md
-git_token.txt
-runs/
+# Python
 __pycache__/
-logs/
-checkpoints/
-__pycache__/
-trajectory_plots/
-诊断脚本路径/
-train_cmd.txt
-viz_results/
-.worktrees/
-.sisyphus/
 testscript/__pycache__/
-testscript/xbox_controller_test.py
+
+# Data & models
+data/
+checkpoints/
+
+# Generated
+logs/
+viz_results/
+
+# Unpublished thesis & docs
+docs/
+
+# Experiment runner scripts
+testscript/experiments/
 testscript/run_formal_eval_all.sh
 testscript/generate_thesis_figures.py
 testscript/generate_thesis_figures_v2.py
-testscript/experiments/
-.opencode/
-.venv/
-docs/
+
+# Development tool data
 ruvector.db
-agentdb.rvf
-agentdb.rvf.lock
+agentdb.rvf*
