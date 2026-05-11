@@ -69,9 +69,9 @@ git clone https://github.com/kirkchinese/Diffable_Drone_Pytorch3D.git
 cd Diffable_Drone_Pytorch3D
 pip install -r requirements.txt
 
-# Download a pretrained checkpoint (checkpoints/ are gitignored)
-# wget https://github.com/kirkchinese/Diffable_Drone_Pytorch3D/releases/latest/download/best_ar.pth \
-#     -O ./checkpoints/thesis/exp21_grad_clip_goal/best_ar.pth
+mkdir -p ./checkpoints/thesis/exp21_grad_clip_goal
+wget https://github.com/kirkchinese/Diffable_Drone_Pytorch3D/releases/download/v0.1.0/exp21_grad_clip_goal_best_ar.pth \
+    -O ./checkpoints/thesis/exp21_grad_clip_goal/best_ar.pth
 
 # Or train your own first (see Training section), then run evaluation:
 python visualize_eval.py \
