@@ -14,7 +14,15 @@ train_cmd.txt
 viz_results/
 .worktrees/
 .sisyphus/
-testscript/
+testscript/__pycache__/
+testscript/xbox_controller_test.py
+testscript/run_formal_eval_all.sh
+testscript/generate_thesis_figures.py
+testscript/generate_thesis_figures_v2.py
+testscript/experiments/
 .opencode/
 .venv/
-docs/ruvector.db
+docs/
+ruvector.db
+agentdb.rvf
+agentdb.rvf.lock
