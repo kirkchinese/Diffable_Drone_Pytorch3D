@@ -1,77 +1,20 @@
 """
 动态场景无人机渲染器模块
 
-扩展自 DroneRenderer，支持：
-1. 多障碍物场景合成
-2. 障碍物动态移动/旋转
-3. 随机化障碍物配置
+扩展自 DroneRenderer，支持多障碍物场景合成、障碍物动态移动/旋转、随机化障碍物配置。
 
-作者: KirkChinese + AI Assistant
-日期: 2026-01-12
-"我这个人类来解释一下情况防止我后面忘记怎么回事。
-这个模块继承自 DroneRenderer，增加了对动态障碍物的支持。
-主要新增了 DynamicObstacle 类来封装单个障碍物的网格和状态，
-以及 DynamicSceneRenderer 类来管理多个动态障碍物并进行场景合成渲染。
-原因是我不知道怎么实现一个动态的场景渲染器，所以我让AI帮我写了这个模块。
-AI是这样教导这个模块的使用的：
-<start>
-## 总结
+核心类:
+- DynamicObstacle: 单个动态障碍物（位置/速度/旋转）
+- DynamicSceneRenderer: 继承 DroneRenderer，支持多障碍物合成
+- DynamicDroneSimulator: 包装 DroneSimulator，自动更新障碍物
 
-我为你创建了动态场景支持系统，主要包含：
-
-### 新文件
-
-1. **drone_renderer_dynamic.py** - 动态场景渲染器
-2. **dynamic_scene_test.ipynb** - 测试 notebook
-
-### 核心类
-
-| 类名 | 功能 |
-|------|------|
-| `DynamicObstacle` | 单个动态障碍物（位置/速度/旋转） |
-| `DynamicSceneRenderer` | 继承 DroneRenderer，支持多障碍物合成 |
-| `DynamicDroneSimulator` | 包装 DroneSimulator，自动更新障碍物 |
-
-### 关键特性
-
-1. **多 Mesh 合成**：使用 `join_meshes_as_scene` 将静态背景 + 动态障碍物合并
-2. **基本几何体**：内置 `sphere` 和 `cube`，可直接添加
-3. **自定义 Mesh**：支持加载任意 .obj 文件作为障碍物
-4. **障碍物运动**：支持线速度和角速度
-5. **点云同步更新**：碰撞检测点云实时更新
-6. **随机化接口**：`randomize_obstacles()` 一键生成随机场景
-
-### 使用示例
-
-```python
-# 创建动态渲染器
-renderer = DynamicSceneRenderer(
-    static_mesh_path='./data/sample/sample4.obj',
-    device=device
-)
-
-# 添加移动球体
-renderer.add_primitive_obstacle(
-    primitive_type='sphere',
-    position=torch.tensor([1.0, 0.0, 0.0]),
-    velocity=torch.tensor([0.0, 0.5, 0.0]),  # Y方向移动
-    scale=0.3
-)
-
-# 在训练循环中
-for step in range(timesteps):
-    renderer.step_obstacles(dt)  # 更新障碍物位置
-    rgb, depth = renderer.render(...)  # 渲染
-```
-
-### 与训练集成
-
-可以在每个 episode 开始时调用 `randomize_obstacles()` 来生成不同的动态场景，让无人机学习应对变化的环境！
-
-<end>
-咱只能说AI写的代码质量还不错，逻辑清晰，注释详细，基本符合我的需求。虽然我还没做测试，但是就先这么放着，等我测试完训练的效果再说吧。
-回头我再整合到训练代码里去。
-"
+关键特性:
+- 多 Mesh 合成: join_meshes_as_scene 合并静态背景与动态障碍物
+- 基本几何体: 内置 sphere 和 cube
+- 自定义 Mesh: 支持加载 .obj 文件作为障碍物
+- 障碍物运动: 线速度和角速度
+- 点云同步更新: 碰撞检测点云实时更新
+- 随机化接口: randomize_obstacles() 一键生成随机场景
 """
 
 import torch
