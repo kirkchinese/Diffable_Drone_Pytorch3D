@@ -5,7 +5,8 @@
 import torch
 import time
 import sys
-sys.path.insert(0, '/home/misaka/Diffable_Drone_Pytorch3D-test')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 def test_decimate_face_count():
     """验证减面后的面片数"""

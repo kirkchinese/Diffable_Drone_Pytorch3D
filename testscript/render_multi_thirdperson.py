@@ -50,7 +50,7 @@ from navigation_utils import DronePolicy
 # Checkpoint candidates (tried in order)
 _CHECKPOINT_CANDIDATES = [
     os.path.join(_PROJECT_ROOT, 'checkpoints', 'multi_run_20260322', 'best_ar.pth'),
-    '/home/misaka/Diffable_Drone_Pytorch3D-test/checkpoints/multi_run_20260322/best_ar.pth',
+    os.path.join(_PROJECT_ROOT, 'checkpoints', 'multi_run_20260322', 'best_ar.pth'),
 ]
 
 # Paths

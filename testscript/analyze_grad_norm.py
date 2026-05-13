@@ -23,7 +23,7 @@ from matplotlib.font_manager import findfont, FontProperties
 from pathlib import Path
 
 # ── 路径设置 ──────────────────────────────────────────────────────
-BASE = Path("/home/misaka/Diffable_Drone_Pytorch3D-test1")
+BASE = Path(__file__).resolve().parent.parent
 CKPT_DIR = BASE / "checkpoints/thesis"
 OUT_DIR = BASE / "docs/论文相关/thesis/figures"
 OUT_DIR.mkdir(parents=True, exist_ok=True)

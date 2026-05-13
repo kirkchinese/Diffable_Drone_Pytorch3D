@@ -16,7 +16,7 @@ from matplotlib import font_manager
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_DIR = "/home/misaka/Diffable_Drone_Pytorch3D-test1/viz_results/thesis_eval"
+BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viz_results", "thesis_eval")
 EXPERIMENTS = {
     "exp01_baseline_mse": "Exp01 Baseline MSE",
     "exp17_goal_reaching": "Exp17 Goal Reaching",
@@ -24,7 +24,7 @@ EXPERIMENTS = {
     "exp22_grad_clip_only": "Exp22 GradClip Only",
 }
 SEEDS = [0, 42, 123, 456, 789]
-OUT_PATH = "/home/misaka/Diffable_Drone_Pytorch3D-test1/docs/论文相关/thesis/figures/fig_progress_distribution.png"
+OUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "论文相关", "thesis", "figures", "fig_progress_distribution.png")
 
 # ---------------------------------------------------------------------------
 # Font setup – prefer Noto Sans CJK SC for Chinese characters

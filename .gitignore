@@ -2,8 +2,10 @@
 __pycache__/
 testscript/__pycache__/
 
-# Data & models
-data/
+# Data & models (base_model meshes are tracked)
+data/*
+!data/base_model/
+!data/sample/
 checkpoints/
 
 # Generated
