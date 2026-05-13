@@ -58,8 +58,6 @@
     - [相关工作](#相关工作)
   - [许可证](#许可证)
   - [关于作者](#关于作者)
-  - [写在最后](#写在最后)
-
 ---
 
 ## 这是什么？
@@ -306,6 +304,3 @@ python testscript/multi_seed_eval.py --exp_dir ./checkpoints/exp_baseline --n_se
 浙大城市学院自动化本科生。本项目为毕业设计课题。
 
 - GitHub: [@kirkchinese](https://github.com/kirkchinese)
-## 写在最后
-
-本项目为一个本科毕业设计课题的完整实现，欢迎社区贡献与合作。
