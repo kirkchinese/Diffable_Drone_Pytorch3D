@@ -36,58 +36,58 @@ class DroneSimulator:
                  dt=0.02, 
                  device=None,
                  mesh_path="data/sample/sample.obj",
-                 image_size=(480, 640),
-                 focal_length=500.0,
-                 principal_point=None,
-                 lights_location=[[0.0, 0.0, -3.0]],
-                 num_samples=20000,
-                 subdivide_times=0,
+                 image_size=(480, 640), # 渲染图像分辨率 (H, W)，可根据需要调整，较高分辨率会增加渲染开销（这里写480*640,但是实际给无人机的是48*64）
+                 focal_length=500.0,  # 相机焦距，单位为像素。实际效果取决于渲染器实现，通常与 image_size 相关联。较高的 focal_length 会增加图像中物体的放大程度，但也可能增加边缘畸变。
+                 principal_point=None, # 相机主点，通常为 (image_width/2, image_height/2)。如果为 None，默认使用图像中心。
+                 lights_location=[[0.0, 0.0, -3.0]], # 点光源位置，单位为米
+                 num_samples=20000, # 渲染用的点云采样数量，随机场景模式下不采样（由 SceneGenerator 生成的网格通常较简单，且采样开销较大）
+                 subdivide_times=0, # 渲染用的网格细分次数，增加面片数量以提升渲染质量和碰撞检测精度，但会增加渲染开销
                  # 动力学参数
-                 enable_airmode=True,
-                 enable_induced_drag=False,
-                 noise_std=0.04,
-                 grad_decay=0.8,
-                 yaw_inertia=5.0,
-                 yaw_ctl_delay=12.0,
-                 pitch_ctl_delay=12.0,
-                 drag_coef_lin=0.375,
-                 drag_coef_quad=0.0,
-                 z_drag_coef=1.0,
-                 rotor_drag_coef=0.07,
-                 airmode_coef=0.5,
-                 gravity=9.80665,
+                 enable_airmode=True, # 开启 Airmode 
+                 enable_induced_drag=False, # 是否启用旋翼气流的诱导阻力（induced drag）模型，增加飞行的物理真实性，但会增加计算复杂度
+                 noise_std=0.04, # 环境扰动的标准差，模拟风等随机因素对飞行的影响
+                 grad_decay=0.8, # 梯度衰减因子，模拟飞行控制系统的响应滞后和历史输入的影响，值越小历史输入影响越大
+                 yaw_inertia=5.0, # yaw角的转动惯量，较大值会使无人机在改变航向时更稳定但响应更慢，较小值则更敏捷但可能更难控制
+                 yaw_ctl_delay=12.0, # yaw控制延迟，模拟飞行控制系统的响应时间
+                 pitch_ctl_delay=12.0, # pitch控制延迟，模拟飞行控制系统的响应时间
+                 drag_coef_lin=0.375, # 一阶线性阻力系数，模拟飞行中的空气阻力，较大值会增加飞行的阻力感和稳定性，但也可能使无人机更难加速和爬升
+                 drag_coef_quad=0.0, # 二阶阻力系数，模拟高速飞行时空气阻力的非线性增加，较大值会使无人机在高速飞行时感觉更重和更稳定，但也可能使其更难达到高速度
+                 z_drag_coef=1.0, # 垂直方向的额外阻力系数，模拟飞行中垂直运动的特殊阻力特性，较大值会增加爬升和下降时的阻力感和稳定性，但也可能使无人机更难快速改变高度
+                 rotor_drag_coef=0.07, # 旋翼阻力系数，模拟旋翼产生的额外阻力，较大值会增加飞行的阻力感和稳定性，但也可能使无人机更难加速和爬升
+                 airmode_coef=0.5, # Airmode 系数，控制在低推力状态下无人机的响应特性，较大值会使无人机在低推力时更稳定但响应更慢，较小值则更敏捷但可能更难控制
+                 gravity=9.80665, # 重力
                  # 初始化范围参数
-                 init_p_range=2.0,
-                 init_v_range=0.0,
-                 init_dg_range=0.2,
-                 init_margin_range=(0.3, 0.8),
+                 init_p_range=2.0, # 位置初始化范围，表示在一个边长为 2*init_p_range 的立方体内随机初始化位置，z轴通常会有额外的偏移以保证出生高度
+                 init_v_range=0.0, # 速度初始化范围，表示在一个边长为 2*init_v_range 的立方体内随机初始化速度，通常设置为 0 以从静止开始
+                 init_dg_range=0.2, # 环境扰动 dg 的初始化范围，表示在一个边长为 2*init_dg_range 的立方体内随机初始化扰动，模拟不同的初始风速或其他环境因素
+                 init_margin_range=(0.3, 0.8), # 安全边距初始化范围，表示无人机在渲染和碰撞检测中使用的安全边距（margin）将从这个范围内随机采样，较大的 margin 会使无人机在视觉上更大，并增加与障碍物的安全距离，但也可能使得环境更拥挤和挑战性更高（这个值会真实的影响模型大小）
                  # 运行参数
-                 wind_std=0.1,
-                 act_queue_len=2,
+                 wind_std=0.1, # 每步随机风的标准差，模拟飞行中的环境扰动，较大值会增加飞行的不确定性和挑战性，但也可能使训练更稳健
+                 act_queue_len=2, # 控制命令队列长度，模拟飞行控制系统的输入延迟，较长的队列会增加飞行的响应延迟和挑战性，但也可能使训练更稳健
                  # 相机参数
-                 cam_mode='auto',
-                 cam_extrinsic=None,
-                 cam_offset_body=None,
-                 cam_mount_rpy=(0.0, 10.0, 0.0),
+                 cam_mode='auto', # 相机模式，'auto' 表示自动根据无人机状态调整相机位置和朝向，'manual' 则使用固定的外参矩阵 cam_extrinsic 定义相机安装位置和姿态
+                 cam_extrinsic=None, # 相机外参矩阵，形状为 (3, 4) 或长度为 12 的列表，表示 [R | t]，其中 R 是 3×3 的旋转矩阵，t 是 3×1 的平移向量。仅在 cam_mode='manual' 时使用。
+                 cam_offset_body=None, # 相机相对于机体的偏移，形状为 (3,) 的向量，表示相机安装位置相对于无人机中心的偏移，单位为米。仅在 cam_mode='auto' 时使用，且会与无人机网格的几何特征结合计算最终安装位置。
+                 cam_mount_rpy=(0.0, 10.0, 0.0), # 相机安装的旋转，表示相机安装时绕自身坐标轴的旋转，单位为度，顺序为 roll (X轴), pitch (Y轴), yaw (Z轴)。仅在 cam_mode='auto' 时使用，且会与无人机网格的几何特征结合计算最终安装姿态。
                  # 渲染参数
-                 z_clip_value=0.3,
+                 z_clip_value=0.3, # 渲染器的近裁剪距离，单位为米，较大的值会增加近距离物体的裁剪，可能导致视觉上的穿模，但也可以提高渲染效率和稳定性
                  # 场景随机化参数
-                 enable_random_scene=False,
-                 scene_generator=None,
-                 safe_spawn_clearance=1.0,
-                 min_spawn_inter_distance=0.0,
-                 random_init_yaw=True,
+                 enable_random_scene=False, # 是否启用随机场景生成，启用后每次调用 randomize_scene() 都会使用 scene_generator 生成一个新的随机场景，替换当前渲染器中的网格和点云
+                 scene_generator=None, # SceneGenerator 实例，用于生成随机场景网格和障碍物信息，在 enable_random_scene=True 时必须提供
+                 safe_spawn_clearance=1.0, # 安全出生点清除半径，单位为米，表示在随机生成出生点时，必须保证与障碍物点云的距离大于等于这个值，以避免出生点在障碍物内部
+                 min_spawn_inter_distance=0.0, # 出生点之间的最小间距，单位为米，表示在随机生成多个出生点时，必须保证它们之间的距离大于等于这个值，以避免出生点过于集中
+                 random_init_yaw=True, # 是否随机初始化 yaw 角，启用后每个样本的初始姿态会有一个随机的 yaw 角度。
                  # 无人机网格参数
-                 drone_mesh_path=None,
-                 aero_margin=0.05,
-                 max_drone_faces=500,
+                 drone_mesh_path=None, # 无人机网格文件路径，支持 OBJ 格式，路径可以是相对于当前文件的相对路径或绝对路径，如果为 None 则不加载无人机网格，仅使用默认的包围球进行渲染和碰撞检测
+                 aero_margin=0.05, # 气动安全边距，单位为米，表示在计算无人机的安全半径时，在包围球半径的基础上额外增加的边距，以模拟飞行中的气动效应和不确定性（这个值会不会影响无人机的物理尺寸）
+                 max_drone_faces=500, # 无人机网格的最大面片数量，加载时如果网格面片数量超过这个值，会自动进行简化以提升渲染效率和碰撞检测性能。（妥协之举）
                  # 多无人机交互参数
-                 n_drones_per_group=1,
+                 n_drones_per_group=1, # 每组无人机数量，控制渲染器中无人机的可见性关系，只有同组的无人机之间互相可见，不同组之间不可见。设置为 1 则所有无人机都不可见，设置为 B 则所有无人机互相可见。适用于多无人机协作或竞争场景的视觉分离需求。
                  # 动态障碍物参数
-                 enable_dynamic_obstacles=False,
-                 num_dynamic_obstacles_range=(2, 5),
-                 dynamic_obstacle_speed_range=(-0.5, 0.5),
-                 dynamic_obstacle_scale_range=(0.2, 0.8),
+                 enable_dynamic_obstacles=False, # 启用动态障碍物功能，启用后可以在环境中添加具有预定义运动模式的动态障碍物，这些障碍物会在每步模拟中更新位置，并在渲染器中显示。需要配合 DynamicObstacle 类使用。
+                 num_dynamic_obstacles_range=(2, 5), # 随机动态障碍物数量范围，表示在启用动态障碍物功能时，每次随机生成的动态障碍物数量将从这个范围内随机采样。
+                 dynamic_obstacle_speed_range=(-0.5, 0.5), # 动态障碍物速度范围，表示在启用动态障碍物功能时，每次随机生成的动态障碍物速度将从这个范围内随机采样。速度是一个三维向量，每个分量独立采样。
+                 dynamic_obstacle_scale_range=(0.2, 0.8), # 动态障碍物缩放范围，表示在启用动态障碍物功能时，每次随机生成的动态障碍物的缩放因子将从这个范围内随机采样。缩放因子会应用于基础几何体网格，以生成不同大小的障碍物。
                  ):
         
         self.B = batch_size
@@ -154,8 +154,8 @@ class DroneSimulator:
         
         # 无人机网格加载
         self.drone_mesh = None
-        self.drone_bounding_radius = 0.15  # 默认值
-        self.aero_margin = aero_margin
+        self.drone_bounding_radius = 0.15  # 包围半径，默认值，会被加载的网格覆盖
+        self.aero_margin = aero_margin # 气动安全边距，渲染和碰撞检测时会加在包围半径上
         if drone_mesh_path is not None:
             drone_mesh_path = self._resolve_path(drone_mesh_path)
             if os.path.exists(drone_mesh_path):

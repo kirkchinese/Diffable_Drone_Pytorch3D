@@ -5,6 +5,8 @@
 [![PyTorch3D](https://img.shields.io/badge/PyTorch3D-0.7.8-green.svg)](https://pytorch3d.org/)
 [![License](https://img.shields.io/badge/License-GPL%203.0-orange.svg)](./LICENSE)
 
+> **Gradient descent instead of reinforcement learning.** A drone learns to weave through dense clutter from a single depth camera — the entire simulation pipeline (rendering · physics · control) is end-to-end differentiable, so the policy is learned straight from task objectives, with no RL and no human demonstrations.
+
 A PyTorch3D-based reimplementation of DiffPhysDrone (Zhang et al., *Nature Machine Intelligence*, 2025). Extends the original with CMA-ES optimization, multi-sensor fusion, dynamic obstacles, and 10 policy network architectures (9 beyond the original). Train vision-based drone navigation entirely through gradient descent — no RL, no human demonstrations.
 
 [中文版本](./README.md)
@@ -47,6 +49,7 @@ A PyTorch3D-based reimplementation of DiffPhysDrone (Zhang et al., *Nature Machi
   - [Experiments](#experiments)
     - [Summary Table (selected)](#summary-table-selected)
     - [Key Findings](#key-findings)
+  - [Roadmap \& Long-Term Vision](#roadmap--long-term-vision)
   - [Installation](#installation)
   - [Training \& Evaluation](#training--evaluation)
     - [Train a Model](#train-a-model)
@@ -189,6 +192,37 @@ SR = Strict success (reach target, zero collisions). RR = Arrival rate. CFR = Co
 
 ---
 
+## Roadmap & Long-Term Vision
+
+### Near-Term
+
+- **Real-world deployment**: transfer the policy to a small quadrotor and validate sim-to-real.
+- **External baselines**: add same-scene PPO/SAC and EGO-Planner comparisons for an absolute performance reference.
+- **Curriculum learning**: progressive simple-to-complex training to further mitigate late-stage degradation.
+- **Transformer temporal modeling**: replace the GRU with self-attention to capture longer-range state dependencies.
+
+### Long-Term: From Flying to Walking — Extending to Legged Robots
+
+This project shows that differentiable-physics training works for drones. The longer-term vision is to carry the same paradigm over to **quadruped / biped / humanoid** locomotion. There is a fundamental mathematical obstacle here worth stating plainly:
+
+**Why a drone is "easy" and a legged robot is "hard."** In this framework a drone is approximated as a **point mass** with attitude; the map from control (thrust) to acceleration is smooth, the whole computation graph is differentiable everywhere, and gradients flow cleanly from the loss back to the policy. A legged robot is different:
+
+1. **No longer a point mass, but a floating-base multibody system.** A quadruped has a 6-DOF floating base + ~12 joint DOF; a humanoid reaches 30+ DOF, governed by the full manipulator equation $M(q)\ddot{q} + h(q,\dot{q}) = S^\top\tau + J_c^\top\lambda$. The dimensionality jumps, but this layer is still **smooth and differentiable** — modern rigid-body libraries (Pinocchio, MuJoCo MJX, Brax) already provide analytic derivatives.
+
+2. **The real difficulty is contact.** Walking is fundamentally about making and breaking foot-ground contact. Contact is governed by **complementarity constraints** (a foot is either in contact with force, or separated with none) and a **friction cone** — both non-smooth — and every touchdown/liftoff is a discrete mode switch, making the system a **hybrid dynamical system**. As a result, gradients through contact can be discontinuous, vanish during stance, or explode at stiff contacts, and the loss landscape becomes non-smooth. This is exactly where naive differentiable physics breaks down.
+
+3. **Underactuation and balance.** A drone is fully actuated along its thrust axis and inherently controllable; a legged robot's floating base has no direct actuation and must balance purely through contact forces (centroidal / capture-point dynamics).
+
+**Tractable attack routes (so this stays grounded, not wishful):**
+
+- **Smoothed contact**: replace hard LCP with soft contact (spring-damper / penalty) or analytically smoothed differentiable contact solvers (Nimble, Dojo, Brax-spring) so contact is differentiable everywhere.
+- **Reduced-order templates**: rather than differentiating the full robot, do differentiable planning on a **centroidal / single-rigid-body (SRBM) / spring-loaded inverted pendulum (SLIP)** model and let a whole-body controller track it — a direct answer to the "the full model is too complex" concern.
+- **First-order + zeroth-order hybrid gradients**: combine analytic gradients with RL-style zeroth-order estimates (e.g., SHAC short-horizon actor-critic, randomized smoothing) to descend reliably despite contact-induced gradient pathologies.
+
+In short, moving from drones to legged robots shifts the challenge from "high-dimensional but smooth" to "non-smooth and gradient-pathological because of contact." The end-to-end differentiable pipeline, gradient-stabilization (GCGL), and training infrastructure built here are the foundation for taking that step.
+
+---
+
 ## Installation
 
 ```bash
@@ -302,6 +336,11 @@ This project is licensed under the [GNU General Public License v3.0](https://www
 
 ## About the Author
 
-Undergraduate student in automation and robotics. This project is part of my bachelor's thesis.
+**Xu Lu (徐路)** — Automation (advanced control), Hangzhou City University. Interested in the intersection of differentiable physics, robot learning, and vision-based navigation.
+
+This project is the most complete expression of my engineering and research ability so far: as a solo developer I built this end-to-end differentiable drone simulation-and-training pipeline from scratch, reproduced and extended a *Nature Machine Intelligence* paper, and diagnosed and mitigated its late-stage training degradation with the GCGL method (+16.7% stable-arrival index, +8.7pp 5-seed success rate). It spans the full stack — from control modeling and differentiable simulation to deep learning and systems engineering.
+
+I'm currently looking for **robotics / reinforcement learning / embodied AI** engineering or research roles. Always happy to connect.
 
 - GitHub: [@kirkchinese](https://github.com/kirkchinese)
+- Email: kirkchinese@gmail.com

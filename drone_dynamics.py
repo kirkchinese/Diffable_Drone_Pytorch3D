@@ -51,8 +51,8 @@ class GDecay(torch.autograd.Function):
             tuple: (衰减后的梯度, None)
         """
         param = ctx.param
-        # per-sample (B,) 张量需要 unsqueeze 以与 (B, 3) grad_output 广播
-        if isinstance(param, torch.Tensor) and param.dim() == 1 and grad_output.dim() == 2:
+        # per-sample (B,) 张量需要 unsqueeze 以与 (B, 3) grad_output 广播 
+        if isinstance(param, torch.Tensor) and param.dim() == 1 and grad_output.dim() == 2: # 这里是为了逐步逐样本不同衰减系数做的处理
             param = param.unsqueeze(-1)
         return grad_output * param, None
 
@@ -276,7 +276,7 @@ def simulate_position_step(
     else:
         alpha = act_curr.new_tensor(-pitch_ctl_delay * dt).exp_()
         
-    act_next = act_cmd * (1 - alpha) + act_curr * alpha
+    act_next = act_cmd * (1 - alpha) + act_curr * alpha # 模拟执行器的物理惯性，不能瞬间改变。有延迟，指数平滑。
     
     # 2. 阻力计算 (Drag)
     # 相对速度
@@ -412,7 +412,7 @@ def simulate_position_step(
     # [New] 计算梯度衰减参数 (decay per step)
     # 必须 **dt 以保证时间一致性：即无论 dt 大小如何，单位时间内的总衰减量恒定。
     # 对应参考项目 CUDA 源码 dynamics_kernel.cu 中的 `pow(grad_decay, ctl_dt)`
-    decay_factor = grad_decay ** dt
+    decay_factor = grad_decay ** dt # 计算真实的衰减参数，确保与时间步长一致
 
     # 使用 g_decay 包裹上一时刻的状态变量 p 和 v
     # 这样在反向传播时，流经 p 和 v 的梯度会被衰减，防止长序列梯度爆炸
@@ -420,7 +420,7 @@ def simulate_position_step(
     v_decayed = g_decay(v, decay_factor)
 
     # p_next = p + v * dt + 0.5 * a * dt^2
-    p_next = p_decayed + v * dt + 0.5 * a * dt**2
+    p_next = p_decayed + v * dt + 0.5 * a * dt**2 # 必须用包裹之后的参数来更新位置，这里有坑踩过。
     
     # v_next = v + 0.5 * (a + a_next) * dt
     v_next = v_decayed + 0.5 * (a + a_next) * dt

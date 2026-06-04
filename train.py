@@ -327,7 +327,7 @@ class DroneTrainer:
         safe_min_sid = 2.0 * margin_max + 0.5  # 留 0.5m 余量
         # 几何上限：cross-map spawn区域 ≈ 2R² 面积中填 N 架无人机
         arena_r = getattr(args, 'arena_range', 6.0)
-        geo_max = (2.0 * arena_r ** 2 / args.batch_size) ** 0.5
+        geo_max = (2.0 * arena_r ** 2 / args.batch_size) ** 0.5  # 计算最大的平均间距，防止设置的最大间隔参数超过可能的值，避免出生即碰撞。同时也是为了避免拒绝采样直接失败导致训练进程卡死。这部分踩过坑。
         if safe_min_sid > geo_max:
             print(f"[Info] min_spawn_inter_distance: 碰撞安全值 {safe_min_sid:.2f}m "
                   f"> 几何上限 {geo_max:.2f}m (N={args.batch_size}, R={arena_r}), "
