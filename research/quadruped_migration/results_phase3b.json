@@ -1,0 +1,20 @@
+{
+  "nominal": {
+    "fwd_rms": 15.877350114661654,
+    "grad_cos": 0.9406433130098231
+  },
+  "accel_residual": {
+    "grad_cos": 0.9692719090497415
+  },
+  "contact_residual_gated": {
+    "fwd_rms": 3.1825730840944426,
+    "grad_cos": 0.9976476707492631,
+    "takeover": 0.15339864862010505
+  },
+  "contact_residual_ungated": {
+    "grad_cos": 0.9957002904973062
+  },
+  "airborne_Fn_physics": 0.008771121431606889,
+  "airborne_Fn_gated": 0.017411945613869766,
+  "airborne_Fn_ungated": 1.41397276254974
+}

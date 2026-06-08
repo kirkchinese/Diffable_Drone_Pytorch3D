@@ -24,3 +24,6 @@ testscript/generate_thesis_figures_v2.py
 # Development tool data
 ruvector.db
 agentdb.rvf*
+
+# LaTeX build artifacts (regenerable)
+research/quadruped_migration/thesis/.preview_build/

@@ -1,0 +1,21 @@
+{
+  "nominal_fwd_rms": 15.459766764500547,
+  "nominal_grad_cos": 0.9537078118365555,
+  "nominal_grad_sign_disagree": 0.049013264315747485,
+  "smooth_teacher": {
+    "fwd_rms_final": 6.25734125414042,
+    "grad_cos": 0.9758223254374113,
+    "grad_rel_err": 0.11312898411725737,
+    "grad_sign_disagree": 0.023616952442571396
+  },
+  "hard_teacher": {
+    "fwd_rms_final": 13.784078552216618,
+    "grad_cos": 0.6659870562620405,
+    "grad_rel_err": 0.4115700450725746,
+    "grad_sign_disagree": 0.06710382513659735
+  },
+  "takeover_final_smooth": 0.1417765827585471,
+  "takeover_final_hard": 0.2636751693144004,
+  "rollout_drift_final_nominal": 0.0033272368876978674,
+  "rollout_drift_final_residual": 0.0026214319619193896
+}

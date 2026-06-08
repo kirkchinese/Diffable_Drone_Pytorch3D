@@ -1,0 +1,29 @@
+{
+  "unconstrained": {
+    "grad_cos": 0.9997479605056729,
+    "fwd_rms": 8.122731473542181,
+    "cone_ratio_max": 13.96050977081402,
+    "cone_violation_frac": 0.8603515625,
+    "relcorr_abs_max": 8.977329012742386,
+    "relcorr_abs_mean": 0.6335996956741743,
+    "airborne_Fn": 0.5344966232250288
+  },
+  "R3 gated": {
+    "grad_cos": 0.9992815191152489,
+    "fwd_rms": 8.778778657987951,
+    "cone_ratio_max": 1.4412442760299324,
+    "cone_violation_frac": 0.8115234375,
+    "relcorr_abs_max": 0.670344986347071,
+    "relcorr_abs_mean": 0.5155162575734544,
+    "airborne_Fn": 0.012688129823115044
+  },
+  "R4 constrained": {
+    "grad_cos": 0.9887384639540933,
+    "fwd_rms": 35.43762591373415,
+    "cone_ratio_max": 0.9999996242437983,
+    "cone_violation_frac": 0.0,
+    "relcorr_abs_max": 0.5999999983014687,
+    "relcorr_abs_mean": 0.5953067739785967,
+    "airborne_Fn": 0.013628827686834773
+  }
+}

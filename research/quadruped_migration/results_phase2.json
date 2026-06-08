@@ -1,0 +1,37 @@
+{
+  "F1": {
+    "smooth_fric_grad_max": 18.0,
+    "hard_fric_grad_max": 0.0,
+    "px_with_friction": 0.08905977651077945,
+    "px_no_friction": 0.0
+  },
+  "F2": {
+    "sensitivity_centroid_s": 1.829787891188081,
+    "horizon_s": 2.5,
+    "note": "attitude sensitivity spread across history -> integrator, not flat algebraic map"
+  },
+  "F3": {
+    "A_smooth_gdecay_init": 0.6740187364230462,
+    "A_smooth_gdecay_final": 0.03526707172635521,
+    "B_hard_gdecay_init": 9.580862698336489,
+    "B_hard_gdecay_final": 37.86475911595893,
+    "A_gradnorm_median": 0.00955695883070219,
+    "B_gradnorm_median": 3042453.621711116,
+    "horizon": 400,
+    "dt": 0.002,
+    "note": "smooth contact: loss降; hard contact: loss不降/升. 平滑接触梯度有界(E5)故GDecay边际收益小,其价值在刚性/长视野域."
+  },
+  "F4": {
+    "A_smooth_init": 0.709632593093565,
+    "A_smooth_final": 0.10413245552905,
+    "B_hard_init": 16.015889483099482,
+    "B_hard_final": 22.986726442174515,
+    "A_gradnorm_median": 0.041537806456565796,
+    "B_gradnorm_median": 68037025.03938806,
+    "trained_mean_vx_last1s": 0.30017405567565875,
+    "untrained_mean_vx_last1s": 0.2345873634762827,
+    "trained_px_final": 0.8613461887441314,
+    "target_vx": 0.35,
+    "trained_abs_theta_max": 0.03283761399806422
+  }
+}

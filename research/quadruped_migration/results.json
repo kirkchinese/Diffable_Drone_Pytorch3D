@@ -1,0 +1,64 @@
+{
+  "E1": {
+    "hard_grad_abs_max": 0.0,
+    "smooth_grad_abs_max": 2083.3333333333335,
+    "note": "hard/stoch FoG≡0 (uninformative); smooth FoG bounded & informative"
+  },
+  "E3_roughness": {
+    "smooth-baseline(drone)": 7.500895426598719e-10,
+    "hopper-smooth": 0.05778302516300232,
+    "hopper-soft": 13.140628693633767,
+    "hopper-stiff": 62.15005584291205
+  },
+  "E4_grad_bias": {
+    "smooth-baseline(drone)": 7.680563319262986e-12,
+    "hopper-smooth": 0.009479644885630356,
+    "hopper-soft": 7.336699785173805,
+    "hopper-stiff": 241.7504529621429,
+    "hopper-stiff +grad_decay0.6": 53.899451157323206
+  },
+  "E4_sign_disagree": {
+    "smooth-baseline(drone)": 0.0,
+    "hopper-smooth": 0.0,
+    "hopper-soft": 0.4821,
+    "hopper-stiff": 0.519,
+    "hopper-stiff +grad_decay0.6": 0.519
+  },
+  "E5": {
+    "stiff_max": 25680.372697856998,
+    "smooth_baseline_max": 6.000000000000338,
+    "stiff_decay_max": 1198.1434685912036
+  },
+  "E6": {
+    "k_list": [
+      500,
+      1000,
+      2000,
+      4000,
+      8000,
+      16000,
+      32000,
+      64000
+    ],
+    "roughness": [
+      0.024435515305912425,
+      0.615277143559705,
+      7.064800711133136,
+      6.62878253979396,
+      17.590788986959637,
+      9.189557330128881,
+      2.329861766598721,
+      7.685437447671264
+    ],
+    "bias": [
+      0.0033050612878475524,
+      0.06955545823277173,
+      5.068299010366839,
+      9.880978692327528,
+      12.637068998984388,
+      7.445371465544019,
+      3.8044247054472273,
+      20.87138265171903
+    ]
+  }
+}
