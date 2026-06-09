@@ -1,7 +1,7 @@
 # 3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生
 
-> 版本：3D 阶段 · E3D-0（2026-06-09）· 配套代码：[`models/`](../models/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
-> 复现：`conda activate pytorch`；依次 `python scripts/convert_dae_to_obj.py`、`python scripts/emit_model_summary.py`、`python scripts/render_standing_pose.py --device cuda:0`
+> 版本：3D 阶段 · E3D-0 + E3D-1（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
+> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`
 > 承接 2D 阶段结论见 [`../research_note.md`](../research_note.md)。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。
 
 本阶段把 2D 平面四足建模迁移到 **3D Unitree Go2 数字机体**。与之前不同，本阶段的核心要求是
@@ -140,8 +140,47 @@ URDF→运动学树→刚体前向运动学（FK）→逐连杆网格刚性蒙�
 
 ---
 
-## 7. 下一步（E3D-1 起）
+## 7. E3D-1：floating-base 单刚体动力学（坐标系/四元数/积分/可微钉死）〔实验〕
 
-1. **E3D-1**：3D 单刚体自由落体 / 悬空姿态积分（四元数归一化、惯量张量、积分稳定性）——把本阶段的浮动基位姿接上动力学。
-2. **E3D-2**：把 2D 的平滑接触/摩擦锥扩展到足端 3D 接触，复刻 E1 的"接触力-梯度"分析。
+> 配套：[`dynamics/floating_base_srbd.py`](../dynamics/floating_base_srbd.py)、[`models/go2_inertia.py`](../models/go2_inertia.py)、[`scripts/e3d1_floating_base_checks.py`](../scripts/e3d1_floating_base_checks.py)、[`notebooks/go2_01_3d_rigid_body.ipynb`](../notebooks/go2_01_3d_rigid_body.ipynb)。
+> 指导原则（用户）：**先不追求复杂，先把坐标系/惯量/四元数积分/可微性钉死**——这一层错了，E3D-2 的接触与摩擦锥会放大错误且难定位。
+
+### 7.1 全局约定（一次定清，全局统一）〔推导/代码〕
+
+状态 `x=(p,q,v,w)`：
+
+| 量 | frame | 说明 |
+|---|---|---|
+| `p` 位置 | **WORLD** | |
+| `q` 姿态 | Body→World | **单位四元数 (w,x,y,z) 标量在前**；`R=quaternion_to_matrix(q)`，`v_world=R·v_body`（与 FK / 无人机项目列向量约定一致，已数值核对）|
+| `v` 线速度 | **WORLD** | |
+| `w` 角速度 | **BODY** | `omega_body`，使 `I_body` 在体系常量 |
+| `f_world` 外力 | **WORLD** | 不含重力 |
+| `tau_body` 外力矩 | **BODY** | 关于 COM；接触换算 `f_world+=f_i, tau_body+=r_i×(Rᵀf_i)` 由调用方在调用点显式完成 |
+
+运动方程：`m dv/dt = m g + f_world`（世界系平动）、`I dw/dt = tau_body − w×(I w)`（体系 Euler 方程）、姿态用**体系旋转向量 `w·dt` 的指数映射**积分 `q_{t+1}=normalize(q_t ⊗ exp_quat(w·dt))`（右乘，因 `w` 是体系率）。**绝不用欧拉角积分**。积分器：半隐式（辛）Euler。
+SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 15.019 kg、`I diag≈(0.158, 0.469, 0.525)`、SPD（Ixx 最小=绕长轴）。
+
+### 7.2 五项验证〔实验〕
+
+![e3d1](../figures/e3d1_floating_base_checks.png)
+
+| 检验 | 结果 | 含义 |
+|---|---|---|
+| **C1 自由落体 vs 解析** | pz 误差 dt 减半→误差减半（比值 2.00，一阶收敛）；速度精确到 7.99e-14 | 坐标系/重力符号正确 |
+| **C2 四元数单位范数** | 8000 步 `max‖q‖-1 = 2.2e-16` | 姿态恒为合法单位四元数 |
+| **C3 力矩自由守恒（最关键）** | **世界系角动量** L 相对漂移 1.6e-3、转动能 2.8e-3，均**有界** | frame/符号正确（`w×(Iw)` 符号或四元数乘序错则此处发散）|
+| **C4 可微 vs 视野** | 梯度范数 50→1600 步 = 0.09→2.02，温和有界 | BPTT 梯度不爆炸 |
+| **C5 exp-map vs 欧拉角** | 欧拉角在 pitch→90° 梯度爆到 ~10（**≈200× 于 exp-map**），exp-map 始终 ≤0.05 | **定量复现"欧拉角积分致梯度爆炸"的踩坑，确认 exp-map 是正确选择** |
+
+### 7.3 结论〔实验〕
+- floating-base 单刚体动力学的**坐标系、惯量、四元数表示与积分、外力/力矩 frame、可微性**已全部钉死并交叉验证。
+- C3 是最有判别力的检验：世界系角动量/能量有界漂移直接证明 frame 与符号正确——这是接触层之前必须先拿到的"干净地基"。
+- C5 用 Go2 复合惯量定量复现了用户预警的欧拉角梯度爆炸，并证明 exp-map 指数映射积分免疫该病理。
+- 半隐式 Euler 的一阶漂移（C1 的 0.5·a·t·dt、C3 的 ~1e-3）是已知且有界的；若 E3D-3+ 长视野需要更紧守恒，可换 RK2/midpoint（接口不变）。
+
+## 8. 下一步（E3D-2 起）
+
+1. **E3D-2**：把 2D 的平滑接触/摩擦锥扩展到足端 3D 接触（法向平滑罚 + 平滑库仑/摩擦锥 + 接触门控），复刻 2D 的 E1"接触力-梯度"分析；外力/力矩按 §7.1 的 frame 换算接入 SRBD。
+2. **E3D-3**：3D SRBD 原地站立（平滑接触 + 目标损失 + GDecay/短视野），对照 smooth/hard。
 3. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
