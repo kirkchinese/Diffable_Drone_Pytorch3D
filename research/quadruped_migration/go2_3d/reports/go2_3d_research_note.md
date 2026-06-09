@@ -1,7 +1,7 @@
 # 3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生
 
-> 版本：3D 阶段 · E3D-0 + E3D-1（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
-> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`
+> 版本：3D 阶段 · E3D-0 + E3D-1 + E3D-2（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
+> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`
 > 承接 2D 阶段结论见 [`../research_note.md`](../research_note.md)。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。
 
 本阶段把 2D 平面四足建模迁移到 **3D Unitree Go2 数字机体**。与之前不同，本阶段的核心要求是
@@ -187,8 +187,38 @@ SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 1
 - C5 用 Go2 复合惯量定量复现了用户预警的欧拉角梯度爆炸，并证明 exp-map 指数映射积分免疫该病理。
 - 半隐式 Euler 的一阶漂移（C1 的 0.5·a·t·dt、C3 的 ~1e-3）是已知且有界的；若 E3D-3+ 长视野需要更紧守恒，可换 RK2/midpoint（接口不变）。
 
-## 8. 下一步（E3D-2 起）
+## 8. E3D-2：3D 足端接触（平滑法向 + 摩擦锥，frame 钉死）〔实验〕
 
-1. **E3D-2**：把 2D 的平滑接触/摩擦锥扩展到足端 3D 接触（法向平滑罚 + 平滑库仑/摩擦锥 + 接触门控），复刻 2D 的 E1"接触力-梯度"分析；外力/力矩按 §7.1 的 frame 换算接入 SRBD。
-2. **E3D-3**：3D SRBD 原地站立（平滑接触 + 目标损失 + GDecay/短视野），对照 smooth/hard。
+> 配套：[`dynamics/contact_3d.py`](../dynamics/contact_3d.py)、[`scripts/e3d2_contact_checks.py`](../scripts/e3d2_contact_checks.py)、[`notebooks/go2_02_smooth_contact_3d.ipynb`](../notebooks/go2_02_smooth_contact_3d.ipynb)。把 2D 的 E1/F1 接触梯度结论迁到 3D 平地足端。
+
+### 8.1 设计（按项目踩坑清单的优先级）〔推导/代码〕
+1. **frame 全部 WORLD**：足端位置/速度入、接触力出，地面法向 `n=+Z`。**绝不**混用 body 足速与 world 法向（会翻转摩擦方向）。world↔body 只在 [`contact_to_body_wrench`](../dynamics/floating_base_srbd.py) 一处发生。
+2. **可微近似不硬投影**：`pen=ε·softplus(−gap/ε)`；`f_n=k_n·pen+k_d·gate·srelu(−vn)`（`gate=sigmoid(−gap/ε)`，`srelu(x)=x·sigmoid(x/v_d)` 在 `vn=0` 恰为 0，**无静止伪力**）；`v_t=v_foot−vn·n`；`f_t=−μf_n·tanh(‖v_t‖/v_ε)·v_t/‖v_t‖`，故 **‖f_t‖≤μf_n 结构成立**、梯度处处有界（无 sign/硬 clamp）。
+3. 摩擦**对抗**切向速度（耗散）。
+
+### 8.2 六项验证（含 SRBD 落地积分）〔实验〕
+
+![e3d2](../figures/e3d2_contact_checks.png)
+
+| 检验 | 结果 | 对应 2D |
+|---|---|---|
+| **K1 法向力 vs 穿深** | 平滑梯度连续有界（~k_n=1e4）；硬接触起始处梯度不连续（阶跃）| E1 |
+| **K2 摩擦 vs 切向速度** | 平滑库仑梯度**有界且有信息**（峰 544）；硬库仑梯度**恒 0**（无信息）| F1 |
+| **K3 摩擦锥** | `max‖f_t‖/(μf_n)=1.0000`，违反率 **0%**（结构成立）| 新 |
+| **K4 摩擦方向** | `f_t·v_t≤0` 恒成立，非耗散率 **0%** | frame 踩坑检查 |
+| **K6 落地积分** | Go2 SRBD+4 足落地稳定 settle 到 COM z≈**0.243 m**，静止 **Σf_n=m·g（误差 0%）** | 新（接触→SRBD 回路）|
+
+全程可微、3080 GPU 运行（CPU/GPU 数值一致）。
+
+### 8.3 结论〔实验〕
+- 2D 的"平滑接触给可用梯度、硬接触梯度无信息"在 3D 足端**复现**（K1/K2）：摩擦的平滑库仑切向梯度有界有信息，硬库仑恒 0——这是 3D 可训练性的同一分水岭。
+- 摩擦锥用 **tanh 饱和**实现"可微近似"，`‖f_t‖≤μf_n` 结构成立、零违反，**避免了硬投影**（呼应用户踩坑 #3）。
+- K4 是 frame 踩坑的判别检验：world 足速 × world 法向 → 摩擦严格耗散，证明方向没反（呼应踩坑 #2）。
+- K6 把 contact_3d 经 §7.1 的 `contact_to_body_wrench` 接入 E3D-1 的 SRBD，落地稳定且静力平衡精确——**接触层与动力学层的接口闭合**。
+- 待办：body-frame 优化版接触换算（确认无误后）；接触门控的 softplus 尾巴（离地微小残力）已被 gate 压制但非严格 0，必要时可加更陡门控；E3D-3 将引入策略闭环。
+
+## 9. 下一步（E3D-3 起）
+
+1. **E3D-3**：3D SRBD 原地站立闭环最小可微训练（平滑接触 + 目标损失 + GDecay/短视野），对照 smooth/hard、with/without GDecay、full/short-horizon BPTT——3D 版 F3。
+2. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）。
 3. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
