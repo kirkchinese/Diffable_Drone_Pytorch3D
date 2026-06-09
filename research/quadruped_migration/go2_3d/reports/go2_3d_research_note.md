@@ -151,12 +151,20 @@ URDF→运动学树→刚体前向运动学（FK）→逐连杆网格刚性蒙�
 
 | 量 | frame | 说明 |
 |---|---|---|
-| `p` 位置 | **WORLD** | |
+| `p` 位置 | **WORLD** | **COM 位置**（非 base 原点）；base 原点 `= p − R·c_body`（平动/转动仅在 COM 处解耦）|
 | `q` 姿态 | Body→World | **单位四元数 (w,x,y,z) 标量在前**；`R=quaternion_to_matrix(q)`，`v_world=R·v_body`（与 FK / 无人机项目列向量约定一致，已数值核对）|
 | `v` 线速度 | **WORLD** | |
 | `w` 角速度 | **BODY** | `omega_body`，使 `I_body` 在体系常量 |
 | `f_world` 外力 | **WORLD** | 不含重力 |
-| `tau_body` 外力矩 | **BODY** | 关于 COM；接触换算 `f_world+=f_i, tau_body+=r_i×(Rᵀf_i)` 由调用方在调用点显式完成 |
+| `tau_body` 外力矩 | **BODY** | 关于 COM |
+
+**接触力矩换算（写死，不靠脑补——frame 混淆会悄悄翻转力矩）**〔推导/代码〕：世界系接触力 `f_i_world` 作用于世界系接触点 `p_i_world`，COM 在 `p_com_world = p`，`R=quaternion_to_matrix(q)`（Body→World）：
+```
+r_world  = p_i_world − p_com_world
+f_world  += f_i_world
+tau_body += Rᵀ (r_world × f_i_world)        # 关于 COM 的力矩，旋到体系
+```
+等价体系形式（恒等式 `R(a×b)=(Ra)×(Rb)`，R∈SO(3)）：`tau_body += (Rᵀr_world)×(Rᵀf_i_world) = r_body×f_body`。两种写法已**数值核对一致到 ~1e-7（CPU 与 3080 GPU）**、可微、GPU-clean。统一走 [`contact_to_body_wrench()`](../dynamics/floating_base_srbd.py) 以防误用；body-frame 优化版（`r_body=foot_body−c_body`）留待世界系版确认无误后再做。
 
 运动方程：`m dv/dt = m g + f_world`（世界系平动）、`I dw/dt = tau_body − w×(I w)`（体系 Euler 方程）、姿态用**体系旋转向量 `w·dt` 的指数映射**积分 `q_{t+1}=normalize(q_t ⊗ exp_quat(w·dt))`（右乘，因 `w` 是体系率）。**绝不用欧拉角积分**。积分器：半隐式（辛）Euler。
 SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 15.019 kg、`I diag≈(0.158, 0.469, 0.525)`、SPD（Ixx 最小=绕长轴）。
