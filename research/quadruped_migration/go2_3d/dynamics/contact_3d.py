@@ -93,8 +93,7 @@ def foot_contact_force_world(p_foot_world: torch.Tensor, v_foot_world: torch.Ten
 
     f_world = f_n * n + f_t
     return dict(f_world=f_world, f_n=f_n, f_t=f_t, pen=pen, gap=gap, v_t=v_t,
-                vt_mag=vt_mag if mode == "hard" else torch.linalg.norm(v_t, -1, keepdim=True),
-                cone_mag=cone_mag, mu_fn=p.mu * f_n)
+                vt_mag=vt_mag, cone_mag=cone_mag, mu_fn=p.mu * f_n)
 
 
 if __name__ == "__main__":

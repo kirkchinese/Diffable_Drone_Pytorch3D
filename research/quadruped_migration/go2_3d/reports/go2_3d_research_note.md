@@ -1,7 +1,7 @@
 # 3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生
 
-> 版本：3D 阶段 · E3D-0 + E3D-1 + E3D-2（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
-> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`
+> 版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
+> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`；E3D-3 `python scripts/e3d3_static_audit.py` + `python scripts/e3d3_standing_train.py --device cuda:0`
 > 承接 2D 阶段结论见 [`../research_note.md`](../research_note.md)。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。
 
 本阶段把 2D 平面四足建模迁移到 **3D Unitree Go2 数字机体**。与之前不同，本阶段的核心要求是
@@ -217,8 +217,52 @@ SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 1
 - K6 把 contact_3d 经 §7.1 的 `contact_to_body_wrench` 接入 E3D-1 的 SRBD，落地稳定且静力平衡精确——**接触层与动力学层的接口闭合**。
 - 待办：body-frame 优化版接触换算（确认无误后）；接触门控的 softplus 尾巴（离地微小残力）已被 gate 压制但非严格 0，必要时可加更陡门控；E3D-3 将引入策略闭环。
 
-## 9. 下一步（E3D-3 起）
+## 9. E3D-3：3D SRBD 原地站立闭环最小可微训练（2D-F3 的 3D 版）〔实验〕
 
-1. **E3D-3**：3D SRBD 原地站立闭环最小可微训练（平滑接触 + 目标损失 + GDecay/短视野），对照 smooth/hard、with/without GDecay、full/short-horizon BPTT——3D 版 F3。
-2. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）。
+> 配套：[`dynamics/srbd_standing.py`](../dynamics/srbd_standing.py)、[`scripts/e3d3_static_audit.py`](../scripts/e3d3_static_audit.py)、[`scripts/e3d3_standing_train.py`](../scripts/e3d3_standing_train.py)、[`notebooks/go2_03_srbd_standing.ipynb`](../notebooks/go2_03_srbd_standing.ipynb)、`results/e3d3_standing.json`。分两阶段：先静力审计，后闭环训练。
+
+### 9.1 动作空间与任务（明确控制器输出）〔推导/代码〕
+- **动作 `a∈R⁴`=四腿竖直伸长**（tanh 限幅 ±0.10 m），足端体系高度=nominal−a；**接触力由接触模型从穿深产生，不直接命令力**——保持接触梯度问题居中、策略贡献可量化（对应 2D-F3 的腿伸长动作）。
+- 足端接触速度只取**刚体部分** `v_com+ω×r`（不做位置差分，规避 2D-F4 的 1/dt 摩擦梯度爆炸）。姿态损失用**无奇异** `1−R[2,2]`（体 z 对世界 z），**不用欧拉角**。
+- 任务：从随机扰动（roll/pitch ±0.08 rad、高度 rest±0.03）regulate 到**目标高度 z\*=rest+0.04 m**（高于被动平衡，故**需策略**）+ 水平 + 速度收敛。
+
+### 9.2 Stage A 静力审计（站立前必查，对应踩坑 #1/#2/#7）〔实验〕
+
+![audit](../figures/e3d3_static_audit.png)
+
+| 检验 | 结果 |
+|---|---|
+| 足端命名/符号 | FL(+x,+y)/FR(+x,−y)/RL(−x,+y)/RR(−x,−y) 全部正确 |
+| 平衡（**不止竖直力**）| 净力 `[0,0,147.34]=[0,0,mg]`、**净力矩 `[0,0,0]`**、roll/pitch≈0 |
+| 静止高度来自几何 | settle 0.2426 vs 解析 `−foot_z_rel_com−mg/(4k_n)`=0.2423（差 0.34mm）|
+| 负载分配 | 前 73.0N/后 74.4N，比值 0.981=力臂比 0.1916/0.1952（恰好令净俯仰力矩=0）|
+| 落足重分配（命名验证）| pitch 扰动→纯**前后**载荷差（+439N，左右=0）；roll→纯**左右**（−332N，前后=0）——错配则会串扰，这里不串 |
+
+> 关键：`Σf_n=mg` 不够，**净力矩=0** 才是站立。审计同时确认了踩坑 #6——**被动接触能把对称四足站到水平**（故任务用高于被动平衡的目标高度逼出策略贡献）。
+
+### 9.3 Stage B 闭环训练〔实验〕
+
+![train](../figures/e3d3_standing_train.png)
+
+| 配置 | 训练损失 | 梯度范数(中位,裁剪前) | 长 rollout(5×=1.5s) 终态 |
+|---|---|---|---|
+| **smooth+noGDecay** | 0.020→**0.004** | 5.5e-3 | z 差 **6.5mm**、tilt 0.20° ✓最佳 |
+| smooth+GDecay | 0.020→0.006 | 2.4e-2 | z 差 30.5mm、tilt 0.20° |
+| smooth+shortH | 0.021→0.011 | 1.2e-2 | z 差 34mm、**tilt 6.45°(漂)** |
+| **hard+GDecay** | 0.028→**0.71(发散)** | **2.1e9** | z 差 162mm、**tilt 115°(倒)** |
+| passive(无策略) | — | — | z 差 39.7mm、tilt 0.003° |
+
+训练前梯度自检（踩坑 #4）：BPTT 梯度范数 smooth=**0.15** vs hard=**2.6×10¹⁰**。
+
+### 9.4 结论〔实验〕
+- **梯度分水岭 3D 复刻 2D-F3/E5**：硬接触浮动基 BPTT 梯度爆到 **10⁹–10¹⁰**（2D ">10⁶" 的放大版）；**smooth 训得动、hard 训不动**，同配方同裁剪——裁剪封幅不纠偏（2D-E4），故 hard 发散倒地。**失败是梯度性的（#9 非稻草人）**。
+- **策略必要性（#6）**：被动站到水平但够不到目标高度（差 39.7mm）；smooth+noGDecay 闭到 6.5mm——策略贡献可量化。
+- **GDecay 边际（诚实边界）**：平滑接触已梯度有界，GDecay 反略伤跟踪（30.5 vs 6.5mm）——价值域在刚性/长视野，与 2D-F3 附注一致。
+- **短视野漂移（#8）**：smooth+shortH 训练损失尚可，5× 长 rollout 暴露姿态慢漂 6.45°（全视野 0.2°）——**只看训练视野内 loss 会被骗，必须长 rollout 验证**。
+- **摩擦锥占用（#3）**：max cone=1.0 出现在起始 settle 暂态（刚性足随机身翻正而横扫滑动），稳态 cone→0；暂态饱和未阻碍 standing 收敛——锥饱和弱梯度对**持续蹬地的 locomotion（E3D-4）**更关键。建模注记：足端刚连机身、无落足锚定。
+
+## 10. 下一步（E3D-4 起）
+
+1. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）——含落足锚定 / 抬腿，正面处理摩擦锥持续占用与切向梯度。
+2. body-frame 优化版接触换算；E3D-5 与高保真仿真器状态对齐；E3D-6 残差动力学。
 3. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
