@@ -1,0 +1,1227 @@
+{
+  "provenance": {
+    "source_repo": "https://github.com/Unitree-Go2-Robot/go2_description",
+    "branch": "humble",
+    "commit": "8bd6717ff0c7b5ca388c0e10e426dd9ad873ceaf",
+    "urdf": "go2_3d/assets/go2_description/urdf/go2_description.urdf",
+    "generated_utc": "2026-06-09T04:38:25Z"
+  },
+  "robot_name": "go2_description",
+  "base_link": "base_link",
+  "n_links": 29,
+  "n_joints": 28,
+  "n_actuated_joints": 12,
+  "total_mass_kg": 15.019,
+  "canonical_leg_order": [
+    "FL",
+    "FR",
+    "RL",
+    "RR"
+  ],
+  "canonical_joint_order": [
+    "hip",
+    "thigh",
+    "calf"
+  ],
+  "sdk_motor_order_caveat": "Unitree low-level SDK indexes motors FR,FL,RR,RL (differs from URDF FL,FR,RL,RR).",
+  "leg_chain_geometry": {
+    "hip_mount_xyz": {
+      "FL": [
+        0.1934,
+        0.0465,
+        0.0
+      ],
+      "FR": [
+        0.1934,
+        -0.0465,
+        0.0
+      ],
+      "RL": [
+        -0.1934,
+        0.0465,
+        0.0
+      ],
+      "RR": [
+        -0.1934,
+        -0.0465,
+        0.0
+      ]
+    },
+    "hip_to_thigh_xyz": [
+      0.0,
+      0.0955,
+      0.0
+    ],
+    "thigh_length_m": 0.213,
+    "calf_length_m": 0.213
+  },
+  "zero_config_foot_offset_from_base": {
+    "FL": [
+      0.1934,
+      0.142,
+      -0.426
+    ],
+    "FR": [
+      0.1934,
+      -0.142,
+      -0.426
+    ],
+    "RL": [
+      -0.1934,
+      0.142,
+      -0.426
+    ],
+    "RR": [
+      -0.1934,
+      -0.142,
+      -0.426
+    ]
+  },
+  "nominal_standing_q_assumed": {
+    "hip": 0.0,
+    "thigh": 0.9,
+    "calf": -1.8
+  },
+  "foot_links": [
+    "FL_foot",
+    "FR_foot",
+    "RL_foot",
+    "RR_foot"
+  ],
+  "frame_convention": "URDF/ROS body frame: +X forward, +Y left, +Z up; gravity -Z.",
+  "links": {
+    "base_link": {
+      "has_inertial": true,
+      "mass": 6.921,
+      "com": [
+        0.021112,
+        0.0,
+        -0.005366
+      ],
+      "inertia": {
+        "ixx": 0.02448,
+        "iyy": 0.098077,
+        "izz": 0.107,
+        "ixy": 0.00012166,
+        "ixz": 0.0014849,
+        "iyz": -3.12e-05
+      },
+      "visual_mesh": "base",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "Head_upper": {
+      "has_inertial": true,
+      "mass": 0.001,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "Head_lower": {
+      "has_inertial": true,
+      "mass": 0.001,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "FL_hip": {
+      "has_inertial": true,
+      "mass": 0.678,
+      "com": [
+        -0.0054,
+        0.00194,
+        -0.000105
+      ],
+      "inertia": {
+        "ixx": 0.00048,
+        "iyy": 0.000884,
+        "izz": 0.000596,
+        "ixy": -3.01e-06,
+        "ixz": 1.11e-06,
+        "iyz": -1.42e-06
+      },
+      "visual_mesh": "hip",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FL_thigh": {
+      "has_inertial": true,
+      "mass": 1.152,
+      "com": [
+        -0.00374,
+        -0.0223,
+        -0.0327
+      ],
+      "inertia": {
+        "ixx": 0.00584,
+        "iyy": 0.0058,
+        "izz": 0.00103,
+        "ixy": 8.72e-05,
+        "ixz": -0.000289,
+        "iyz": 0.000808
+      },
+      "visual_mesh": "thigh",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FL_calf": {
+      "has_inertial": true,
+      "mass": 0.154,
+      "com": [
+        0.00548,
+        -0.000975,
+        -0.115
+      ],
+      "inertia": {
+        "ixx": 0.00108,
+        "iyy": 0.0011,
+        "izz": 3.29e-05,
+        "ixy": 3.4e-07,
+        "ixz": 1.72e-05,
+        "iyz": 8.28e-06
+      },
+      "visual_mesh": "calf",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FL_calflower": {
+      "has_inertial": false
+    },
+    "FL_calflower1": {
+      "has_inertial": false
+    },
+    "FL_foot": {
+      "has_inertial": true,
+      "mass": 0.04,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      },
+      "visual_mesh": "foot",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FR_hip": {
+      "has_inertial": true,
+      "mass": 0.678,
+      "com": [
+        -0.0054,
+        -0.00194,
+        -0.000105
+      ],
+      "inertia": {
+        "ixx": 0.00048,
+        "iyy": 0.000884,
+        "izz": 0.000596,
+        "ixy": 3.01e-06,
+        "ixz": 1.11e-06,
+        "iyz": 1.42e-06
+      },
+      "visual_mesh": "hip",
+      "visual_origin_rpy": [
+        3.1415,
+        0.0,
+        0.0
+      ]
+    },
+    "FR_thigh": {
+      "has_inertial": true,
+      "mass": 1.152,
+      "com": [
+        -0.00374,
+        0.0223,
+        -0.0327
+      ],
+      "inertia": {
+        "ixx": 0.00584,
+        "iyy": 0.0058,
+        "izz": 0.00103,
+        "ixy": -8.72e-05,
+        "ixz": -0.000289,
+        "iyz": -0.000808
+      },
+      "visual_mesh": "thigh_mirror",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FR_calf": {
+      "has_inertial": true,
+      "mass": 0.154,
+      "com": [
+        0.00548,
+        0.000975,
+        -0.115
+      ],
+      "inertia": {
+        "ixx": 0.00108,
+        "iyy": 0.0011,
+        "izz": 3.29e-05,
+        "ixy": -3.4e-07,
+        "ixz": 1.72e-05,
+        "iyz": -8.28e-06
+      },
+      "visual_mesh": "calf_mirror",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "FR_calflower": {
+      "has_inertial": false
+    },
+    "FR_calflower1": {
+      "has_inertial": false
+    },
+    "FR_foot": {
+      "has_inertial": true,
+      "mass": 0.04,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      },
+      "visual_mesh": "foot",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RL_hip": {
+      "has_inertial": true,
+      "mass": 0.678,
+      "com": [
+        0.0054,
+        0.00194,
+        -0.000105
+      ],
+      "inertia": {
+        "ixx": 0.00048,
+        "iyy": 0.000884,
+        "izz": 0.000596,
+        "ixy": 3.01e-06,
+        "ixz": -1.11e-06,
+        "iyz": -1.42e-06
+      },
+      "visual_mesh": "hip",
+      "visual_origin_rpy": [
+        0.0,
+        3.1415,
+        0.0
+      ]
+    },
+    "RL_thigh": {
+      "has_inertial": true,
+      "mass": 1.152,
+      "com": [
+        -0.00374,
+        -0.0223,
+        -0.0327
+      ],
+      "inertia": {
+        "ixx": 0.00584,
+        "iyy": 0.0058,
+        "izz": 0.00103,
+        "ixy": 8.72e-05,
+        "ixz": -0.000289,
+        "iyz": 0.000808
+      },
+      "visual_mesh": "thigh",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RL_calf": {
+      "has_inertial": true,
+      "mass": 0.154,
+      "com": [
+        0.00548,
+        -0.000975,
+        -0.115
+      ],
+      "inertia": {
+        "ixx": 0.00108,
+        "iyy": 0.0011,
+        "izz": 3.29e-05,
+        "ixy": 3.4e-07,
+        "ixz": 1.72e-05,
+        "iyz": 8.28e-06
+      },
+      "visual_mesh": "calf",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RL_calflower": {
+      "has_inertial": false
+    },
+    "RL_calflower1": {
+      "has_inertial": false
+    },
+    "RL_foot": {
+      "has_inertial": true,
+      "mass": 0.04,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      },
+      "visual_mesh": "foot",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RR_hip": {
+      "has_inertial": true,
+      "mass": 0.678,
+      "com": [
+        0.0054,
+        -0.00194,
+        -0.000105
+      ],
+      "inertia": {
+        "ixx": 0.00048,
+        "iyy": 0.000884,
+        "izz": 0.000596,
+        "ixy": -3.01e-06,
+        "ixz": -1.11e-06,
+        "iyz": 1.42e-06
+      },
+      "visual_mesh": "hip",
+      "visual_origin_rpy": [
+        3.1415,
+        3.1415,
+        0.0
+      ]
+    },
+    "RR_thigh": {
+      "has_inertial": true,
+      "mass": 1.152,
+      "com": [
+        -0.00374,
+        0.0223,
+        -0.0327
+      ],
+      "inertia": {
+        "ixx": 0.00584,
+        "iyy": 0.0058,
+        "izz": 0.00103,
+        "ixy": -8.72e-05,
+        "ixz": -0.000289,
+        "iyz": -0.000808
+      },
+      "visual_mesh": "thigh_mirror",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RR_calf": {
+      "has_inertial": true,
+      "mass": 0.154,
+      "com": [
+        0.00548,
+        0.000975,
+        -0.115
+      ],
+      "inertia": {
+        "ixx": 0.00108,
+        "iyy": 0.0011,
+        "izz": 3.29e-05,
+        "ixy": -3.4e-07,
+        "ixz": 1.72e-05,
+        "iyz": -8.28e-06
+      },
+      "visual_mesh": "calf_mirror",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "RR_calflower": {
+      "has_inertial": false
+    },
+    "RR_calflower1": {
+      "has_inertial": false
+    },
+    "RR_foot": {
+      "has_inertial": true,
+      "mass": 0.04,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 9.6e-06,
+        "iyy": 9.6e-06,
+        "izz": 9.6e-06,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      },
+      "visual_mesh": "foot",
+      "visual_origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "imu": {
+      "has_inertial": true,
+      "mass": 0.0,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 0.0,
+        "iyy": 0.0,
+        "izz": 0.0,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    },
+    "radar": {
+      "has_inertial": true,
+      "mass": 0.0,
+      "com": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inertia": {
+        "ixx": 0.0,
+        "iyy": 0.0,
+        "izz": 0.0,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyz": 0.0
+      }
+    }
+  },
+  "joints": {
+    "Head_upper_joint": {
+      "type": "fixed",
+      "parent": "base_link",
+      "child": "Head_upper",
+      "origin_xyz": [
+        0.285,
+        0.0,
+        0.01
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "Head_lower_joint": {
+      "type": "fixed",
+      "parent": "Head_upper",
+      "child": "Head_lower",
+      "origin_xyz": [
+        0.008,
+        0.0,
+        -0.07
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FL_hip_joint": {
+      "type": "revolute",
+      "parent": "base_link",
+      "child": "FL_hip",
+      "origin_xyz": [
+        0.1934,
+        0.0465,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.0472,
+        "upper": 1.0472,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "FL_thigh_joint": {
+      "type": "revolute",
+      "parent": "FL_hip",
+      "child": "FL_thigh",
+      "origin_xyz": [
+        0.0,
+        0.0955,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.5708,
+        "upper": 3.4907,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "FL_calf_joint": {
+      "type": "revolute",
+      "parent": "FL_thigh",
+      "child": "FL_calf",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -2.7227,
+        "upper": -0.83776,
+        "effort": 45.43,
+        "velocity": 15.7
+      }
+    },
+    "FL_calflower_joint": {
+      "type": "fixed",
+      "parent": "FL_calf",
+      "child": "FL_calflower",
+      "origin_xyz": [
+        0.02,
+        0.0,
+        -0.148
+      ],
+      "origin_rpy": [
+        0.0,
+        0.05,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FL_calflower1_joint": {
+      "type": "fixed",
+      "parent": "FL_calflower",
+      "child": "FL_calflower1",
+      "origin_xyz": [
+        -0.01,
+        0.0,
+        -0.04
+      ],
+      "origin_rpy": [
+        0.0,
+        0.48,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FL_foot_joint": {
+      "type": "fixed",
+      "parent": "FL_calf",
+      "child": "FL_foot",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FR_hip_joint": {
+      "type": "revolute",
+      "parent": "base_link",
+      "child": "FR_hip",
+      "origin_xyz": [
+        0.1934,
+        -0.0465,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.0472,
+        "upper": 1.0472,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "FR_thigh_joint": {
+      "type": "revolute",
+      "parent": "FR_hip",
+      "child": "FR_thigh",
+      "origin_xyz": [
+        0.0,
+        -0.0955,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.5708,
+        "upper": 3.4907,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "FR_calf_joint": {
+      "type": "revolute",
+      "parent": "FR_thigh",
+      "child": "FR_calf",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -2.7227,
+        "upper": -0.83776,
+        "effort": 45.43,
+        "velocity": 15.7
+      }
+    },
+    "FR_calflower_joint": {
+      "type": "fixed",
+      "parent": "FR_calf",
+      "child": "FR_calflower",
+      "origin_xyz": [
+        0.02,
+        0.0,
+        -0.148
+      ],
+      "origin_rpy": [
+        0.0,
+        0.05,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FR_calflower1_joint": {
+      "type": "fixed",
+      "parent": "FR_calflower",
+      "child": "FR_calflower1",
+      "origin_xyz": [
+        -0.01,
+        0.0,
+        -0.04
+      ],
+      "origin_rpy": [
+        0.0,
+        0.48,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "FR_foot_joint": {
+      "type": "fixed",
+      "parent": "FR_calf",
+      "child": "FR_foot",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RL_hip_joint": {
+      "type": "revolute",
+      "parent": "base_link",
+      "child": "RL_hip",
+      "origin_xyz": [
+        -0.1934,
+        0.0465,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.0472,
+        "upper": 1.0472,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "RL_thigh_joint": {
+      "type": "revolute",
+      "parent": "RL_hip",
+      "child": "RL_thigh",
+      "origin_xyz": [
+        0.0,
+        0.0955,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -0.5236,
+        "upper": 4.5379,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "RL_calf_joint": {
+      "type": "revolute",
+      "parent": "RL_thigh",
+      "child": "RL_calf",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -2.7227,
+        "upper": -0.83776,
+        "effort": 45.43,
+        "velocity": 15.7
+      }
+    },
+    "RL_calflower_joint": {
+      "type": "fixed",
+      "parent": "RL_calf",
+      "child": "RL_calflower",
+      "origin_xyz": [
+        0.02,
+        0.0,
+        -0.148
+      ],
+      "origin_rpy": [
+        0.0,
+        0.05,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RL_calflower1_joint": {
+      "type": "fixed",
+      "parent": "RL_calflower",
+      "child": "RL_calflower1",
+      "origin_xyz": [
+        -0.01,
+        0.0,
+        -0.04
+      ],
+      "origin_rpy": [
+        0.0,
+        0.48,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RL_foot_joint": {
+      "type": "fixed",
+      "parent": "RL_calf",
+      "child": "RL_foot",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RR_hip_joint": {
+      "type": "revolute",
+      "parent": "base_link",
+      "child": "RR_hip",
+      "origin_xyz": [
+        -0.1934,
+        -0.0465,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -1.0472,
+        "upper": 1.0472,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "RR_thigh_joint": {
+      "type": "revolute",
+      "parent": "RR_hip",
+      "child": "RR_thigh",
+      "origin_xyz": [
+        0.0,
+        -0.0955,
+        0.0
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -0.5236,
+        "upper": 4.5379,
+        "effort": 23.7,
+        "velocity": 30.1
+      }
+    },
+    "RR_calf_joint": {
+      "type": "revolute",
+      "parent": "RR_thigh",
+      "child": "RR_calf",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "limit": {
+        "lower": -2.7227,
+        "upper": -0.83776,
+        "effort": 45.43,
+        "velocity": 15.7
+      }
+    },
+    "RR_calflower_joint": {
+      "type": "fixed",
+      "parent": "RR_calf",
+      "child": "RR_calflower",
+      "origin_xyz": [
+        0.02,
+        0.0,
+        -0.148
+      ],
+      "origin_rpy": [
+        0.0,
+        0.05,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RR_calflower1_joint": {
+      "type": "fixed",
+      "parent": "RR_calflower",
+      "child": "RR_calflower1",
+      "origin_xyz": [
+        -0.01,
+        0.0,
+        -0.04
+      ],
+      "origin_rpy": [
+        0.0,
+        0.48,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "RR_foot_joint": {
+      "type": "fixed",
+      "parent": "RR_calf",
+      "child": "RR_foot",
+      "origin_xyz": [
+        0.0,
+        0.0,
+        -0.213
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "imu_joint": {
+      "type": "fixed",
+      "parent": "base_link",
+      "child": "imu",
+      "origin_xyz": [
+        -0.02557,
+        0.0,
+        0.04232
+      ],
+      "origin_rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    },
+    "radar_joint": {
+      "type": "fixed",
+      "parent": "base_link",
+      "child": "radar",
+      "origin_xyz": [
+        0.28945,
+        0.0,
+        -0.046825
+      ],
+      "origin_rpy": [
+        0.0,
+        2.8782,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "limit": null
+    }
+  }
+}
