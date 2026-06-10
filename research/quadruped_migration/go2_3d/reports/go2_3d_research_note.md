@@ -1,7 +1,7 @@
 # 3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生
 
-> 版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
-> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`；E3D-3 `python scripts/e3d3_static_audit.py` + `python scripts/e3d3_standing_train.py --device cuda:0`
+> 版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）+ E3D-6（2026-06-11）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
+> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`；E3D-3 `python scripts/e3d3_static_audit.py` + `python scripts/e3d3_standing_train.py --device cuda:0`；E3D-6 `python scripts/e3d6_channel_matching.py` + `python scripts/e3d6_dualhead_routing.py`（float64/CPU）
 > 承接 2D 阶段结论见 [`../research_note.md`](../research_note.md)。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。
 
 本阶段把 2D 平面四足建模迁移到 **3D Unitree Go2 数字机体**。与之前不同，本阶段的核心要求是
@@ -261,8 +261,59 @@ SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 1
 - **短视野漂移（#8）**：smooth+shortH 训练损失尚可，5× 长 rollout 暴露姿态慢漂 6.45°（全视野 0.2°）——**只看训练视野内 loss 会被骗，必须长 rollout 验证**。
 - **摩擦锥占用（#3）**：max cone=1.0 出现在起始 settle 暂态（刚性足随机身翻正而横扫滑动），稳态 cone→0；暂态饱和未阻碍 standing 收敛——锥饱和弱梯度对**持续蹬地的 locomotion（E3D-4）**更关键。建模注记：足端刚连机身、无落足锚定。
 
-## 10. 下一步（E3D-4 起）
+## 10. E3D-6：双通道残差——误差通道匹配与双头自动路由（2D R3/R8–R11 的 3D 版）〔实验〕
+
+> 配套：[`dynamics/residual_3d.py`](../dynamics/residual_3d.py)、[`scripts/e3d6_channel_matching.py`](../scripts/e3d6_channel_matching.py)、[`scripts/e3d6_dualhead_routing.py`](../scripts/e3d6_dualhead_routing.py)、`results/e3d6_*.json`。
+> 出处说明：本实验的先行版本曾在一条（已清理的）全身 ABA 平行实现上得到一致结论；本节为正史 SRBD 栈上的可复现版。E3D-4/5 顺延（E3D-6 提前是因为它是整个迁移研究的核心论点落点，由用户指定优先）。
+
+### 10.1 设计〔推导/代码〕
+
+把 2D 阶段的核心论点搬到 3D SRBD 站立环境验证："残差 `a = a_phys + r_φ` 必须放在**误差实际发生的通道**——力误差→接触力残差，几何误差→落足残差；放错通道即使前向能拟合，梯度也会坏。"
+
+- **双通道 hook**（`residual_3d.py`，同一 hook 既当已知失配又当残差输出，frame 纪律沿用 §7/§8）：
+  force = 世界系额外足端力 (B,4,3)，与接触力同点进同一 `r×f` 力矩求和（wrench 自洽）；
+  kin = 体系足偏移 (B,4,3)：`foot_w += R·δ`，杠杆与刚体足速同步用偏移后的 r。
+- **已知失配**（真实系统 = SRBD + 失配，ground truth 在手）：
+  `M_force = −κ·f_n·x̂`（κ=0.4，载荷比例固定向切向力——kin 偏移造不出固定方向切向力，纯力通道）；
+  `M_kin = δ=[0.02, 0, −0.012] m`（体系足端几何偏移，纯运动学通道）。
+- **判据 = 前向一步加速度 MSE + 梯度保真**：`∂(a_lin,a_ang)/∂leg_ext` 雅可比相对误差 vs 真实系统——这正是闭环 BPTT 实际消费的策略梯度通道。
+- **协议避坑**：状态采**标称** settle 早中期快照 ×1024（失配 rollout 会发散；回归只需一步加速度）；动作 leg_ext 独立随机 ±0.05；float64/CPU（梯度实验精度优先）；**2000 迭代收敛预算**（M_force 目标是接触状态的陡峭函数（k_n=1e4），拟合值≠拟合导数：400 迭代时匹配力头梯度误差 0.26，2000 迭代到 0.13；M_kin 目标是常数不受影响）；头输入 33 维含 gap+**vn**（`f_n` 的速度阻尼项需要 vn，缺它力头表示不全）；头输入全部由标称几何算出，不依赖头自身输出（无不动点回路）。
+
+### 10.2 E3D-6a：通道匹配 2×2〔实验〕
+
+| 失配 × 残差头 | 前向 MSE（标称基线） | ∂a/∂leg_ext 梯度相对误差（标称基线） |
+|---|---|---|
+| M_force × **R_force** ✓匹配 | **77.6** (3217) | **0.133** (0.297) |
+| M_force × R_kin ✗错通道 | 603 | 0.346 — **差于不加残差** |
+| M_kin × R_force ✗错通道 | 691 (13350，**前向好 19×**) | 0.441 — **差于不加残差** |
+| M_kin × **R_kin** ✓匹配 | **0.0088** | **0.001** |
+
+匹配通道平均梯度误差 **0.067** vs 错通道 **0.393**（5.9×）。两个关键观察：
+1. **两个错通道项的梯度都低于"什么都不加"的标称基线**——错通道残差不仅没用，还**主动污染**策略梯度。
+2. 最锋利的一刀仍是 `M_kin × R_force`：表达力强的力头把前向拟到比标称好 19×，梯度反而更坏——**前向拟合是糟糕的残差选型判据，梯度保真才是判别器**（与 2D R9 一致）。
+
+### 10.3 E3D-6b：双头自动路由〔实验〕
+
+两头同挂、联合前向回归 + 正则，验证"网络自己会放对"。预注册避坑：①N vs m 单位不可通约→正则统一折算**等效牛顿** `λ·(‖f‖² + ‖k_n·Δx‖²)`（两头同一物理汇率付费）；②kin 头经 k_n 放大权限→"主导"判定用**加速度空间消融归因** `C_i = E‖a(双头) − a(去头 i)‖` 不看输出范数；③退化簇→正则杀零空间，λ 扫 3 量级 + λ=0 对照；④要求双头 fit ≈ 匹配单头水平才算收敛；⑤主 λ 下 3 seeds。
+
+| 失配 | λ=0 | λ=1e-5 | λ=1e-4 (seed 0/1/2) | λ=1e-3 | 主配置 fit / 梯度误差 |
+|---|---|---|---|---|---|
+| M_force ρ(正确头) | 0.730 | 0.738 | **0.783 / 0.783 / 0.792** | 0.858 | 20.3 / **0.107** |
+| M_kin ρ(正确头) | 1.000 | 0.999 | **0.995 / 0.995 / 0.995** | 0.965 | 0.062 / **0.002** |
+
+- **判定：全部 λ>0/seed 的 ρ(正确头) 最小值 0.738 > 0.7 ✅ 自动路由成立**，方向对 λ 三个量级与 3 seeds 稳定。
+- **λ=0 对照**：路由主体由**拟合差距**驱动（M_kin 在零正则下已 ρ=1.000；M_force 0.730）；正则的作用是**单调提纯**力通道（0.730→0.858）而不改方向——路由不是正则 artifact。
+- **梯度保真闭环**：双头模型的雅可比误差 M_force **0.107**（甚至优于匹配单头 0.133——kin 头分担的份额未污染梯度）、M_kin **0.002**（=匹配单头）。**双头自动达到了匹配单头的梯度质量，无需人工选通道**——这就是 auto-routing 的全部价值。
+
+### 10.4 结论与诚实边界〔实验〕
+
+1. **误差通道匹配在 3D SRBD 上成立**（梯度判据 5.9×分离，错通道差于零残差基线）。
+2. **双头 + 前向回归自动路由成立**（min ρ=0.738，λ/seed 稳健），等效牛顿正则单调提纯。
+3. 边界：M_force 的路由是**部分的**（0.73–0.86 非 ≈1）——kin 头能经法向/杠杆通道表达力失配的一部分，正则汇率决定提纯程度；失配强度/形态会影响锐度。一步加速度回归 ≠ 闭环验证——"残差修正后的孪生训出的策略迁到真实系统更好"（梯度保真的最终兑现）留待 E3D-7。
+
+## 11. 下一步（E3D-4 起）
 
 1. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）——含落足锚定 / 抬腿，正面处理摩擦锥持续占用与切向梯度。
-2. body-frame 优化版接触换算；E3D-5 与高保真仿真器状态对齐；E3D-6 残差动力学。
-3. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
+2. body-frame 优化版接触换算；E3D-5 与高保真仿真器状态对齐；~~E3D-6 残差动力学~~（已完成，见 §10）。
+3. **E3D-7**：残差修正闭环——用双头修正后的孪生训站立/步态策略，迁回"真实系统"对比未修正孪生（梯度保真的最终兑现）。
+4. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
