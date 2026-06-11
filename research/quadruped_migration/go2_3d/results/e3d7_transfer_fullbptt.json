@@ -1,0 +1,26 @@
+{
+  "kin": {
+    "nominal": {
+      "loss_mean": 0.00984908510375438,
+      "loss_std": 0.0018713577319569893,
+      "track_rmse_mm": 14.954327611923096,
+      "tilt_deg": 2.101535458160064,
+      "ff_mm": 2.4078860284902883
+    },
+    "corrected": {
+      "loss_mean": 1.6363995777825604,
+      "loss_std": 2.286058151931332,
+      "track_rmse_mm": 72.5602459593941,
+      "tilt_deg": 37.85132482126901,
+      "ff_mm": 5.851028888840424
+    },
+    "oracle": {
+      "loss_mean": NaN,
+      "loss_std": NaN,
+      "track_rmse_mm": NaN,
+      "tilt_deg": NaN,
+      "ff_mm": NaN
+    },
+    "gap_closure": NaN
+  }
+}

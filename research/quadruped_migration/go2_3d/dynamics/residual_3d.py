@@ -31,7 +31,7 @@ from pytorch3d.transforms import quaternion_to_matrix
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from floating_base_srbd import FloatingBaseState, _matvec  # noqa: E402
+from floating_base_srbd import FloatingBaseState, _matvec, srbd_step  # noqa: E402
 from contact_3d import foot_contact_force_world  # noqa: E402
 from srbd_standing import StandingConfig, foot_world  # noqa: E402
 
@@ -75,6 +75,26 @@ def accel(state: FloatingBaseState, leg_ext: torch.Tensor, cfg: StandingConfig,
 
 
 # --------------------------------------------------------------------------- #
+def standing_step_hooked(state: FloatingBaseState, leg_ext: torch.Tensor,
+                         cfg: StandingConfig,
+                         f_extra: torch.Tensor | None = None,
+                         dx_body: torch.Tensor | None = None):
+    """带双通道注入的积分步（E3D-7）。与 srbd_standing.standing_step 同一物理路径：
+    hooks=None 时逐位等价（回归检查见 e3d7 脚本）。标称/真实/修正三系统统一走此函数。"""
+    foot_w, foot_v = foot_world_offset(state, leg_ext, cfg, dx_body)
+    out = foot_contact_force_world(foot_w, foot_v, cfg.contact)
+    f_each = out["f_world"] if f_extra is None else out["f_world"] + f_extra
+    R = quaternion_to_matrix(state.q)
+    r_world = foot_w - state.p[:, None, :]
+    tau_world = torch.cross(r_world, f_each, dim=-1).sum(1)
+    tau_body = torch.einsum("bji,bj->bi", R, tau_world)
+    nxt = srbd_step(state, cfg.mass, cfg.I_body, cfg.I_body_inv, cfg.dt,
+                    f_world=f_each.sum(1), tau_body=tau_body)
+    cone = torch.linalg.norm(out["f_t"], dim=-1) / out["mu_fn"].squeeze(-1).clamp_min(1e-9)
+    info = dict(f_n=out["f_n"].squeeze(-1), cone=cone, foot_world=foot_w)
+    return nxt, info
+
+
 def mismatch(kind: str, state: FloatingBaseState, leg_ext: torch.Tensor,
              cfg: StandingConfig):
     """真实系统的已知失配 → (f_extra, dx_body)。"""

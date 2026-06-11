@@ -1,7 +1,7 @@
 # 3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生
 
-> 版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）+ E3D-6（2026-06-11）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
-> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`；E3D-3 `python scripts/e3d3_static_audit.py` + `python scripts/e3d3_standing_train.py --device cuda:0`；E3D-6 `python scripts/e3d6_channel_matching.py` + `python scripts/e3d6_dualhead_routing.py`（float64/CPU）
+> 版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）+ E3D-6/E3D-7（2026-06-11）· 配套代码：[`models/`](../models/)、[`dynamics/`](../dynamics/)、[`scripts/`](../scripts/)、[`parameters/`](../parameters/)、[`figures/`](../figures/)
+> 复现：`conda activate pytorch`；E3D-0 `python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py`；E3D-1 `python scripts/e3d1_floating_base_checks.py`；E3D-2 `python scripts/e3d2_contact_checks.py --device cuda:0`；E3D-3 `python scripts/e3d3_static_audit.py` + `python scripts/e3d3_standing_train.py --device cuda:0`；E3D-6 `python scripts/e3d6_channel_matching.py` + `python scripts/e3d6_dualhead_routing.py`（float64/CPU）；E3D-7 依次 `python scripts/e3d7_mismatch_audit.py` → `e3d7_fit_residual.py` → `e3d7_grad_fidelity.py` → `e3d7_transfer.py --mismatches kin`
 > 承接 2D 阶段结论见 [`../research_note.md`](../research_note.md)。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。
 
 本阶段把 2D 平面四足建模迁移到 **3D Unitree Go2 数字机体**。与之前不同，本阶段的核心要求是
@@ -311,9 +311,90 @@ SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 1
 2. **双头 + 前向回归自动路由成立**（min ρ=0.738，λ/seed 稳健），等效牛顿正则单调提纯。
 3. 边界：M_force 的路由是**部分的**（0.73–0.86 非 ≈1）——kin 头能经法向/杠杆通道表达力失配的一部分，正则汇率决定提纯程度；失配强度/形态会影响锐度。一步加速度回归 ≠ 闭环验证——"残差修正后的孪生训出的策略迁到真实系统更好"（梯度保真的最终兑现）留待 E3D-7。
 
-## 11. 下一步（E3D-4 起）
+## 11. E3D-7：残差修正闭环——梯度保真的兑现与边界〔实验〕
 
-1. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）——含落足锚定 / 抬腿，正面处理摩擦锥持续占用与切向梯度。
-2. body-frame 优化版接触换算；E3D-5 与高保真仿真器状态对齐；~~E3D-6 残差动力学~~（已完成，见 §10）。
-3. **E3D-7**：残差修正闭环——用双头修正后的孪生训站立/步态策略，迁回"真实系统"对比未修正孪生（梯度保真的最终兑现）。
-4. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
+> 配套：[`scripts/e3d7_common.py`](../scripts/e3d7_common.py)（动态跟踪任务）、[`e3d7_mismatch_audit.py`](../scripts/e3d7_mismatch_audit.py)（Stage 0 闸门）、[`e3d7_fit_residual.py`](../scripts/e3d7_fit_residual.py)（Stage 1）、[`e3d7_grad_fidelity.py`](../scripts/e3d7_grad_fidelity.py)（Stage 2 主指标）、[`e3d7_transfer.py`](../scripts/e3d7_transfer.py)（Stage 3 闭环）；`results/e3d7_*.json`、`figures/e3d7_*.png`、`results/e3d7_models/`。
+> 问题：用 E3D-6 的双头残差修正孪生后，**它给策略的训练信号是否更接近真实系统**？三师对照：nominal（标称孪生）/ corrected（标称+冻结双头残差）/ oracle（真实系统，上界）。预注册坑：①失配对任务不敏感→Stage 0 闸门；②反馈掩盖模型误差；③残差分布外失效→残差改在真实闭环数据上拟（sim2real 管线）；④残差进回路的梯度；⑤公平比较（同架构/超参/seeds/eval 批）；⑥三系统统一积分路径（`standing_step_hooked`，hooks=None 与 `standing_step` 逐位一致 0.00e+00）。
+
+### 11.1 Stage 0 审计：反馈掩盖与任务校准（两次拦截，都是闸门的意义所在）〔实验〕
+
+![audit](../figures/e3d7_mismatch_audit.png)
+
+- **静态站立（E3D-3 任务）**：被动下失配影响巨大（real_kin 被动倒地 tilt 41°、real_force 持续漂移）；但**反馈策略几乎完全掩盖**——基线策略在三系统 eval loss 仅差 1.2×，残留只有稳态小偏置（M_kin 高度偏置 +7mm；M_force 不可抗漂移 ~3cm/s，垂直腿无法产生持续水平力）。坑②应验：闭环收敛表现不是模型误差的灵敏读数。
+- **动态跟踪任务 v1 的校准 bug（存档）**：沿用 E3D-3 权重 w_h=4 时"不跟踪"才是损失最优（速度罚>高度罚），基线 RMSE 38.7mm 比"坐中点不动"（17.7mm）还差——任务没在考模型。修正：w_h=20、T=0.6s、A=0.03（校准计算见 `e3d7_common.py` 注释）。
+- **闸门指标修正**：`baseline_real/baseline_nominal` 把"任务难度变化"与"老师可分性"混为一谈（real_kin 腿变长反而更接近目标，比值 0.66×）。正确的量 = **L_real(标称策略)/L_real(oracle策略)**。实测：M_kin 1.22×；**M_force 的 oracle 自身发散**（loss→6.4、倒至 111°——它试图用倾斜对抗不可控漂移）。结论：本任务闭环对比度有限，**主结论改由确定性梯度指标承重**（与 2D R8/R11 的处理一致）。
+
+### 11.2 Stage 1：残差在真实闭环数据上重拟（sim2real 管线）〔实验〕
+
+![fit](../figures/e3d7_fit_residual.png)
+
+坑③的对策落地：标称基线策略+探索噪声在"真实系统"滚动态跟踪轨迹，采 (state, action) 4096+1024 held-out，重训双头（λ=1e-4 等效牛顿）。**结果**：闭环动作覆盖到 ±0.09（远超 E3D-6 的 ±0.05 训练域——坑③是真的）；fit M_force 401→5.8/6.4（train/held-out，**62×**）、M_kin 5494→0.30/0.31（**18000×**），held-out≈train 无过拟；**自动路由在部署分布上保持**：ρ(正确头)=0.818/0.990。
+
+### 11.3 Stage 2 主结果：梯度保真 × 视野（确定性指标）〔实验〕
+
+![gradfid](../figures/e3d7_grad_fidelity.png)
+
+**一步雅可比（部署态全局 Frobenius ∂a/∂leg_ext 比，免逐态除零）**：
+
+| | nominal | corrected | 改善 |
+|---|---|---|---|
+| M_force | 0.187 | **0.058** | −69% |
+| M_kin | 0.950 | **0.008** | −99% |
+
+**策略梯度 ∇θL（6 策略点全局拼接 cos，对 oracle；H=BPTT 视野）**：
+
+| | H=75 | H=150 | H=300 | H=600 |
+|---|---|---|---|---|
+| M_kin nominal | 0.78 | 0.56 | 0.37 | (0.94†) |
+| M_kin **corrected** | **0.81** | **0.82** | 0.39 | (−0.71†) |
+| M_force nominal | 0.67 | 0.70 | 0.70 | **0.007** (rel 6.9) |
+| M_force **corrected** | 0.59 | 0.50 | 0.47 | **0.40** (rel 0.92) |
+
+†H=600 处 \|g_oracle\| 跨至 1.8e6（近混沌点支配，方向无信息）。
+
+**机制解读（本实验最重要的发现）——修正的收益集中在"失配 × 任务可控/损失相关子空间"的交集**：
+1. **M_kin**（失配直接打在可控的接触几何/高度通道）：corrected 在 TBPTT 工作区全面更优（H=150: 0.82 vs 0.56；逐点 5/6 胜，已训策略点 1.00 vs −0.43）。
+2. **M_force**（失配主要在弱可控漂移通道）：短视野 nominal 不受影响（其竖直动力学本就近似正确 cos≈0.7），corrected 略付"残差拟合噪声税"（≈0.5）；**长视野（H=600）未建模漂移积分进损失后 nominal 梯度崩塌（cos=0.007、rel=6.9）而 corrected 保持（0.40、0.92）**。
+3. **长视野 BPTT 梯度方向对两个孪生都被轨迹发散淹没**（H=600 近混沌支配）——一步雅可比近乎完美（−99%）也救不了长视野方向，**与 E3D-3 的视野教训、TBPTT 的有效区间同机制**：可微孪生的梯度要在短窗口里用。
+
+### 11.4 Stage 3：闭环迁移确认（仅 M_kin）——两种协议下均不可判定，如实报〔实验〕
+
+![transfer](../figures/e3d7_transfer.png)
+
+（M_force 的 oracle 因不可控漂移发散，闭环对比无意义，如实跳过；以下仅 M_kin。）
+
+**全程 BPTT（H=600，存档 `e3d7_transfer_fullbptt.json`）**：训练收敛率本身随系统难度分化——
+nominal 3/3 收敛（0.009–0.017）、corrected 1/3 发散（0.014/3.55/0.044）、**oracle（真实系统
+本身）2/3 发散（0.010/10.5/NaN）**。real_kin 的不对称几何更难训：随机初始化策略早期把系统
+推进跌倒/颤振区，正是 Stage 2 实测的 \|g\|→1.8e6 混沌区。**修正孪生忠实带入了真实系统的训练
+难度；nominal 因"错得更稳定"反而 3/3 收敛**——且其收敛策略靠反馈在真实系统照样
+0.0098±0.0019（坑②再现）。gap closure 因 oracle NaN 不可定义。
+
+**TBPTT-150（按 Stage 2 处方，`e3d7_transfer.json`）**：训练稳定性未系统改善——nominal
+seed0 在自己孪生里都不收敛（~0.1 游走），三师 eval 全被 seed 方差支配
+（nominal 1.69±1.94 / corrected 0.44±0.60 / oracle 1.10±1.54），oracle 均值反不如 corrected。
+
+**Stage 3 结论：闭环训练-迁移对比在站立/跟踪类任务上不可判定**——反馈掩盖（坑②）+ 训练
+稳定性 seed 噪声两座大山，两种 BPTT 协议都翻不过去。这是 2D R8/R11"闭环 seed-noisy、
+确定性结论靠梯度指标"教训带着完整证据链的 3D 重演；**E3D-7 的承重结论在 §11.3 的确定性
+梯度指标**。把闭环对比变可判的出路是任务（步态，E3D-4）而非协议调参。
+
+### 11.5 结论分级〔实验〕
+
+**已验证**
+1. 双头残差在**真实闭环数据**（sim2real 管线）上拟合精确且自动路由保持（ρ 0.82/0.99）。
+2. 修正孪生的**一步训练信号**决定性更接近真实系统（雅可比 −69%/−99%，确定性指标）。
+3. 策略梯度保真在 **TBPTT 工作区**兑现：失配落在任务可控子空间时（M_kin）corrected 全面更优；失配在弱可控通道时（M_force），nominal 短视野无碍但**长视野梯度崩塌，corrected 保持**。
+
+4. **修正孪生忠实带入真实系统的训练难度**（Stage 3 全程 BPTT：oracle 2/3 发散、corrected 1/3、nominal 0/3）——"好训"与"模型对"是两回事，错得稳定的模型可能更好训。
+
+**诚实边界**
+- 闭环收敛**表现**被反馈大幅掩盖（坑②实测）：站立/跟踪类任务对模型误差的闭环灵敏度低，"修正后训得更好"的闭环效应量小——梯度指标才是灵敏读数；叠加训练稳定性 seed 噪声后，闭环训练-迁移对比在本任务**不可判定**（§11.4，两协议实测）。
+- 长视野（≥600 步）BPTT 梯度方向被轨迹发散淹没，**与模型质量解耦**——任何孪生（含 oracle 邻域）都如此；残差修正不改变这一点，TBPTT 仍是必需。
+- corrected 在 M_force 短视野的轻微劣化（拟合噪声税）提示：**残差只应在其证据所在的通道/幅度内使用**——与 E3D-6 的通道匹配结论同源。
+
+## 12. 下一步（E3D-4 起）
+
+1. **E3D-4**：预定步态 3D 前向速度跟踪（3D 版 F4）——含落足锚定 / 抬腿，正面处理摩擦锥持续占用与切向梯度；步态任务对模型误差的闭环灵敏度应远高于站立（E3D-7 边界的自然出路）。
+2. body-frame 优化版接触换算；E3D-5 与高保真仿真器状态对齐。
+3. 减面版孪生（rendering LOD）以支持批量与短视野 BPTT。
