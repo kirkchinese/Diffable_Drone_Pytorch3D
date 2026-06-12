@@ -49,50 +49,46 @@ class GaitConfig:
         return self.vx_cmd * self.t_stance
 
 
-def foot_plan(t_step: int, a: torch.Tensor, cfg: StandingConfig, g: GaitConfig):
-    """相位闭式足端规划（体系）。a:(B,8)=每腿[ΔLx,Δext]（已限幅前的 tanh 输出）。
-    返回 p_b:(B,4,3)、pdot_b:(B,4,3)、stance:(4,) bool、phase φ∈[0,1)。"""
+def foot_plan(t_step, a: torch.Tensor, cfg: StandingConfig, g: GaitConfig):
+    """相位闭式足端规划（体系），**按样本相位全张量化**（残差训练需逐样本相位）。
+    t_step: 标量 或 (B,) 张量；a:(B,8)=每腿[ΔLx,Δext]（tanh 限幅在内）。
+    返回 p_b:(B,4,3)、pdot_b:(B,4,3)、stance:(B,4) bool、phase φ:(B,)。"""
     B = a.shape[0]
     dLx = g.dLx_max * torch.tanh(a[:, 0::2])          # (B,4)
     dext = g.dext_max * torch.tanh(a[:, 1::2])        # (B,4)
     Lx = g.lx0 + dLx                                   # (B,4) 每腿扫程
-    t = t_step * cfg.dt
-    phi_g = (t / g.period) % 1.0
-    p_b = a.new_zeros(B, 4, 3)
-    pdot_b = a.new_zeros(B, 4, 3)
-    stance = []
-    fr = cfg.foot_rel_com                              # (4,3) 站立标称（体系）
-    for li in range(4):
-        phi = (phi_g + PHASE_OFF[li]) % 1.0
-        st = phi < g.duty
-        stance.append(st)
-        if st:                                         # 支撑：线性后扫（摩擦速度伺服）
-            s = phi / g.duty
-            x = (0.5 - s) * Lx[:, li]
-            xdot = -Lx[:, li] / g.t_stance             # ≈ −vx_cmd
-            z = fr[li, 2] - g.ext0 - dext[:, li]
-            zdot = torch.zeros_like(x)
-        else:                                          # 摆动：端点速率连续样条 + 正弦抬腿
-            s = (phi - g.duty) / (1.0 - g.duty)
-            # f(0)=0,f(1)=1,f'(0)=f'(1)=−(1−duty)/duty：起落两端体系速率与支撑扫速连续
-            # → **着地回撤**（足触地瞬间世界速度≈0，消除每步制动脉冲——标准步态做法）
-            k = (1.0 - g.duty) / g.duty
-            a3 = -2.0 * (1.0 + k)
-            a2 = 3.0 * (1.0 + k)
-            f = a3 * s ** 3 + a2 * s ** 2 - k * s
-            fp = 3 * a3 * s ** 2 + 2 * a2 * s - k
-            x = (-0.5 + f) * Lx[:, li]
-            xdot = (fp / ((1 - g.duty) * g.period)) * Lx[:, li]
-            z = fr[li, 2] - g.ext0 - dext[:, li] \
-                + g.h_swing * np.sin(np.pi * s)
-            zdot = torch.full_like(x, g.h_swing * np.pi * np.cos(np.pi * s)
-                                   / ((1 - g.duty) * g.period))
-        p_b[:, li, 0] = fr[li, 0] + x
-        p_b[:, li, 1] = fr[li, 1]
-        p_b[:, li, 2] = z
-        pdot_b[:, li, 0] = xdot
-        pdot_b[:, li, 2] = zdot
-    return p_b, pdot_b, torch.tensor(stance), phi_g
+    if not torch.is_tensor(t_step):
+        t_step = a.new_full((B,), float(t_step))
+    phi_g = (t_step.to(a.dtype) * cfg.dt / g.period) % 1.0          # (B,)
+    off = a.new_tensor(PHASE_OFF)                                    # (4,)
+    phi = (phi_g[:, None] + off) % 1.0                               # (B,4)
+    st = phi < g.duty                                                # (B,4)
+    fr = cfg.foot_rel_com                                            # (4,3)
+    # 支撑：线性后扫（摩擦速度伺服）
+    s_st = phi / g.duty
+    x_st = (0.5 - s_st) * Lx
+    xd_st = -Lx / g.t_stance                                         # ≈ −vx_cmd
+    # 摆动：端点速率连续样条 + 正弦抬腿。f(0)=0,f(1)=1,f'(0)=f'(1)=−(1−duty)/duty
+    # → **着地回撤**（触地瞬间世界速度≈0，消除每步制动脉冲——标准步态做法）
+    s_sw = ((phi - g.duty) / (1.0 - g.duty)).clamp(0.0, 1.0)
+    k = (1.0 - g.duty) / g.duty
+    a3, a2 = -2.0 * (1.0 + k), 3.0 * (1.0 + k)
+    f = a3 * s_sw ** 3 + a2 * s_sw ** 2 - k * s_sw
+    fp = 3 * a3 * s_sw ** 2 + 2 * a2 * s_sw - k
+    x_sw = (-0.5 + f) * Lx
+    xd_sw = (fp / ((1 - g.duty) * g.period)) * Lx
+    z_sw_lift = g.h_swing * torch.sin(np.pi * s_sw)
+    zd_sw = g.h_swing * np.pi * torch.cos(np.pi * s_sw) / ((1 - g.duty) * g.period)
+    # 合成
+    x = torch.where(st, x_st, x_sw)
+    xdot = torch.where(st, xd_st, xd_sw)
+    z0 = fr[None, :, 2] - g.ext0 - dext                              # (B,4)
+    z = torch.where(st, z0, z0 + z_sw_lift)
+    zdot = torch.where(st, torch.zeros_like(zd_sw), zd_sw)
+    p_b = torch.stack([fr[None, :, 0] + x,
+                       fr[None, :, 1].expand(B, 4), z], dim=-1)      # (B,4,3)
+    pdot_b = torch.stack([xdot, torch.zeros_like(xdot), zdot], dim=-1)
+    return p_b, pdot_b, st, phi_g
 
 
 def gait_step(state: FloatingBaseState, t_step: int, a: torch.Tensor,

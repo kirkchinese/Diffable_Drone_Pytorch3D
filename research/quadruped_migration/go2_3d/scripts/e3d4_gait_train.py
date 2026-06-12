@@ -134,11 +134,12 @@ def evaluate(pol, cfg, g, z_ref, label, horizon=H_EVAL, seed=7, B=32):
         vxs.append(s2.v[:, 0].mean().item())
         zs.append(s2.p[:, 2].mean().item())
         atts.append(np.degrees(level_to_angle(level_error(s2.q).mean().item())))
-        st = info["stance"]
-        if st.any():
-            cones.append(info["cone"][:, st].mean().item())
+        st = info["stance"].float()                    # (B,4) 支撑掩码
+        if st.sum() > 0:
+            cones.append(((info["cone"] * st).sum() / st.sum()).item())
             # 支撑足世界滑移（锚定涌现诊断）：真实足世界速度（含指令项 R·ṗ_b）
-            slips.append(info["foot_v"][:, st, :2].norm(dim=-1).mean().item())
+            slip = info["foot_v"][..., :2].norm(dim=-1)
+            slips.append(((slip * st).sum() / st.sum()).item())
         s = s2
     vxs = np.array(vxs)
     half = horizon // 2
