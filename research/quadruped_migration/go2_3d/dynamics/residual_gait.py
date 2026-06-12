@@ -97,3 +97,23 @@ class GaitDualHead(nn.Module):
 
     def extras(self, state, t_step, a, cfg, g):
         return self.fh(state, t_step, a, cfg, g), self.kh(state, t_step, a, cfg, g)
+
+
+class StructuredDual(nn.Module):
+    """结构化参数残差（E3D-4b 收官判别实验）：力头只学标量 κ̂（基底 −f_n·x̂），
+    运动学头只学常量 δ̂∈R³。共 4 个参数 vs 自由 MLP 的 ~万级——若它兑现收益而
+    MLP 头不能，则败因=头的拟合/梯度质量，非修正概念；同时复刻 2D"结构化 vs
+    神经残差"边界（结构对了 4 参数胜过自由网络）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.kappa = nn.Parameter(torch.zeros(1))
+        self.delta = nn.Parameter(torch.zeros(3))
+
+    def extras(self, state, t_step, a, cfg, g):
+        foot_w, foot_v, _, _ = _foot_world_v(state, t_step, a, cfg, g)
+        f_n = foot_contact_force_world(foot_w, foot_v, cfg.contact)["f_n"]
+        xhat = state.p.new_tensor([1.0, 0.0, 0.0]).expand_as(foot_w)
+        fe = -self.kappa * f_n * xhat
+        dx = self.delta.expand(state.p.shape[0], 4, 3)
+        return fe, dx

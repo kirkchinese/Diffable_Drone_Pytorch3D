@@ -35,8 +35,8 @@ sys.path.insert(0, str(HERE))
 from srbd_standing import build_standing_config  # noqa: E402
 from floating_base_srbd import FloatingBaseState  # noqa: E402
 from gait_3d import GaitConfig, gait_step  # noqa: E402
-from residual_gait import (KAPPA, KIN_OFF, GaitDualHead, gait_accel,  # noqa: E402
-                           gait_mismatch)
+from residual_gait import (KAPPA, KIN_OFF, GaitDualHead, StructuredDual,  # noqa: E402
+                           gait_accel, gait_mismatch)
 from e3d4_gait_train import (GaitPolicy, observe, loss_step, sample_init,  # noqa: E402
                              evaluate, MODELS as MODELS4A)
 
@@ -343,19 +343,75 @@ def stage_transfer(cfg, g, z_ref):
             ls = [evals[(mk, teacher, s)]["loss"] for s in SEEDS]
             a.bar(i, np.mean(ls), 0.6, yerr=np.std(ls), color=TCOL[teacher], capsize=4)
         a.set_xticks(range(3)); a.set_xticklabels(TEACHERS)
-        a.set_title(f"M_{mk}: 真实系统 eval loss (3 seeds), gap closure="
-                    f"{summary[mk]['gap_closure']:.2f}")
-    fig.suptitle("E3D-4b: three teachers on the GAIT task — closed-loop becomes decidable",
-                 fontsize=13)
+        rms = [summary[mk][t]["vx_rmse_mm"] for t in TEACHERS]
+        a.set_title(f"M_{mk}: 真实系统 eval loss (3 seeds); vx RMSE "
+                    f"{rms[0]:.0f}/{rms[1]:.0f}/{rms[2]:.0f} mm/s")
+    fig.suptitle("E3D-4b: 三师×步态 — M_force 可判(oracle≪nominal) 但 MLP 残差头未接住"
+                 "(corrected 更差)；M_kin 仍被反馈掩盖", fontsize=12)
     fig.tight_layout()
     fig.savefig(FIG / "e3d4b_transfer.png", dpi=110, bbox_inches="tight")
     print(f"saved {FIG / 'e3d4b_transfer.png'}")
 
 
+def stage_structured(cfg, g, z_ref):
+    """收官判别：结构化参数残差（κ̂ + δ̂，4 参数）。若它兑现收益而自由 MLP 头不能
+    （M_force 闭环 68 vs nominal 39 vs oracle 18 mm/s），败因=头质量而非修正概念。"""
+    cfg64 = build_standing_config(device="cpu", dtype=torch.float64)
+    nom = load_nominal(cfg, 0)
+    fitted = {}
+    for mk in ["force", "kin"]:
+        S, T, A = collect_real(cfg, g, z_ref, nom, mk)
+        dtr, ttr, atr = to64(S, T, A, 4096)
+        with torch.no_grad():
+            aT = gait_accel(dtr, ttr, atr, cfg64, g,
+                            *gait_mismatch(mk, dtr, ttr, atr, cfg64, g))
+        sd = StructuredDual().double()
+        opt = torch.optim.Adam(sd.parameters(), lr=1e-2)
+        for _ in range(800):
+            fe, dx = sd.extras(dtr, ttr, atr, cfg64, g)
+            loss = ((gait_accel(dtr, ttr, atr, cfg64, g, fe, dx) - aT) ** 2).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():
+            fe, dx = sd.extras(dtr, ttr, atr, cfg64, g)
+            fit = ((gait_accel(dtr, ttr, atr, cfg64, g, fe, dx) - aT) ** 2).mean().item()
+        torch.save(sd.state_dict(), MODELS / f"gait_structured_{mk}.pt")
+        fitted[mk] = dict(fit=fit, kappa=float(sd.kappa.item()),
+                          delta=[float(x) for x in sd.delta])
+        print(f"  [structured M_{mk:5s}] fit={fit:.3e}  κ̂={sd.kappa.item():.4f}"
+              f"(真值 {KAPPA}) δ̂={np.round([float(x) for x in sd.delta],4).tolist()}"
+              f"(真值 {list(KIN_OFF)})")
+    # M_force（可判通道）上 corrected-structured ×3 seeds 训练+迁移
+    mk = "force"
+    sdev = StructuredDual().to(cfg.device, cfg.dtype)
+    sdev.load_state_dict(torch.load(MODELS / f"gait_structured_{mk}.pt",
+                                    map_location=cfg.device, weights_only=True))
+    for p in sdev.parameters():
+        p.requires_grad_(False)
+    extra = lambda s, t, a: sdev.extras(s, t, a, cfg, g)
+    es, t0 = [], time.time()
+    for seed in SEEDS:
+        pol, hist = train(cfg, g, z_ref, extra, seed=seed)
+        torch.save(pol.state_dict(), MODELS / f"gait_corrstruct_{mk}_s{seed}.pt")
+        e = eval_real(pol, cfg, g, z_ref, mk)
+        es.append(e)
+        print(f"  corrected-structured M_{mk} s{seed}: 训到 {hist[-1]:.4f} → "
+              f"真实 loss={e['loss']:.4f} vx RMSE={e['vx_rmse']*1e3:.0f}mm/s "
+              f"[{time.time()-t0:.0f}s]")
+    out = dict(fitted=fitted, transfer_force=dict(
+        loss_mean=float(np.mean([e["loss"] for e in es])),
+        loss_std=float(np.std([e["loss"] for e in es])),
+        vx_rmse_mm=float(np.mean([e["vx_rmse"] * 1e3 for e in es]))))
+    print(f"  M_force corrected-structured: loss {out['transfer_force']['loss_mean']:.4f}"
+          f"±{out['transfer_force']['loss_std']:.4f}  vx RMSE "
+          f"{out['transfer_force']['vx_rmse_mm']:.0f}mm/s "
+          f"(对照: nominal 39 / MLP-corrected 68 / oracle 18)")
+    (RESULTS / "e3d4b_structured.json").write_text(json.dumps(out, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", required=True,
-                    choices=["audit", "fit", "gradfid", "transfer"])
+                    choices=["audit", "fit", "gradfid", "transfer", "structured"])
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     cfg = build_standing_config(device=args.device, dtype=torch.float32)
@@ -363,7 +419,7 @@ def main():
     z_ref = cfg.rest_height + g.ext0 - 0.004
     print(f"E3D-4b [{args.stage}] ({args.device})")
     dict(audit=stage_audit, fit=stage_fit, gradfid=stage_gradfid,
-         transfer=stage_transfer)[args.stage](cfg, g, z_ref)
+         transfer=stage_transfer, structured=stage_structured)[args.stage](cfg, g, z_ref)
 
 
 if __name__ == "__main__":
