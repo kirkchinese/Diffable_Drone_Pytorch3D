@@ -51,15 +51,17 @@ def gait_accel(state: FloatingBaseState, t_step: int, a: torch.Tensor,
     return torch.cat([a_lin, a_ang], dim=-1)
 
 
-def gait_mismatch(kind: str, state, t_step, a, cfg, g):
-    """真实系统失配 → (f_extra, dx_body)。定义与 E3D-6/7 完全一致。"""
+def gait_mismatch(kind: str, state, t_step, a, cfg, g,
+                  kappa: float = KAPPA, kin_off=KIN_OFF):
+    """真实系统失配 → (f_extra, dx_body)。默认与 E3D-6/7 完全一致；
+    kappa/kin_off 可调供强度扫描（E3D-4c 统计加固）。"""
     if kind == "force":
         foot_w, foot_v, _, _ = _foot_world_v(state, t_step, a, cfg, g)
         f_n = foot_contact_force_world(foot_w, foot_v, cfg.contact)["f_n"]
         xhat = state.p.new_tensor([1.0, 0.0, 0.0]).expand_as(foot_w)
-        return -KAPPA * f_n * xhat, None
+        return -kappa * f_n * xhat, None
     if kind == "kin":
-        return None, state.p.new_tensor(KIN_OFF).expand(state.p.shape[0], 4, 3)
+        return None, state.p.new_tensor(kin_off).expand(state.p.shape[0], 4, 3)
     raise ValueError(kind)
 
 
