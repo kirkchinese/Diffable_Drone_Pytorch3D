@@ -94,9 +94,12 @@ def foot_plan(t_step, a: torch.Tensor, cfg: StandingConfig, g: GaitConfig):
 def gait_step(state: FloatingBaseState, t_step: int, a: torch.Tensor,
               cfg: StandingConfig, g: GaitConfig, mode: str = "smooth",
               f_extra: torch.Tensor | None = None,
-              dx_body: torch.Tensor | None = None):
+              dx_body: torch.Tensor | None = None,
+              gen_force: tuple | None = None):
     """一步：足规划→世界足位/解析足速→接触→wrench→srbd_step。
-    f_extra/dx_body = E3D-6/7 同款双通道 hook（E3D-4b 失配/残差用）。"""
+    f_extra/dx_body = E3D-6/7 同款双通道 hook（E3D-4b 失配/残差用）；
+    gen_force=(Δf_world(B,3), Δτ_body(B,3)) = E3D-5c 广义力通道（base 6-DoF 失配的
+    最小 in-class 表示，直接加到 base 净 wrench）。"""
     p_b, pdot_b, stance, phi = foot_plan(t_step, a, cfg, g)
     if dx_body is not None:
         p_b = p_b + dx_body
@@ -112,8 +115,12 @@ def gait_step(state: FloatingBaseState, t_step: int, a: torch.Tensor,
     f_each = out["f_world"] if f_extra is None else out["f_world"] + f_extra
     tau_world = torch.cross(r, f_each, dim=-1).sum(1)
     tau_body = torch.einsum("bji,bj->bi", R, tau_world)
+    f_tot = f_each.sum(1)
+    if gen_force is not None:
+        f_tot = f_tot + gen_force[0]
+        tau_body = tau_body + gen_force[1]
     nxt = srbd_step(state, cfg.mass, cfg.I_body, cfg.I_body_inv, cfg.dt,
-                    f_world=f_each.sum(1), tau_body=tau_body)
+                    f_world=f_tot, tau_body=tau_body)
     cone = torch.linalg.norm(out["f_t"], dim=-1) / out["mu_fn"].squeeze(-1).clamp_min(1e-9)
     info = dict(f_n=out["f_n"].squeeze(-1), cone=cone, foot_world=foot_w,
                 foot_v=foot_v, stance=stance, phase=phi)

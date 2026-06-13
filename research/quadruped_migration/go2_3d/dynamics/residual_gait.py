@@ -37,15 +37,20 @@ def _foot_world_v(state, t_step, a, cfg, g, dx_body=None):
 
 def gait_accel(state: FloatingBaseState, t_step: int, a: torch.Tensor,
                cfg: StandingConfig, g: GaitConfig,
-               f_extra=None, dx_body=None):
-    """一步广义加速度 (B,6)=[a_lin WORLD, a_ang BODY]，含双通道注入。全程可微。"""
+               f_extra=None, dx_body=None, gen_force=None):
+    """一步广义加速度 (B,6)=[a_lin WORLD, a_ang BODY]，含三通道注入。全程可微。
+    gen_force=(Δf_world,Δτ_body) 直接加到 base 净 wrench（E3D-5c 广义力通道）。"""
     foot_w, foot_v, _, R = _foot_world_v(state, t_step, a, cfg, g, dx_body)
     out = foot_contact_force_world(foot_w, foot_v, cfg.contact)
     f_each = out["f_world"] if f_extra is None else out["f_world"] + f_extra
     r = foot_w - state.p[:, None, :]
     tau_body = torch.einsum("bji,bj->bi", R, torch.cross(r, f_each, dim=-1).sum(1))
+    f_tot = f_each.sum(1)
+    if gen_force is not None:
+        f_tot = f_tot + gen_force[0]
+        tau_body = tau_body + gen_force[1]
     grav = state.p.new_tensor([0.0, 0.0, -9.81])
-    a_lin = grav + f_each.sum(1) / cfg.mass
+    a_lin = grav + f_tot / cfg.mass
     Iw = _matvec(cfg.I_body, state.w)
     a_ang = _matvec(cfg.I_body_inv, tau_body - torch.cross(state.w, Iw, dim=-1))
     return torch.cat([a_lin, a_ang], dim=-1)
@@ -99,6 +104,31 @@ class GaitDualHead(nn.Module):
 
     def extras(self, state, t_step, a, cfg, g):
         return self.fh(state, t_step, a, cfg, g), self.kh(state, t_step, a, cfg, g)
+
+
+class GenForceHead(nn.Module):
+    """E3D-5c 广义力残差：state → (Δf_world∈R³, Δτ_body∈R³)，直接修正 base 净 wrench。
+    base 6-DoF 失配（真实失配=base 加速度之差）的**最小 in-class 表示**；限幅按实测
+    失配量级（~165N / ~30N·m，由 E3D-5 fit 基线 MSE 反推），不放任表达力（E3D-5 教训）。
+    用法配合 gait_step/gait_accel 的 gen_force=(Δf,Δτ)。"""
+
+    # 限幅按"闭环训练可稳定"定（≈足力残差量级），非按拟合最优——E3D-5c 发现：
+    # 按失配量级(180N)的残差在 OOD 状态饱和到 170%自重、破坏训练。受限幅+输出正则后
+    # 才可训，代价是欠拟合（入类但仍受分布漂移约束）。
+    SCALE_F, SCALE_T = 70.0, 14.0
+
+    def __init__(self, in_dim: int = 29, hid: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_dim, hid), nn.ELU(),
+                                 nn.Linear(hid, hid), nn.ELU(), nn.Linear(hid, 6))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def gen(self, state, t_step, a, cfg, g):
+        out = torch.tanh(self.net(gait_head_obs(state, t_step, a, cfg, g)))
+        df = self.SCALE_F * out[:, :3]
+        dtau = self.SCALE_T * out[:, 3:]
+        return df, dtau
 
 
 class StructuredDual(nn.Module):
