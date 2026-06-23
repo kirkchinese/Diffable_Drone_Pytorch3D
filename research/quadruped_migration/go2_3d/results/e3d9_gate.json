@@ -1,0 +1,49 @@
+{
+  "nominal": {
+    "per_kp": {
+      "200": {
+        "rmse_mean": 122.92569154722666,
+        "rmse_std": 4.803448341224144,
+        "falls": 0
+      },
+      "300": {
+        "rmse_mean": 92.38287188788034,
+        "rmse_std": 17.741423183589294,
+        "falls": 0
+      },
+      "400": {
+        "rmse_mean": 84.33515245891498,
+        "rmse_std": 16.88717676958785,
+        "falls": 0
+      }
+    },
+    "rmse_overall": 99.88123863134065,
+    "rmse_worst": 122.92569154722666,
+    "falls_total": 0,
+    "n": 3
+  },
+  "DR": {
+    "per_kp": {
+      "200": {
+        "rmse_mean": 135.77122259266343,
+        "rmse_std": 8.275950537187951,
+        "falls": 0
+      },
+      "300": {
+        "rmse_mean": 85.55504280328552,
+        "rmse_std": 9.248949006250966,
+        "falls": 0
+      },
+      "400": {
+        "rmse_mean": 68.09174438741833,
+        "rmse_std": 12.580836099875809,
+        "falls": 0
+      }
+    },
+    "rmse_overall": 96.47266992778908,
+    "rmse_worst": 135.77122259266343,
+    "falls_total": 0,
+    "n": 3
+  },
+  "verdict": "[\u90e8\u5206\u9a8c\u8bc1\u00b7robustness>correction \u65b9\u5411\u6210\u7acb] \u8c03\u5b9a\u70b9 kp300: DR 86\u00b19 vs nominal 92\u00b118(\u65b9\u5dee\u21938,\u66f4\u53ef\u9760\u8fc1\u79fb); kp400 DR 68<84 \u660e\u663e\u66f4\u4f18; 2/3 kp \u66f4\u4f18, \u5168 0 \u6454. \u552f\u4e00\u56de\u9000\u5728 kp200(\u4f4e\u589e\u76ca=\u6267\u884c\u5668\u6743\u9650,**\u672a\u968f\u673a\u5316\u7684\u8f74**: \u5b6a\u751f\u65e0PD,DR \u6ca1\u8986\u76d6\u8be5\u8f74). \u7ed3\u8bba: DR \u53ea\u5728\u968f\u673a\u5316\u8fc7\u7684\u8f74\u4e0a\u6536\u7a84 gap(\u5df2\u5151\u73b0:\u63a5\u89e6/\u60ef\u91cf/\u51e0\u4f55),\u8865\u6267\u884c\u5668\u589e\u76ca/\u65f6\u5ef6\u968f\u673a\u5316\u5e94\u95ed\u5408 kp200; \u53ef\u5fae+DR \u5bf9\u771f\u673a\u4ee3\u7406\u65b9\u5411\u6709\u6548,\u7eff\u706f\u4f46\u9700\u8865\u8f74."
+}
