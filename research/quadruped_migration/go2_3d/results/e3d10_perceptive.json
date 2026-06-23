@@ -1,0 +1,17 @@
+{
+  "blind": {
+    "fell_frac": 0.875,
+    "dist_mean": 0.11913303285837173,
+    "dist_alive": 1.3794710636138916,
+    "vx_alive": 0.2053758203983307,
+    "gnorm_med": 0.20550056546926498
+  },
+  "perceptive": {
+    "fell_frac": 0.921875,
+    "dist_mean": -0.02817978709936142,
+    "dist_alive": 0.6870255470275879,
+    "vx_alive": 0.10633925348520279,
+    "gnorm_med": 42.40962082892656
+  },
+  "verdict": "\u26a0 \u5730\u5f62\u4e0a \u611f\u77e5 vs \u76f2: \u6454 92% vs 88%\u3001\u524d\u8fdb -0.03 vs 0.12m. \u68af\u5ea6\u6709\u754c(|g|\u4e2d\u4f4d \u76f20.2/\u611f\u77e542.4=\u5e73\u6ed1\u5730\u5f62+heightmap\u53ef\u5fae). \u611f\u77e5\u672a\u663e\u8457\u4f18\u4e8e\u76f2\u2014\u2014\u67e5\u5730\u5f62\u96be\u5ea6/heightmap\u4fe1\u606f\u91cf/swing\u6743\u9650,\u6216\u52a0trip\u7f5a\u3002"
+}
