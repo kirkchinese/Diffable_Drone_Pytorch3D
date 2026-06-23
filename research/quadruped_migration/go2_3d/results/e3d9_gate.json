@@ -45,5 +45,28 @@
     "falls_total": 0,
     "n": 3
   },
-  "verdict": "[\u90e8\u5206\u9a8c\u8bc1\u00b7robustness>correction \u65b9\u5411\u6210\u7acb] \u8c03\u5b9a\u70b9 kp300: DR 86\u00b19 vs nominal 92\u00b118(\u65b9\u5dee\u21938,\u66f4\u53ef\u9760\u8fc1\u79fb); kp400 DR 68<84 \u660e\u663e\u66f4\u4f18; 2/3 kp \u66f4\u4f18, \u5168 0 \u6454. \u552f\u4e00\u56de\u9000\u5728 kp200(\u4f4e\u589e\u76ca=\u6267\u884c\u5668\u6743\u9650,**\u672a\u968f\u673a\u5316\u7684\u8f74**: \u5b6a\u751f\u65e0PD,DR \u6ca1\u8986\u76d6\u8be5\u8f74). \u7ed3\u8bba: DR \u53ea\u5728\u968f\u673a\u5316\u8fc7\u7684\u8f74\u4e0a\u6536\u7a84 gap(\u5df2\u5151\u73b0:\u63a5\u89e6/\u60ef\u91cf/\u51e0\u4f55),\u8865\u6267\u884c\u5668\u589e\u76ca/\u65f6\u5ef6\u968f\u673a\u5316\u5e94\u95ed\u5408 kp200; \u53ef\u5fae+DR \u5bf9\u771f\u673a\u4ee3\u7406\u65b9\u5411\u6709\u6548,\u7eff\u706f\u4f46\u9700\u8865\u8f74."
+  "DR+act": {
+    "per_kp": {
+      "200": {
+        "rmse_mean": 128.22867636177628,
+        "rmse_std": 14.845367946617625,
+        "falls": 0
+      },
+      "300": {
+        "rmse_mean": 86.03229090003747,
+        "rmse_std": 10.3190869403867,
+        "falls": 0
+      },
+      "400": {
+        "rmse_mean": 144.63496534666555,
+        "rmse_std": 102.83945861055274,
+        "falls": 0
+      }
+    },
+    "rmse_overall": 119.63197753615977,
+    "rmse_worst": 144.63496534666555,
+    "falls_total": 0,
+    "n": 3
+  },
+  "verdict": "[E3D-9b \u8865\u6267\u884c\u5668\u6ede\u540eDR\u2014\u2014\u4ea4\u53c9\u6298\u635f,DR \u975e\u514d\u8d39] kp200(\u76ee\u6807\u8f6f\u9a71\u52a8\u8f74) DR+act 128 < DR 136 \u6539\u5584\u4f46\u4ecd > nominal 123(**\u672a\u95ed\u5408**); \u4ee3\u4ef7: kp400 145\u00b1103 \u226b DR 68(**\u56de\u9000+\u5931\u7a33**), \u8de8kp\u603b\u5747 DR+act 120 > DR 96(\u51c0\u66f4\u5dee); \u5168 0 \u6454. \u8bda\u5b9e\u7ed3\u8bba: \u4e00\u9636\u6ede\u540e\u662f\u4f4e kp \u5931\u914d(=\u67d4\u987a+\u6b20\u8fbe+\u6ede\u540e)\u7684**\u7c97\u4ee3\u7406**\u2014\u2014\u53ea\u8865'\u6162'\u6ca1\u8865'\u6b20\u8fbe/\u67d4\u987a'\u2192\u65e2\u6ca1\u95ed\u5408 kp200 \u53c8\u8fc7\u5ea6\u5c55\u5bbd\u4f24\u4e86\u521a\u6027\u7aef kp400; **DR \u7684\u8f74\u5fc5\u987b\u5fe0\u5b9e\u5efa\u6a21\u771f\u5b9e\u673a\u5236**(\u540c\u5168\u5f27: \u7ed3\u6784/\u4fdd\u771f\u662f\u627f\u91cd\u5899), dynamics-only DR(E3D-9)\u4ecd\u662f\u6700\u7a33\u8d62\u7684\u9c81\u68d2\u81c2\u3002"
 }
