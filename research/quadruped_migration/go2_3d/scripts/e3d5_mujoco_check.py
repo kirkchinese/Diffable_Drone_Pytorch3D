@@ -56,11 +56,14 @@ def _make_mj(cfg, kp, kd):
 
 
 def rollout_mj(policy, cfg, g, z_ref, seconds=4.0, kp=300.0, kd=5.0,
-               video_path=None, noise=0.0, seed=0, record_data=False):
+               video_path=None, noise=0.0, seed=0, record_data=False, ground_mu=None):
     """策略（或 None=开环）在 MuJoCo 上滚 seconds 秒。
-    返回 metrics 字典；record_data=True 时附 (states, t_steps, actions, next_v, next_w)。"""
+    返回 metrics 字典；record_data=True 时附 (states, t_steps, actions, next_v, next_w)。
+    ground_mu 不为 None 时把所有 geom 的滑动摩擦设为该值（E3D-11 摩擦扫描）。"""
     mj = _make_mj(cfg, kp, kd)
     mj.reset()
+    if ground_mu is not None:
+        mj.m.geom_friction[:, 0] = ground_mu
     gen = torch.Generator().manual_seed(seed)
     # 初始化：基座放 home，关节按 t=0 足端目标 IK
     a0 = torch.zeros(1, 8)
