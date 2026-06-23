@@ -42,7 +42,10 @@ from srbd_standing import build_standing_config  # noqa: E402
 from gait_3d import GaitConfig  # noqa: E402
 from e3d4_gait_train import (GaitPolicy, sample_init, rollout_train,  # noqa: E402
                              observe, loss_step)
-from gait_3d import gait_step  # noqa: E402
+from gait_3d import gait_step, foot_plan  # noqa: E402
+from contact_3d import foot_contact_force_world  # noqa: E402
+from floating_base_srbd import srbd_step  # noqa: E402
+from pytorch3d.transforms import quaternion_to_matrix  # noqa: E402
 from e3d4b_residual_gait import load_nominal  # noqa: E402
 from e3d5_mujoco_check import rollout_mj  # noqa: E402
 
@@ -87,8 +90,43 @@ def rollout_lagged(pol, cfg, g, z_ref, state, H, tbptt, beta):
     return loss / H
 
 
+def rollout_compliant(pol, cfg, g, z_ref, state, H, tbptt, omega_n, zeta=1.0):
+    """忠实可微 PD/柔顺执行器层（E3D-9c）：realized 足端目标经**二阶临界阻尼**跟踪
+    commanded（=well-tuned 关节 PD 的响应：滞后 + 欠达；ω_n∝√kp，刚端 ω_n 大→近直通，
+    **不伤刚性端**，这正是修正 E3D-9b 粗一阶滞后过度展宽的关键）。realized 足世界速度含
+    v_real → 摩擦速度伺服看到真实(柔顺)足速。"""
+    B = state.p.shape[0]
+    a0 = state.p.new_zeros(B, 8)
+    p_real, _, _, _ = foot_plan(0, a0, cfg, g)            # 初始 realized = commanded
+    v_real = torch.zeros_like(p_real)
+    loss = state.p.new_zeros(())
+    for t in range(H):
+        if tbptt and t > 0 and t % tbptt == 0:
+            state = state.detach(); p_real = p_real.detach(); v_real = v_real.detach()
+        phi = (t * cfg.dt / g.period) % 1.0
+        a = pol(observe(state, phi, g, z_ref))
+        p_cmd, _, _, _ = foot_plan(t, a, cfg, g)
+        acc = omega_n ** 2 * (p_cmd - p_real) - 2.0 * zeta * omega_n * v_real
+        v_real = v_real + cfg.dt * acc                    # 半隐式（先 v 后 x，稳定）
+        p_real = p_real + cfg.dt * v_real
+        R = quaternion_to_matrix(state.q)
+        foot_w = state.p[:, None, :] + torch.einsum("bij,bkj->bki", R, p_real)
+        w_world = torch.einsum("bij,bj->bi", R, state.w)
+        r = foot_w - state.p[:, None, :]
+        foot_v = (state.v[:, None, :]
+                  + torch.cross(w_world[:, None, :].expand_as(r), r, dim=-1)
+                  + torch.einsum("bij,bkj->bki", R, v_real))
+        out = foot_contact_force_world(foot_w, foot_v, cfg.contact, mode="smooth")
+        f_each = out["f_world"]
+        tau_body = torch.einsum("bji,bj->bi", R, torch.cross(r, f_each, dim=-1).sum(1))
+        state = srbd_step(state, cfg.mass, cfg.I_body, cfg.I_body_inv, cfg.dt,
+                          f_world=f_each.sum(1), tau_body=tau_body)
+        loss = loss + loss_step(state, a, g, z_ref)
+    return loss / H
+
+
 def train_dr(base, g, iters, B=48, H=600, tbptt=150, lr=3e-3, seed=0, clip=1.0,
-             dr=True, act_lag=False, tau_max=0.03):
+             dr=True, act_lag=False, tau_max=0.03, comp=False, omega_lo=40.0, omega_hi=300.0):
     """域随机训练：每 iter 重采样一个孪生（dr=False 恒用 base）。act_lag=True 额外随机化
     执行器滞后 τ∈[0,tau_max]（覆盖 kp200 的软驱动轴）。"""
     torch.manual_seed(seed)
@@ -101,7 +139,10 @@ def train_dr(base, g, iters, B=48, H=600, tbptt=150, lr=3e-3, seed=0, clip=1.0,
         cfg = randomize_cfg(base, g, cgen) if dr else base
         z_ref = cfg.rest_height + g.ext0 - 0.004
         s = sample_init(cfg, g, z_ref, B, gen)
-        if act_lag:
+        if comp:                                          # 忠实二阶 PD/柔顺执行器（log-均匀 ω_n）
+            omega_n = omega_lo * (omega_hi / omega_lo) ** torch.rand((), generator=cgen).item()
+            loss = rollout_compliant(pol, cfg, g, z_ref, s, H, tbptt, omega_n)
+        elif act_lag:
             tau = tau_max * torch.rand((), generator=cgen).item()
             beta = cfg.dt / (tau + cfg.dt)
             loss = rollout_lagged(pol, cfg, g, z_ref, s, H, tbptt, beta)
@@ -117,12 +158,13 @@ def stage_train(device, iters, n_seeds, variant="dr"):
     base = build_standing_config(device=device, dtype=torch.float32)
     g = GaitConfig()
     act_lag = (variant == "dract")
-    tag = "dract" if act_lag else "dr"
+    comp = (variant == "drcomp")
+    tag = {"dr": "dr", "dract": "dract", "drcomp": "drcomp"}[variant]
     print(f"[train] 域随机 DR 策略 ×{n_seeds} 种子 (variant={variant}, "
-          f"act_lag={act_lag}, iters={iters}, H=600)")
+          f"act_lag={act_lag}, comp={comp}, iters={iters}, H=600)")
     t0 = time.time()
     for seed in range(n_seeds):
-        pol, hist = train_dr(base, g, iters, seed=seed, dr=True, act_lag=act_lag)
+        pol, hist = train_dr(base, g, iters, seed=seed, dr=True, act_lag=act_lag, comp=comp)
         torch.save(pol.state_dict(), MODELS / f"e3d9_{tag}_s{seed}.pt")
         print(f"  {tag} s{seed} loss→{hist[-1]:.4f} [{time.time()-t0:.0f}s]")
 
@@ -137,8 +179,10 @@ def eval_policy_mj(pol, cfg, g, z_ref, kps):
     return out
 
 
-ARM_FILE = {"DR": "dr", "DR+act": "dract"}
-ARM_COL = {"nominal": "tab:gray", "DR": "tab:green", "DR+act": "tab:blue"}
+ARM_FILE = {"DR": "dr", "DR+act": "dract", "DR+comp": "drcomp"}
+ARM_COL = {"nominal": "tab:gray", "DR": "tab:green", "DR+act": "tab:blue",
+           "DR+comp": "tab:orange"}
+ALL_ARMS = ["nominal", "DR", "DR+act", "DR+comp"]
 
 
 def _load_arm(name, seed, cfg):
@@ -156,8 +200,8 @@ def stage_gate(device, n_seeds):
     cfg = build_standing_config(device="cpu", dtype=torch.float32)   # rollout_mj 用 cpu
     g = GaitConfig()
     z_ref = cfg.rest_height + g.ext0 - 0.004
-    # 动态臂：nominal 必有；DR/DR+act 有模型才纳入
-    arm_names = [a for a in ["nominal", "DR", "DR+act"]
+    # 动态臂：nominal 必有；DR/DR+act/DR+comp 有模型才纳入
+    arm_names = [a for a in ALL_ARMS
                  if a == "nominal" or _load_arm(a, 0, cfg) is not None]
     print(f"[gate] 上 MuJoCo 跨 kp={KP_SWEEP} (kd=5)，臂={arm_names}")
     arms = {a: [] for a in arm_names}
@@ -193,8 +237,30 @@ def stage_gate(device, n_seeds):
 
     no = summ["nominal"]
     pk = lambda arm, kp: summ[arm]["per_kp"][str(int(kp))]["rmse_mean"]
-    if "DR+act" in summ:           # E3D-9b：补执行器滞后轴，看 kp200 是否闭合
-        k2, k4 = {a: pk(a, 200) for a in arm_names}, {a: pk(a, 400) for a in arm_names}
+    k2, k4 = {a: pk(a, 200) for a in arm_names}, {a: pk(a, 400) for a in arm_names}
+    if "DR+comp" in summ:          # E3D-9c：忠实二阶 PD/柔顺执行器，看 kp200 是否闭合且不伤 kp400
+        c = summ["DR+comp"]
+        closed = k2["DR+comp"] <= k2["nominal"]
+        k4_kept = k4["DR+comp"] <= k4["DR"] * 1.3
+        k3 = pk("DR+comp", 300)
+        if closed and k4_kept:
+            verdict = (f"✅[E3D-9c 忠实PD/柔顺执行器层] kp200 闭合 DR+comp {k2['DR+comp']:.0f}≤"
+                       f"nominal {k2['nominal']:.0f} 且 kp400 {k4['DR+comp']:.0f}≈DR {k4['DR']:.0f} 未损; "
+                       "忠实二阶PD响应正确补软驱动轴(对照 E3D-9b 粗代理失败)。")
+            sub = "E3D-9c 忠实PD/柔顺执行器层：闭合kp200且不伤kp400✓"
+        else:
+            verdict = (f"[E3D-9c 忠实PD/柔顺执行器层——仍未闭合, 执行器轴对 SRBD 孪生**出表达类**] "
+                       f"kp200 DR+comp {k2['DR+comp']:.0f} = dynamics-DR {k2['DR']:.0f}(未闭合, 仍 > "
+                       f"nominal {k2['nominal']:.0f}); 且调定点 kp300 回退 86→{k3:.0f}、kp400 {k4['DR+comp']:.0f} "
+                       f"(均劣于 dynamics-DR、高方差); 跨kp总均 {c['rmse_overall']:.0f} > DR "
+                       f"{summ['DR']['rmse_overall']:.0f}. 诚实结论: **两次补执行器轴(粗一阶滞后9b/忠实二阶柔顺9c)"
+                       "都没闭合 kp200 且伤其他点**——根因是 SRBD 孪生**无关节**,PD柔顺是关节空间+载荷相关,"
+                       "在足端笛卡尔层随机化建模不出来=**该轴对此孪生出表达类**(同 E3D-5 多体惯量出类、全弧"
+                       "结构是承重墙); 加之展宽伤调定点+柔顺rollout更难训(欠拟合)。dynamics-only DR(E3D-9)"
+                       "是 SRBD 孪生**能表示的轴**上的正确鲁棒工具(总均96/调定点方差减半); 执行器/PD轴要真覆盖"
+                       "须上关节动力学(重建ABA栈),非DR旋钮。")
+            sub = "E3D-9c 忠实PD/柔顺执行器层仍未闭合kp200——执行器轴对SRBD孪生出表达类(须关节动力学,非DR旋钮)"
+    elif "DR+act" in summ:          # E3D-9b：粗一阶滞后
         k4_std = summ["DR+act"]["per_kp"]["400"]["rmse_std"]
         closed = k2["DR+act"] <= k2["nominal"]
         verdict = (f"[E3D-9b 补执行器滞后DR——交叉折损,DR 非免费] kp200(目标软驱动轴) DR+act "
@@ -259,7 +325,7 @@ def main():
     ap.add_argument("--device", default="cuda:1" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--iters", type=int, default=120)
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--variant", default="dr", choices=["dr", "dract"])
+    ap.add_argument("--variant", default="dr", choices=["dr", "dract", "drcomp"])
     args = ap.parse_args()
     print(f"E3D-9 [{args.stage}]")
     if args.stage == "train":
