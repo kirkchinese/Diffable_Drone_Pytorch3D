@@ -66,6 +66,18 @@ def parse_summary(log_text):
     return metrics
 
 
+def load_metrics(out_dir, log_path):
+    """优先读 metrics.json（结构化，去 stdout-regex 脆弱性）；回退到日志正则解析（兼容旧 run）。"""
+    mjson = os.path.join(out_dir, 'metrics.json')
+    if os.path.exists(mjson):
+        try:
+            with open(mjson) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    return parse_summary(open(log_path).read())
+
+
 def run_eval(exp_name):
     out_dir = f"{BASE_OUT}/{exp_name}_seed{SEED}"
     done_file = f"{out_dir}/DONE"
@@ -74,7 +86,7 @@ def run_eval(exp_name):
     if os.path.exists(done_file):
         log_file = f"{out_dir}/eval.log"
         if os.path.exists(log_file):
-            return parse_summary(open(log_file).read())
+            return load_metrics(out_dir, log_file)
         return None
     
     ckpt = f"{CKPT_BASE}/{exp_name}/best_ar.pth"
@@ -125,7 +137,7 @@ def run_eval(exp_name):
         return None
     
     Path(done_file).touch()
-    return parse_summary(open(log_path).read())
+    return load_metrics(out_dir, log_path)
 
 
 def main():

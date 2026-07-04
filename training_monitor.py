@@ -144,6 +144,11 @@ class TrainingMonitor:
         if step % self.curve_save_interval == 0:
             self._save_curves(step)
     
+    def flush(self):
+        """立即将缓冲指标落盘。checkpoint 保存前调用，保证中断-续跑时
+        磁盘 CSV 覆盖到 checkpoint 迭代、无指标空洞。"""
+        self._flush_csv()
+
     def close(self):
         """训练结束时调用，刷新所有缓冲。"""
         self._flush_csv()

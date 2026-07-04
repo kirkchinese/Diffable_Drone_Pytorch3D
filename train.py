@@ -6,11 +6,13 @@
 
 import os
 import gc
+import random
 import argparse
 import subprocess
 from collections import defaultdict
 from datetime import datetime
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -60,6 +62,9 @@ def parse_args():
                         help='梯度裁剪最大范数。>0 时启用 clip_grad_norm_ 防止梯度爆炸导致策略退化。推荐值 1.0')
     parser.add_argument('--ctl_dt', type=float, default=1/15, help='控制时间步长 (秒)')
     parser.add_argument('--render_interval', type=int, default=1, help='渲染间隔帧数 (1=每帧渲染, 2=隔帧渲染, 节省渲染开销)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='随机种子：设置后会 seed random/numpy/torch/cuda 以复现实验场景和初始化；'
+                             'PyTorch3D rasterizer/GPU 路径不保证完整 bitwise deterministic')
     
     # 损失函数权重
     parser.add_argument('--coef_v', type=float, default=1.0, help='速度跟踪损失权重')
@@ -303,6 +308,7 @@ class DroneTrainer:
                 ground_ratio=getattr(args, 'ground_ratio', 0.6),
                 cluster_ratio=getattr(args, 'cluster_ratio', 0.3),
                 cluster_spread=getattr(args, 'cluster_spread', 1.5),
+                seed=getattr(args, 'seed', None),
             )
             print(f"[SceneGenerator] 已启用随机场景生成, "
                   f"障碍物数量: {args.num_obstacles_min}-{args.num_obstacles_max}, "
@@ -463,6 +469,9 @@ class DroneTrainer:
             self.ema_shadow = None
         
         # 恢复优化器 / 调度器 / best-metric 状态（必须在 optimizer/scheduler 创建之后）
+        # start_iter: 无 --reset_lr 的 resume 会从 checkpoint 的迭代数继续，
+        # 保证总训练步数恰为 num_iters（而非重跑一整轮）
+        self.start_iter = 0
         if args.resume:
             self._restore_training_state()
         
@@ -599,6 +608,7 @@ class DroneTrainer:
             csv_flush_interval=25,
             curve_save_interval=500,
             console_summary_interval=100,
+            resume_step=self.start_iter,  # 续跑时保留 metrics.csv 历史并追加
         )
         
         # 确保保存目录存在
@@ -639,6 +649,14 @@ class DroneTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'iteration': iteration,
             'args': vars(self.args),
+            # RNG 状态: 使中断-续跑与不间断训练走同一随机轨迹
+            'rng_state': {
+                'python': random.getstate(),
+                'numpy': np.random.get_state(),
+                'torch_cpu': torch.get_rng_state(),
+                'torch_cuda': (torch.cuda.get_rng_state_all()
+                               if torch.cuda.is_available() else None),
+            },
         }
         # CMA-ES 状态
         if self.decay_controller is not None:
@@ -705,7 +723,7 @@ class DroneTrainer:
         reset_lr = getattr(self.args, 'reset_lr', False)
         if reset_lr:
             # 参考项目方式: 只恢复模型权重, optimizer/scheduler 从头开始
-            # 适用于改变训练参数后的 fine-tune 场景
+            # 适用于改变训练参数后的 fine-tune 场景（start_iter 保持 0，重跑完整轮次）
             print(f"[Resume] --reset_lr: 跳过优化器/调度器恢复, lr 从 {self.args.lr} 开始新 cosine 周期")
         else:
             if 'optimizer_state_dict' in ckpt:
@@ -714,6 +732,24 @@ class DroneTrainer:
             if 'scheduler_state_dict' in ckpt:
                 self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                 print(f"[Resume] 调度器状态已恢复 (last_lr={self.scheduler.get_last_lr()[0]:.6f})")
+            # 中断-续跑语义: 从存档迭代继续，总步数 = num_iters
+            self.start_iter = int(ckpt.get('iteration', 0))
+            if self.start_iter > 0:
+                print(f"[Resume] 从 iter {self.start_iter} 继续 (剩余 "
+                      f"{self.args.num_iters - self.start_iter} 步)")
+            # RNG 轨迹恢复（跨机器 GPU 数不同等情况下降级为警告）
+            rng = ckpt.get('rng_state')
+            if rng is not None:
+                try:
+                    random.setstate(rng['python'])
+                    np.random.set_state(rng['numpy'])
+                    torch.set_rng_state(rng['torch_cpu'].cpu())
+                    if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                        torch.cuda.set_rng_state_all(
+                            [s.cpu() for s in rng['torch_cuda']])
+                    print(f"[Resume] RNG 状态已恢复")
+                except Exception as e:  # 不因 RNG 恢复失败而中断训练
+                    print(f"[Resume] 警告: RNG 状态恢复失败 ({e}), 随机轨迹将不连续")
         # 恢复 best metric 追踪
         if 'best_ar' in ckpt:
             self.best_ar = ckpt['best_ar']
@@ -1168,7 +1204,9 @@ class DroneTrainer:
         """主训练循环"""
         args = self.args
         
-        pbar = tqdm(range(args.num_iters), ncols=160, bar_format='{l_bar}{bar:20}{r_bar}')
+        pbar = tqdm(range(self.start_iter, args.num_iters), ncols=160,
+                    initial=self.start_iter, total=args.num_iters,
+                    bar_format='{l_bar}{bar:20}{r_bar}')
         cma_gen = 0
         
         for i in pbar:
@@ -1274,6 +1312,9 @@ class DroneTrainer:
                 self._log_figures(i, debug_data)
             
             if (i + 1) % args.save_freq == 0:
+                # 先把指标缓冲落盘，保证磁盘 CSV 覆盖到本 checkpoint 的迭代，
+                # 中断后从该 checkpoint 续跑不会留指标空洞
+                self.monitor.flush()
                 save_path = os.path.join(args.save_dir, f'checkpoint_{i+1:06d}.pth')
                 torch.save(self._make_checkpoint(i + 1), save_path)
                 print(f"\nSaved checkpoint to {save_path}")
@@ -1377,6 +1418,16 @@ class DroneTrainer:
 
 def main():
     args = parse_args()
+
+    # 固定随机种子
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"  随机种子:   {args.seed}")
+
     print("Training arguments:")
     print(args)
     

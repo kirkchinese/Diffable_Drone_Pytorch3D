@@ -87,6 +87,18 @@ def parse_summary(log_text):
     return metrics
 
 
+def load_metrics(out_dir, log_path):
+    """优先读 metrics.json（结构化，去 stdout-regex 脆弱性）；回退到日志正则解析（兼容旧 run）。"""
+    mjson = os.path.join(out_dir, 'metrics.json')
+    if os.path.exists(mjson):
+        try:
+            with open(mjson) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    return parse_summary(open(log_path).read())
+
+
 def run_eval(exp_name, seed, gpu, episodes, timesteps):
     """运行单个实验的单个seed评估"""
     out_dir = f"{BASE_OUT}/{exp_name}/seed{seed}"
@@ -96,7 +108,7 @@ def run_eval(exp_name, seed, gpu, episodes, timesteps):
     if os.path.exists(done_file):
         log_file = f"{out_dir}/eval.log"
         if os.path.exists(log_file):
-            result = parse_summary(open(log_file).read())
+            result = load_metrics(out_dir, log_file)
             if result:
                 return result
         # DONE文件存在但解析失败, 删除重跑
@@ -145,7 +157,7 @@ def run_eval(exp_name, seed, gpu, episodes, timesteps):
         return None
 
     Path(done_file).touch()
-    return parse_summary(open(log_path).read())
+    return load_metrics(out_dir, log_path)
 
 
 def aggregate_results(all_results):
@@ -189,7 +201,19 @@ def main():
                         help='评估种子列表')
     parser.add_argument('--experiments', nargs='+', default=None,
                         help='只评估指定的实验 (默认全部)')
+    parser.add_argument('--ckpt_base', default=None,
+                        help=f'checkpoint 根目录 (默认 {CKPT_BASE}; '
+                             f'multiseed 战役用 checkpoints/thesis_multiseed)')
+    parser.add_argument('--out_base', default=None,
+                        help=f'评估输出根目录 (默认 {BASE_OUT}; multiseed 请另指目录, '
+                             f'勿覆盖论文 5-seed 真值)')
     args = parser.parse_args()
+
+    global CKPT_BASE, BASE_OUT
+    if args.ckpt_base:
+        CKPT_BASE = args.ckpt_base
+    if args.out_base:
+        BASE_OUT = args.out_base
 
     experiments = args.experiments if args.experiments else EXPERIMENTS
     seeds = args.seeds

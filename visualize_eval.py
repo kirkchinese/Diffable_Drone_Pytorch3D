@@ -21,6 +21,7 @@
 """
 
 import os
+import json
 import argparse
 from datetime import datetime
 
@@ -1162,6 +1163,34 @@ class EvalRunner:
         print(f"  平均完成进度: {avg_prog:.1f}%")
         print(f"  深度图平均覆盖率: {np.mean(depth_pcts):.1f}%")
         print("=" * 70)
+
+        # 结构化指标 → metrics.json（去除下游 stdout-regex 依赖，作可复现结果表的固定来源）
+        out_dir = getattr(self.args, 'output_dir', None)
+        if out_dir and n_eps > 0:
+            metrics = {
+                'SR': 100 * success_count / n_eps,
+                'SR_n': f"{success_count}/{n_eps}",
+                'RR': 100 * reach_count / n_eps,
+                'RR_n': f"{reach_count}/{n_eps}",
+                'CFR': 100 * collision_free_count / n_eps,
+                'CFR_n': f"{collision_free_count}/{n_eps}",
+                'collision_rate': 100 * total_collisions / max(total_steps, 1),
+                'avg_speed': float(np.mean(speeds)),
+                'avg_speed_std': float(np.std(speeds)),
+                'min_obs_dist': float(np.min(min_dists)),
+                'best_target_dist': float(np.mean(best_dists)),
+                'best_target_dist_std': float(np.std(best_dists)),
+                'final_target_dist': float(np.mean(final_dists)),
+                'final_target_dist_std': float(np.std(final_dists)),
+                'progress': float(avg_prog),
+                'n_episodes': int(n_eps),
+            }
+            try:
+                with open(os.path.join(out_dir, 'metrics.json'), 'w') as mf:
+                    json.dump(metrics, mf, indent=2, ensure_ascii=False)
+                print(f"  指标已写入: {os.path.join(out_dir, 'metrics.json')}")
+            except OSError as e:
+                print(f"  [warn] metrics.json 写入失败: {e}")
 
 
 # ================================================================

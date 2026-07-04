@@ -179,7 +179,11 @@ graph TB
 | exp10_model_attention | 72.50 ± 9.48 | 83.13 ± 11.18 | 85.63 ± 2.79 | 1.29 ± 0.11 |
 | exp06_cmaes_meta | 67.50 ± 4.20 | 74.37 ± 5.59 | 85.62 ± 6.09 | **2.09** ± 0.04 |
 
-SR = 严格成功率（到达且无碰撞）。RR = 到达率。CFR = 无碰撞率。完整表格见 `viz_results/thesis_eval/summary_aggregated.csv`。
+SR = 严格成功率（到达且无碰撞）。RR = 到达率。CFR = 无碰撞率。论文使用的 5 个评估场景种子
+（`0/42/123/456/789`）完整表格见
+`docs/论文相关/会议论文/data/thesis_eval_5seed/summary_5seed_aggregated.csv`。
+`viz_results/thesis_eval/summary_aggregated.csv` 会被每次评估重写，当前只是 3-seed
+临时汇总，不可用于复现论文数字。
 
 ### 关键发现
 
