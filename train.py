@@ -20,14 +20,14 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from drone_env import DroneSimulator
+from diffsim import EnvBuildContext, make_env
+from diffsim.losses import LossBuildContext, make_loss
 from model import (
     Model, Model_bigger, Model_adaptive,
     Model_attention, Model_multiscale, Model_residual, Model_lightweight,
     Model_lidar, Model_fusion,
     DecayController, LossGuide, MetaController, LossNetwork,
 )
-from loss import DroneLoss
 from navigation_utils import (
     compute_navigation_metrics_torch,
     DronePolicy,
@@ -50,6 +50,11 @@ class _ArgParser(argparse.ArgumentParser):
 def parse_args():
     """解析命令行参数"""
     parser = _ArgParser(description='无人机避障训练脚本', fromfile_prefix_chars='@')
+
+    parser.add_argument(
+        '--env_type', '--env-type', type=str, default='drone',
+        help='模拟环境类型。当前内置 drone；后续机械狗环境通过同一工厂注册。',
+    )
     
     # 训练参数
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
@@ -327,84 +332,20 @@ class DroneTrainer:
         print(f"[Camera] HFOV={hfov_actual:.0f}° VFOV={vfov_actual:.0f}° "
               f"focal={focal_length:.1f} image={args.image_width}x{args.image_height}")
 
-        # 自动计算最小出生间距：必须 > 2*margin_max 以避免出生即碰撞
-        margin_max = getattr(args, 'margin_max', 0.8)
-        min_sid = getattr(args, 'min_spawn_inter_distance', 0.0)
-        safe_min_sid = 2.0 * margin_max + 0.5  # 留 0.5m 余量
-        # 几何上限：cross-map spawn区域 ≈ 2R² 面积中填 N 架无人机
-        arena_r = getattr(args, 'arena_range', 6.0)
-        geo_max = (2.0 * arena_r ** 2 / args.batch_size) ** 0.5  # 计算最大的平均间距，防止设置的最大间隔参数超过可能的值，避免出生即碰撞。同时也是为了避免拒绝采样直接失败导致训练进程卡死。这部分踩过坑。
-        if safe_min_sid > geo_max:
-            print(f"[Info] min_spawn_inter_distance: 碰撞安全值 {safe_min_sid:.2f}m "
-                  f"> 几何上限 {geo_max:.2f}m (N={args.batch_size}, R={arena_r}), "
-                  f"裁剪至 {geo_max:.2f}m")
-            safe_min_sid = geo_max
-        if min_sid <= 0:
-            min_sid = safe_min_sid
-        elif min_sid < safe_min_sid:
-            print(f"[Warn] min_spawn_inter_distance={min_sid:.1f}m < 安全值={safe_min_sid:.1f}m, "
-                  f"自动提升至 {safe_min_sid:.1f}m 以避免出生即碰撞")
-            min_sid = safe_min_sid
-        args.min_spawn_inter_distance = min_sid
-
-        # 初始化环境
-        self.env = DroneSimulator(
-            batch_size=args.batch_size,
-            dt=self.ctl_dt,
-            mesh_path=args.mesh_path,
-            image_size=(args.image_height, args.image_width),
-            focal_length=focal_length,
-            device=self.device,
-            # 动力学参数
-            enable_airmode=enable_airmode,
-            enable_induced_drag=False,
-            noise_std=getattr(args, 'noise_std', 0.04),
-            grad_decay=args.grad_decay,
-            yaw_inertia=getattr(args, 'yaw_inertia', 5.0),
-            yaw_ctl_delay=getattr(args, 'yaw_ctl_delay', 12.0),
-            pitch_ctl_delay=getattr(args, 'pitch_ctl_delay', 12.0),
-            airmode_coef=getattr(args, 'airmode_coef', 0.5),
-            # 初始化参数
-            init_p_range=getattr(args, 'init_p_range', 2.0),
-            init_margin_range=(getattr(args, 'margin_min', 0.3), getattr(args, 'margin_max', 0.8)),
-            # 点云采样
-            num_samples=args.num_samples,
-            # 渲染优化: subdivide_times=0 在 48x64 下无质量损失, 面片从 106 万降至 1.6 万
-            subdivide_times=args.subdivide_times,
-            # 渲染近平面裁剪: 与 depth_min 对齐，避免 clip_faces OOM
-            z_clip_value=getattr(args, 'depth_min', 0.3),
-            # 场景随机化
-            enable_random_scene=getattr(args, 'random_scene', False),
-            scene_generator=self.scene_generator,
-            safe_spawn_clearance=getattr(args, 'safe_clearance', 1.0),
-            min_spawn_inter_distance=args.min_spawn_inter_distance,
-            random_init_yaw=getattr(args, 'random_init_yaw', True),
-            # 相机安装参数
-            cam_mode=getattr(args, 'cam_mode', 'auto'),
-            cam_extrinsic=getattr(args, 'cam_extrinsic', None),
-            cam_mount_rpy=(getattr(args, 'cam_mount_roll', 0.0),
-                           getattr(args, 'cam_angle', 10),
-                           getattr(args, 'cam_mount_yaw', 0.0)),
-            # 无人机网格与多机交互
-            drone_mesh_path=getattr(args, 'drone_mesh_path', None),
-            aero_margin=getattr(args, 'aero_margin', 0.05),
-            max_drone_faces=getattr(args, 'max_drone_faces', 500),
-            n_drones_per_group=args.n_drones_per_group if args.n_drones_per_group is not None else args.batch_size,
-            # 动态障碍物
-            enable_dynamic_obstacles=getattr(args, 'enable_dynamic_obstacles', False),
-            num_dynamic_obstacles_range=(
-                getattr(args, 'num_dynamic_obstacles_min', 2),
-                getattr(args, 'num_dynamic_obstacles_max', 5),
-            ),
-            dynamic_obstacle_speed_range=(
-                getattr(args, 'dynamic_obs_speed_min', -0.5),
-                getattr(args, 'dynamic_obs_speed_max', 0.5),
-            ),
-            dynamic_obstacle_scale_range=(
-                getattr(args, 'dynamic_obs_scale_min', 0.2),
-                getattr(args, 'dynamic_obs_scale_max', 0.8),
+        # 环境由注册表构造。默认 drone 仍调用原 DroneSimulator，参数与数值路径不变。
+        env_type = getattr(args, 'env_type', 'drone')
+        self.env = make_env(
+            env_type,
+            EnvBuildContext(
+                args=args,
+                device=self.device,
+                control_dt=self.ctl_dt,
+                focal_length=focal_length,
+                scene_generator=self.scene_generator,
+                extras={'enable_airmode': enable_airmode},
             ),
         )
+        print(f"[Environment] type={env_type} class={type(self.env).__name__}")
         
         # 初始化模型
         dim_obs = 7 if args.no_odom else 10
@@ -476,24 +417,9 @@ class DroneTrainer:
             self._restore_training_state()
         
         # 损失函数
-        self.losser = DroneLoss(
-            coef_v=args.coef_v,
-            coef_speed=args.coef_speed,
-            coef_v_pred=args.coef_v_pred,
-            coef_collide=args.coef_collide,
-            coef_obj_avoidance=args.coef_obj_avoidance,
-            coef_d_acc=args.coef_d_acc,
-            coef_d_jerk=args.coef_d_jerk,
-            coef_d_snap=args.coef_d_snap,
-            coef_ground_affinity=args.coef_ground_affinity,
-            coef_bias=args.coef_bias,
-            coef_lateral=getattr(args, 'coef_lateral', 0.0),
-            coef_drone_collide=getattr(args, 'coef_drone_collide', 5.0),
-            ctl_dt=self.ctl_dt,
-            window_size=getattr(args, 'window_size', 30),
-            loss_v_mode=getattr(args, 'loss_v_mode', 'mse'),
-            adaptive_decay_rate=getattr(args, 'adaptive_decay_rate', 2.0),
-            ga_z_ceiling=getattr(args, 'ga_z_ceiling', 5.0),
+        self.losser = make_loss(
+            'drone_navigation',
+            LossBuildContext(args=args, control_dt=self.ctl_dt),
         )
         # 保存初始系数（LossGuide 模式下用于合并未被进化覆盖的系数）
         self._base_coefs = dict(self.losser.coefs)
