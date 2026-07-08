@@ -54,6 +54,14 @@ class CollisionGeometry:
     local_rot: torch.Tensor
     size: torch.Tensor
     link_names: tuple[str, ...]
+    sample_owner: torch.Tensor
+    sample_pos: torch.Tensor
+    sample_radius: torch.Tensor
+    sample_is_foot: torch.Tensor
+    sample_collision: torch.Tensor
+    bounding_radius: torch.Tensor
+    self_pair_a: torch.Tensor
+    self_pair_b: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -202,6 +210,70 @@ def compile_go2_model(
         local_rot=tensor(np.asarray(collision_rot)),
         size=tensor(np.asarray(collision_size)),
         link_names=tuple(collision_links),
+        sample_owner=torch.empty(0, device=device, dtype=torch.long),
+        sample_pos=torch.empty(0, 3, device=device, dtype=dtype),
+        sample_radius=torch.empty(0, device=device, dtype=dtype),
+        sample_is_foot=torch.empty(0, device=device, dtype=torch.bool),
+        sample_collision=torch.empty(0, device=device, dtype=torch.long),
+        bounding_radius=torch.empty(0, device=device, dtype=dtype),
+        self_pair_a=torch.empty(0, device=device, dtype=torch.long),
+        self_pair_b=torch.empty(0, device=device, dtype=torch.long),
+    )
+    sample_owner, sample_pos, sample_radius, sample_is_foot, sample_collision = [], [], [], [], []
+    bounding_radius = []
+    for collision_index, (owner, kind, pos, rotation, size, link_name) in enumerate(
+        zip(collision_owner, collision_kind, collision_pos, collision_rot, collision_size, collision_links)
+    ):
+        size_arr = np.asarray(size)
+        if kind == COLLISION_SPHERE:
+            offsets = [np.zeros(3)]
+            radii = [size_arr[0]]
+            bound = size_arr[0]
+        elif kind == COLLISION_CAPSULE:
+            offsets = [np.array((0.0, 0.0, z)) for z in (-size_arr[1], 0.0, size_arr[1])]
+            radii = [size_arr[0]] * len(offsets)
+            bound = size_arr[0] + size_arr[1]
+        else:
+            signs = [np.array((x, y, z)) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+            offsets = [sign * size_arr for sign in signs]
+            offsets += [np.array((axis == 0, axis == 1, axis == 2), dtype=float) * sign * size_arr
+                        for axis in range(3) for sign in (-1, 1)]
+            radii = [0.0] * len(offsets)
+            bound = float(np.linalg.norm(size_arr))
+        for offset, radius in zip(offsets, radii):
+            sample_owner.append(owner)
+            sample_pos.append(np.asarray(pos) + np.asarray(rotation) @ offset)
+            sample_radius.append(radius)
+            sample_is_foot.append(link_name.endswith("_foot"))
+            sample_collision.append(collision_index)
+        bounding_radius.append(bound)
+    pair_a, pair_b = [], []
+    for first in range(len(collision_owner)):
+        for second in range(first + 1, len(collision_owner)):
+            owner_a, owner_b = collision_owner[first], collision_owner[second]
+            if owner_a == owner_b:
+                continue
+            group_a = -1 if owner_a == 0 else (owner_a - 1) // 3
+            group_b = -1 if owner_b == 0 else (owner_b - 1) // 3
+            cross_leg = group_a >= 0 and group_b >= 0 and group_a != group_b
+            if cross_leg:
+                pair_a.append(first)
+                pair_b.append(second)
+    collisions = CollisionGeometry(
+        owner=collisions.owner,
+        kind=collisions.kind,
+        local_pos=collisions.local_pos,
+        local_rot=collisions.local_rot,
+        size=collisions.size,
+        link_names=collisions.link_names,
+        sample_owner=tensor(sample_owner, long=True),
+        sample_pos=tensor(np.asarray(sample_pos)),
+        sample_radius=tensor(sample_radius),
+        sample_is_foot=torch.as_tensor(sample_is_foot, device=device, dtype=torch.bool),
+        sample_collision=tensor(sample_collision, long=True),
+        bounding_radius=tensor(bounding_radius),
+        self_pair_a=tensor(pair_a, long=True),
+        self_pair_b=tensor(pair_b, long=True),
     )
     default = tensor(np.tile((0.0, 0.9, -1.8), 4))
     return Go2Model(

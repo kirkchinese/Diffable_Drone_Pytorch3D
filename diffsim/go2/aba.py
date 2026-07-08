@@ -71,7 +71,7 @@ def _gravity_wrenches(model: Go2Model, kin: Go2Kinematics, gravity_world: torch.
     return torch.cat((moment, force), dim=-1)
 
 
-def _spatial_velocities(model: Go2Model, state: Go2State, kin: Go2Kinematics):
+def spatial_velocities(model: Go2Model, state: Go2State, kin: Go2Kinematics):
     base_v_body = torch.einsum("bji,bj->bi", kin.body_rotation[:, 0], state.base_vel)
     velocities: list[torch.Tensor] = [torch.cat((state.base_omega, base_v_body), dim=-1)]
     biases: list[torch.Tensor] = []
@@ -99,7 +99,7 @@ def forward_dynamics(
     """Floating-base ABA with external body-frame spatial wrenches."""
 
     kin = forward_kinematics(model, state)
-    velocity, bias, subspaces = _spatial_velocities(model, state, kin)
+    velocity, bias, subspaces = spatial_velocities(model, state, kin)
     if gravity_world is None:
         gravity_world = state.base_pos.new_tensor((0.0, 0.0, -9.81))
     external = _gravity_wrenches(model, kin, gravity_world)
@@ -176,7 +176,7 @@ def inverse_dynamics(
     """RNEA oracle returning required root wrench and joint torques."""
 
     kin = forward_kinematics(model, state)
-    velocity, bias, subspaces = _spatial_velocities(model, state, kin)
+    velocity, bias, subspaces = spatial_velocities(model, state, kin)
     if gravity_world is None:
         gravity_world = state.base_pos.new_tensor((0.0, 0.0, -9.81))
     external = _gravity_wrenches(model, kin, gravity_world)

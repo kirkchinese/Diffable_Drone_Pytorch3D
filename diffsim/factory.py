@@ -37,6 +37,7 @@ def _load_builtins() -> None:
     # Import for registration only. Keeping this lazy avoids importing
     # PyTorch3D when callers use just the API/registry modules.
     from .envs import drone as _drone  # noqa: F401
+    from .envs import go2 as _go2  # noqa: F401
 
     _BUILTINS_LOADED = True
 
