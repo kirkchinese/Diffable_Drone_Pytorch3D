@@ -27,6 +27,7 @@ def _load_builtins() -> None:
     if _BUILTINS_LOADED:
         return
     from . import drone as _drone  # noqa: F401
+    from . import go2 as _go2  # noqa: F401
 
     _BUILTINS_LOADED = True
 

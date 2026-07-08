@@ -91,11 +91,20 @@ def dynamics_step(
     kp: torch.Tensor | None = None,
     kd: torch.Tensor | None = None,
     motor_strength: torch.Tensor | None = None,
+    spatial_inertia: torch.Tensor | None = None,
+    body_mass: torch.Tensor | None = None,
 ) -> Go2DynamicsOutput:
     torque, desired, filtered = actuator_torque(
         model, state, action, config, kp=kp, kd=kd, motor_strength=motor_strength
     )
-    acceleration = forward_dynamics(model, state, torque, external_wrench_body)
+    acceleration = forward_dynamics(
+        model,
+        state,
+        torque,
+        external_wrench_body,
+        spatial_inertia=spatial_inertia,
+        body_mass=body_mass,
+    )
     dt = config.physics_dt
     base_vel = state.base_vel + dt * acceleration.base_linear_world
     base_omega = state.base_omega + dt * acceleration.base_angular_body

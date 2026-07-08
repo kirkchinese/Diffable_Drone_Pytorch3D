@@ -20,6 +20,7 @@ class ContactOutput:
     probability: torch.Tensor
     normal_force: torch.Tensor
     tangential_force: torch.Tensor
+    normal: torch.Tensor
     sample_world: torch.Tensor
     sample_velocity_world: torch.Tensor
     sample_is_foot: torch.Tensor
@@ -153,6 +154,7 @@ def contact_wrenches(
         probability=probability,
         normal_force=normal_force,
         tangential_force=tangential_force,
+        normal=normal,
         sample_world=contact_point,
         sample_velocity_world=center_velocity,
         sample_is_foot=geometry.sample_is_foot,

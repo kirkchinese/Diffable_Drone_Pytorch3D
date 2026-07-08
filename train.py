@@ -53,8 +53,27 @@ def parse_args():
 
     parser.add_argument(
         '--env_type', '--env-type', type=str, default='drone',
-        help='模拟环境类型。当前内置 drone；后续机械狗环境通过同一工厂注册。',
+        choices=['drone', 'go2'],
+        help='模拟环境类型。drone 保持原数值路径；go2 使用独立可微四足 trainer。',
     )
+    parser.add_argument('--go2_batch_size', type=int, default=None,
+                        help='Go2 批大小；未设置时默认 64，不改变无人机默认值')
+    parser.add_argument('--go2_control_dt', type=float, default=0.02,
+                        help='Go2 控制周期，默认 20 ms')
+    parser.add_argument('--physics_dt', type=float, default=0.001,
+                        help='Go2 物理子步，默认 1 ms')
+    parser.add_argument('--go2_sensor_mode', choices=['blind', 'heightmap', 'depth'],
+                        default='heightmap', help='Go2 感知对照模式')
+    parser.add_argument('--go2_randomize', action=argparse.BooleanOptionalAction, default=True,
+                        help='Go2 质量/惯量/执行器/传感器/场景域随机化')
+    parser.add_argument('--go2_max_obstacles', type=int, default=24)
+    parser.add_argument('--go2_rollout_steps', type=int, default=100)
+    parser.add_argument('--go2_tbptt_steps', type=int, default=25)
+    parser.add_argument('--go2_hidden_size', type=int, default=128)
+    parser.add_argument('--go2_symmetry_weight', type=float, default=0.05)
+    parser.add_argument('--go2_gdecay', type=float, default=1.0,
+                        help='Go2 跨控制步状态梯度衰减；1.0 保持原始梯度')
+    parser.add_argument('--go2_grad_clip_norm', type=float, default=1.0)
     
     # 训练参数
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
@@ -1362,7 +1381,12 @@ def main():
         torch.autograd.set_detect_anomaly(True)
         print("Anomaly detection enabled!")
     
-    trainer = DroneTrainer(args)
+    if args.env_type == 'go2':
+        from diffsim.go2.trainer import Go2Trainer
+
+        trainer = Go2Trainer(args)
+    else:
+        trainer = DroneTrainer(args)
     trainer.train()
 
 

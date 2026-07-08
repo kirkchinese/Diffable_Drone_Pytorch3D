@@ -64,9 +64,15 @@ def forward_kinematics(model: Go2Model, state: Go2State) -> Go2Kinematics:
     )
 
 
-def _gravity_wrenches(model: Go2Model, kin: Go2Kinematics, gravity_world: torch.Tensor) -> torch.Tensor:
+def _gravity_wrenches(
+    model: Go2Model,
+    kin: Go2Kinematics,
+    gravity_world: torch.Tensor,
+    body_mass: torch.Tensor | None = None,
+) -> torch.Tensor:
     gravity_body = torch.einsum("bnji,j->bni", kin.body_rotation, gravity_world)
-    force = model.body_mass[None, :, None] * gravity_body
+    mass = model.body_mass[None] if body_mass is None else body_mass
+    force = mass[..., None] * gravity_body
     moment = torch.cross(model.body_com[None, :, :].expand_as(force), force, dim=-1)
     return torch.cat((moment, force), dim=-1)
 
@@ -95,6 +101,8 @@ def forward_dynamics(
     joint_torque: torch.Tensor,
     external_wrench_body: torch.Tensor | None = None,
     gravity_world: torch.Tensor | None = None,
+    spatial_inertia: torch.Tensor | None = None,
+    body_mass: torch.Tensor | None = None,
 ) -> Go2Acceleration:
     """Floating-base ABA with external body-frame spatial wrenches."""
 
@@ -102,11 +110,16 @@ def forward_dynamics(
     velocity, bias, subspaces = spatial_velocities(model, state, kin)
     if gravity_world is None:
         gravity_world = state.base_pos.new_tensor((0.0, 0.0, -9.81))
-    external = _gravity_wrenches(model, kin, gravity_world)
+    external = _gravity_wrenches(model, kin, gravity_world, body_mass)
     if external_wrench_body is not None:
         external = external + external_wrench_body
 
-    inertias = [model.spatial_inertia[i].expand(state.batch_size, 6, 6) for i in range(model.n_bodies)]
+    inertia_batch = (
+        model.spatial_inertia[None].expand(state.batch_size, -1, -1, -1)
+        if spatial_inertia is None
+        else spatial_inertia
+    )
+    inertias = [inertia_batch[:, i] for i in range(model.n_bodies)]
     articulated = list(inertias)
     bias_force = []
     for body in range(model.n_bodies):
