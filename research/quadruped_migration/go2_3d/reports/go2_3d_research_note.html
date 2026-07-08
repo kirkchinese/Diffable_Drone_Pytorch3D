@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>3D &#x8fc1;&#x79fb;&#x9636;&#x6bb5;&#x7814;&#x7a76;&#x7b14;&#x8bb0;&#xff1a;Unitree Go2 &#x53ef;&#x5fae;&#x6570;&#x5b57;&#x5b6a;&#x751f;</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <h1 id="3d-迁移阶段研究笔记unitree-go2-可微数字孪生">3D 迁移阶段研究笔记：Unitree Go2 可微数字孪生</h1>
+<blockquote>
+<p>版本：3D 阶段 · E3D-0 … E3D-3（2026-06-09）+ E3D-6/E3D-7（2026-06-11）· 配套代码：<a href="../models/"><code>models/</code></a>、<a href="../dynamics/"><code>dynamics/</code></a>、<a href="../scripts/"><code>scripts/</code></a>、<a href="../parameters/"><code>parameters/</code></a>、<a href="../figures/"><code>figures/</code></a>
+复现：<code>conda activate pytorch</code>；E3D-0 <code>python scripts/{convert_dae_to_obj,emit_model_summary,render_standing_pose}.py</code>；E3D-1 <code>python scripts/e3d1_floating_base_checks.py</code>；E3D-2 <code>python scripts/e3d2_contact_checks.py --device cuda:0</code>；E3D-3 <code>python scripts/e3d3_static_audit.py</code> + <code>python scripts/e3d3_standing_train.py --device cuda:0</code>；E3D-6 <code>python scripts/e3d6_channel_matching.py</code> + <code>python scripts/e3d6_dualhead_routing.py</code>（float64/CPU）；E3D-7 依次 <code>python scripts/e3d7_mismatch_audit.py</code> → <code>e3d7_fit_residual.py</code> → <code>e3d7_grad_fidelity.py</code> → <code>e3d7_transfer.py --mismatches kin</code>
+承接 2D 阶段结论见 <a href="../research_note.html"><code>../research_note.md</code></a>。证据等级沿用：〔代码〕〔论文〕〔推导〕〔实验〕〔假设/猜想〕。</p>
+</blockquote>
+<p>本阶段把 2D 平面四足建模迁移到 <strong>3D Unitree Go2 数字机体</strong>。与之前不同，本阶段的核心要求是
+<strong>整条链路（运动学 + 渲染）全部可微</strong>，并基于 PyTorch / PyTorch3D <strong>自建可微数字孪生</strong>，
+而不是接入一个黑箱仿真器。本笔记记录第一步 <strong>E3D-0：模型读取 + 可微数字孪生骨架</strong>。</p>
+<hr>
+<h2 id="0-速览tldr">0. 速览（TL;DR）</h2>
+<p><strong>一句话</strong>：用宇树官方 URDF（<code>go2_description</code>）构建了一个<strong>端到端可微</strong>的 Go2 数字孪生——
+URDF→运动学树→刚体前向运动学（FK）→逐连杆网格刚性蒙皮（rigid skinning）→PyTorch3D 可微光栅化。
+所有几何与物理参数<strong>逐项可追溯到官方 URDF 的固定 commit</strong>；FK 的足端位置与零位解析值逐点吻合、
+梯度物理正确；渲染像素对关节角 <code>q</code> 的梯度有限且 12 维全非零——<strong>&quot;可微数字孪生&quot;在 3D Go2 上成立</strong>〔实验〕。</p>
+<table>
+<thead>
+<tr>
+<th>验收问题（§12-Q1）</th>
+<th>速答</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unitree Go2 数字模型是否已正确加载与参数化？</td>
+<td><strong>是</strong>。官方 URDF @ <code>8bd6717</code> 解析为 29 连杆 / 28 关节 / 12 驱动关节，总质量 <strong>15.019 kg</strong>，参数表见 <a href="../parameters/"><code>parameters/</code></a>，逐项标注来源〔代码/实验〕</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="1-e3d-0-目标与交付">1. E3D-0 目标与交付</h2>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>交付物</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>确认官方数字模型可被正确加载、参数可信、坐标系/命名清楚</td>
+<td>URDF 解析器 + 参数摘要</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>把&quot;下载 obj + PyTorch3D 骨骼绑定&quot;落地为可微孪生</td>
+<td>DAE→OBJ 转换 + FK + 蒙皮 + 渲染</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>端到端可微性验证</td>
+<td>像素→<code>q</code> 梯度检验</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<p>模块划分（遵循&quot;多小文件&quot;）：</p>
+<ul>
+<li><a href="../models/go2_urdf.py"><code>models/go2_urdf.py</code></a>：纯标准库 URDF 解析器（无 urdfpy 依赖）。</li>
+<li><a href="../models/go2_kinematics.py"><code>models/go2_kinematics.py</code></a>：批量可微 FK（4×4 齐次变换）。</li>
+<li><a href="../models/go2_render.py"><code>models/go2_render.py</code></a>：刚体蒙皮 + PyTorch3D 渲染（<code>Go2Twin</code>）。</li>
+<li><a href="../scripts/convert_dae_to_obj.py"><code>scripts/convert_dae_to_obj.py</code></a>、<a href="../scripts/emit_model_summary.py"><code>emit_model_summary.py</code></a>、<a href="../scripts/render_standing_pose.py"><code>render_standing_pose.py</code></a>。</li>
+</ul>
+<hr>
+<h2 id="2-模型来源与可追溯性代码">2. 模型来源与可追溯性〔代码〕</h2>
+<ul>
+<li>来源：<code>https://github.com/Unitree-Go2-Robot/go2_description</code>，分支 <code>humble</code>，<strong>固定 commit <code>8bd6717ff0c7b5ca388c0e10e426dd9ad873ceaf</code></strong>。</li>
+<li>物理参数（质量、惯量、关节限位、连杆偏置）<strong>全部取自官方 URDF</strong>；网格仅用于渲染。</li>
+<li>关键工程事实：官方可视化网格是 <strong>COLLADA <code>.dae</code></strong>，而 PyTorch3D 仅读 <code>.obj/.ply</code>。
+故新增 DAE→OBJ 转换步骤（<code>trimesh</code>+<code>pycollada</code>，烘焙场景图变换、单网格化）。
+转换后单位经核对为<strong>米</strong>（base 包围盒 0.46×0.19×0.19 m、thigh 0.278 m），缩放 1.0〔实验〕。</li>
+<li>来源记录：<a href="../assets/go2_description/PROVENANCE.html"><code>assets/go2_description/PROVENANCE.md</code></a>，并写入参数摘要 JSON 的 <code>provenance</code> 字段。</li>
+</ul>
+<hr>
+<h2 id="3-参数摘要关键数字代码">3. 参数摘要（关键数字）〔代码〕</h2>
+<p>完整表见 <a href="../parameters/go2_model_summary.html"><code>parameters/go2_model_summary.md</code></a> / <code>.json</code>。</p>
+<ul>
+<li><strong>base link</strong>：<code>base_link</code>（浮动基），质量 6.921 kg，惯量对角 <code>(0.02448, 0.098077, 0.107)</code>。</li>
+<li><strong>总质量 15.019 kg</strong> = base 6.921 + 4×(hip 0.678 + thigh 1.152 + calf 0.154 + foot 0.04) + 2×Head 0.001。</li>
+<li><strong>腿几何</strong>：hip 安装点 <code>(±0.1934, ±0.0465, 0)</code>；hip→thigh 侧向偏置 <code>0.0955</code>；<strong>thigh 长 = calf 长 = 0.213 m</strong>。</li>
+<li><strong>12 驱动关节</strong>（canonical 顺序 <code>LEGS=(FL,FR,RL,RR) × (hip,thigh,calf)</code>）：
+<ul>
+<li>hip 外摆，轴 <code>[1,0,0]</code>，限位 ±1.0472 rad，力矩 23.7 N·m；</li>
+<li>thigh 屈伸，轴 <code>[0,1,0]</code>，前腿 <code>[-1.5708, 3.4907]</code> / 后腿 <code>[-0.5236, 4.5379]</code>；</li>
+<li>calf 膝，轴 <code>[0,1,0]</code>，限位 <code>[-2.7227, -0.83776]</code>，力矩 45.43 N·m。</li>
+</ul>
+</li>
+<li><strong>足端帧</strong>（SRBD 接触点）：<code>{FL,FR,RL,RR}_foot</code>，零位（腿伸直）相对 base 偏置 <code>(±0.1934, ±0.142, -0.426)</code>。</li>
+<li><strong>坐标系</strong>：URDF/ROS 机体系 <code>+X 前、+Y 左、+Z 上</code>，重力 <code>-Z</code>——与无人机项目的 ENU 约定一致，便于复用。</li>
+<li>⚠ <strong>顺序陷阱</strong>〔假设/待核对〕：Unitree 底层 SDK 电机序为 <code>FR,FL,RR,RL</code>，与 URDF 的 <code>FL,FR,RL,RR</code> <strong>不同</strong>；
+后续与 Unitree 工具对齐（E3D-5）必须重映射。</li>
+</ul>
+<hr>
+<h2 id="4-可微数字孪生构建实验">4. 可微数字孪生构建〔实验〕</h2>
+<h3 id="41-设计刚体骨骼绑定rigid-skinning推导代码">4.1 设计：刚体骨骼绑定（rigid skinning）〔推导/代码〕</h3>
+<p>对<strong>刚性</strong>机器人，&quot;骨骼绑定&quot;= 一个连杆即一根刚性骨；用 FK 求每个连杆的世界变换，
+再把该连杆<strong>整块网格</strong>刚性变换后用 <code>join_meshes_as_scene</code> 合成单一场景 Mesh。
+<strong>无需</strong>带顶点混合权重的线性混合蒙皮（LBS，那是给可形变角色的）。</p>
+<blockquote>
+<p>关键复用：合成所用的 <code>join_meshes_as_scene</code> 正是无人机渲染器
+<a href="../../../drone_renderer.py"><code>drone_renderer.py</code></a> 合成&quot;静态场景 + 动态机体&quot;的同一 PyTorch3D 习语；
+相机用 <code>PerspectiveCameras(in_ndc=False)</code> + <code>MeshRasterizer</code> + <code>SoftPhongShader</code>，与原项目一致。
+<strong>PyTorch3D 本身没有内建关节/骨骼动画系统</strong>——FK 由我们自建，PyTorch3D 只提供可微的网格/变换/光栅化原语。</p>
+</blockquote>
+<p>整条 <code>q → 连杆世界变换 → 顶点 → 像素</code> 由 torch 可微算子组成，梯度可回传到 <code>q</code> 与浮动基位姿。</p>
+<h3 id="42-fk-数值与梯度验证实验">4.2 FK 数值与梯度验证〔实验〕</h3>
+<ul>
+<li><strong>零位一致性</strong>：<code>foot_positions(q=0)</code> 给出 <code>FL=(0.1934, 0.142, -0.426)</code> 等，与参数摘要的零位偏置<strong>逐点吻合</strong>。</li>
+<li><strong>梯度物理正确</strong>：<code>d(FL_foot_z)/d[hip,thigh,calf] |_{q=0} = [0.0955, 0, 0]</code>。
+<ul>
+<li><code>0.0955</code> = hip 轴到足端的侧向力臂（绕 X 抬腿，一阶灵敏度 = 侧向偏置）；</li>
+<li>thigh/calf 为 0，因零位足端正悬于这两个 Y 轴正下方，绕 Y 一阶不改变高度——<strong>与解析预期一致</strong>。</li>
+</ul>
+</li>
+</ul>
+<h3 id="43-渲染与端到端可微性实验">4.3 渲染与端到端可微性〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/go2_digital_twin_poses.png" alt="twin"></p>
+<ul>
+<li>装配正确：灰躯干 / 蓝 hip / 橙 thigh / 绿 calf / 黑 foot，左右腿镜像（FR/RR 用 <code>*_mirror</code> 网格 + 翻转 rpy）正确，<strong>机身直立（Z-up 经 DAE→OBJ 保持）</strong>。</li>
+<li><strong>站立高度核对</strong>：nominal <code>q=(0, 0.9, -1.8)</code> 下四足同高 <code>z=-0.265</code>，base 距足 <strong>0.265 m</strong>（Go2 站高 ~0.28–0.32 m 量级合理）〔假设：nominal 角为 legged_gym 典型值，未拟合真实站姿〕。</li>
+<li><strong>端到端可微</strong>：<code>d(mean pixel)/dq</code> 范数 <code>6.5e-3</code>，有限、<strong>12 维全非零</strong>——确认&quot;可微数字孪生&quot;成立。</li>
+</ul>
+<hr>
+<h2 id="5-与-2d--无人机框架的对照">5. 与 2D / 无人机框架的对照</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>无人机</th>
+<th>2D 四足（已验证）</th>
+<th>3D Go2（E3D-0 现状）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>状态</td>
+<td>质点 + 代数姿态</td>
+<td>平面 SRBM <code>[p_x,p_z,θ]</code></td>
+<td>浮动基 <code>[p,q,v,ω]</code>（待 E3D-1/3 接入动力学）</td>
+</tr>
+<tr>
+<td>可微渲染</td>
+<td>单 obj 场景</td>
+<td>无（纯动力学实验）</td>
+<td><strong>URDF 多连杆刚性蒙皮 + PyTorch3D</strong>（本阶段新增）</td>
+</tr>
+<tr>
+<td>几何来源</td>
+<td>手写无人机 mesh</td>
+<td>手写简化几何</td>
+<td><strong>官方 URDF，逐项可追溯</strong></td>
+</tr>
+<tr>
+<td>可微性</td>
+<td>C∞ 动力学</td>
+<td>平滑接触下良好</td>
+<td><strong>运动学 + 渲染已确认可微</strong>；接触动力学留待 E3D-2/3</td>
+</tr>
+<tr>
+<td>GDecay/坐标系</td>
+<td>ENU, <code>R</code> 列向量</td>
+<td>同</td>
+<td><strong>沿用同一约定</strong>，迁移成本低</td>
+</tr>
+</tbody>
+</table>
+<p><strong>迁移可行性的第一块拼图已就位</strong>：Go2 的几何/惯量/关节结构能被干净加载，且&quot;自建可微孪生&quot;在 3D 多连杆形态下确实可微——
+这是后续把 2D 接触/姿态/残差结论搬到 3D 的<strong>前提条件</strong>，现已满足。</p>
+<hr>
+<h2 id="6-结论分级">6. 结论分级</h2>
+<p><strong>已验证结论〔实验〕</strong></p>
+<ol>
+<li>官方 Go2 URDF 可被正确解析为 29 连杆 / 28 关节 / 12 驱动，总质量 15.019 kg，参数逐项可追溯。</li>
+<li>自建 FK 数值正确（零位吻合）、梯度物理正确。</li>
+<li>DAE→OBJ + 刚体蒙皮 + PyTorch3D 渲染装配正确、单位为米、机身直立。</li>
+<li>整条 <code>q→像素</code> 链路端到端可微（梯度有限、满秩非零）。</li>
+</ol>
+<p><strong>从 2D 继承〔实验/论文〕</strong></p>
+<ul>
+<li>接触平滑性是可训练性分水岭；GDecay 压幅不压偏；残差须放在误差发生处（见 2D 笔记 §9/§10）。本阶段尚未触及接触。</li>
+</ul>
+<p><strong>假设 / 待核对〔假设〕</strong></p>
+<ul>
+<li>nominal 站姿关节角为典型值，未拟合真实站高；</li>
+<li>SDK 电机序 <code>FR,FL,RR,RL</code> 与 URDF 序不同，E3D-5 对齐时须重映射；</li>
+<li>渲染世界系直接用 URDF 系（相机 up=+Z），与无人机 <code>transform_pos_ros2pt3d</code> 的 ROS↔PT3D 映射尚未统一，后续若要复用无人机感知管线需对齐。</li>
+</ul>
+<p><strong>3D 新发现 / 工程经验〔实验〕</strong></p>
+<ul>
+<li>官方 <code>.dae</code> 与 PyTorch3D 的 <code>.obj</code> 不兼容，需 <code>pycollada</code> 转换；</li>
+<li>全分辨率孪生约 <strong>40 万面</strong>，单姿态渲染在 6 GB 显存可行，但批量训练前需减面（decimation）。</li>
+</ul>
+<p><strong>环境校正〔代码〕</strong></p>
+<ul>
+<li>实际机器为<strong>单块 RTX 3060 Laptop（6 GB）</strong>，与研究提示词所述 3080+3060 双卡桌面<strong>不符</strong>；<code>torch.cuda.device_count()==1</code>，全部用 <code>cuda:0</code>。后续涉及显存/并行规划须以此为准。</li>
+</ul>
+<hr>
+<h2 id="7-e3d-1floating-base-单刚体动力学坐标系四元数积分可微钉死实验">7. E3D-1：floating-base 单刚体动力学（坐标系/四元数/积分/可微钉死）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/floating_base_srbd.py"><code>dynamics/floating_base_srbd.py</code></a>、<a href="../models/go2_inertia.py"><code>models/go2_inertia.py</code></a>、<a href="../scripts/e3d1_floating_base_checks.py"><code>scripts/e3d1_floating_base_checks.py</code></a>、<a href="../notebooks/go2_01_3d_rigid_body.ipynb"><code>notebooks/go2_01_3d_rigid_body.ipynb</code></a>。
+指导原则（用户）：<strong>先不追求复杂，先把坐标系/惯量/四元数积分/可微性钉死</strong>——这一层错了，E3D-2 的接触与摩擦锥会放大错误且难定位。</p>
+</blockquote>
+<h3 id="71-全局约定一次定清全局统一推导代码">7.1 全局约定（一次定清，全局统一）〔推导/代码〕</h3>
+<p>状态 <code>x=(p,q,v,w)</code>：</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>frame</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>p</code> 位置</td>
+<td><strong>WORLD</strong></td>
+<td><strong>COM 位置</strong>（非 base 原点）；base 原点 <code>= p − R·c_body</code>（平动/转动仅在 COM 处解耦）</td>
+</tr>
+<tr>
+<td><code>q</code> 姿态</td>
+<td>Body→World</td>
+<td><strong>单位四元数 (w,x,y,z) 标量在前</strong>；<code>R=quaternion_to_matrix(q)</code>，<code>v_world=R·v_body</code>（与 FK / 无人机项目列向量约定一致，已数值核对）</td>
+</tr>
+<tr>
+<td><code>v</code> 线速度</td>
+<td><strong>WORLD</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><code>w</code> 角速度</td>
+<td><strong>BODY</strong></td>
+<td><code>omega_body</code>，使 <code>I_body</code> 在体系常量</td>
+</tr>
+<tr>
+<td><code>f_world</code> 外力</td>
+<td><strong>WORLD</strong></td>
+<td>不含重力</td>
+</tr>
+<tr>
+<td><code>tau_body</code> 外力矩</td>
+<td><strong>BODY</strong></td>
+<td>关于 COM</td>
+</tr>
+</tbody>
+</table>
+<p><strong>接触力矩换算（写死，不靠脑补——frame 混淆会悄悄翻转力矩）</strong>〔推导/代码〕：世界系接触力 <code>f_i_world</code> 作用于世界系接触点 <code>p_i_world</code>，COM 在 <code>p_com_world = p</code>，<code>R=quaternion_to_matrix(q)</code>（Body→World）：</p>
+<pre><code>r_world  = p_i_world − p_com_world
+f_world  += f_i_world
+tau_body += Rᵀ (r_world × f_i_world)        # 关于 COM 的力矩，旋到体系
+</code></pre>
+<p>等价体系形式（恒等式 <code>R(a×b)=(Ra)×(Rb)</code>，R∈SO(3)）：<code>tau_body += (Rᵀr_world)×(Rᵀf_i_world) = r_body×f_body</code>。两种写法已<strong>数值核对一致到 ~1e-7（CPU 与 3080 GPU）</strong>、可微、GPU-clean。统一走 <a href="../dynamics/floating_base_srbd.py"><code>contact_to_body_wrench()</code></a> 以防误用；body-frame 优化版（<code>r_body=foot_body−c_body</code>）留待世界系版确认无误后再做。</p>
+<p>运动方程：<code>m dv/dt = m g + f_world</code>（世界系平动）、<code>I dw/dt = tau_body − w×(I w)</code>（体系 Euler 方程）、姿态用<strong>体系旋转向量 <code>w·dt</code> 的指数映射</strong>积分 <code>q_{t+1}=normalize(q_t ⊗ exp_quat(w·dt))</code>（右乘，因 <code>w</code> 是体系率）。<strong>绝不用欧拉角积分</strong>。积分器：半隐式（辛）Euler。
+SRBD 惯量来自 URDF 复合刚体（parallel-axis，nominal 站姿）：mass 15.019 kg、<code>I diag≈(0.158, 0.469, 0.525)</code>、SPD（Ixx 最小=绕长轴）。</p>
+<h3 id="72-五项验证实验">7.2 五项验证〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d1_floating_base_checks.png" alt="e3d1"></p>
+<table>
+<thead>
+<tr>
+<th>检验</th>
+<th>结果</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>C1 自由落体 vs 解析</strong></td>
+<td>pz 误差 dt 减半→误差减半（比值 2.00，一阶收敛）；速度精确到 7.99e-14</td>
+<td>坐标系/重力符号正确</td>
+</tr>
+<tr>
+<td><strong>C2 四元数单位范数</strong></td>
+<td>8000 步 <code>max‖q‖-1 = 2.2e-16</code></td>
+<td>姿态恒为合法单位四元数</td>
+</tr>
+<tr>
+<td><strong>C3 力矩自由守恒（最关键）</strong></td>
+<td><strong>世界系角动量</strong> L 相对漂移 1.6e-3、转动能 2.8e-3，均<strong>有界</strong></td>
+<td>frame/符号正确（<code>w×(Iw)</code> 符号或四元数乘序错则此处发散）</td>
+</tr>
+<tr>
+<td><strong>C4 可微 vs 视野</strong></td>
+<td>梯度范数 50→1600 步 = 0.09→2.02，温和有界</td>
+<td>BPTT 梯度不爆炸</td>
+</tr>
+<tr>
+<td><strong>C5 exp-map vs 欧拉角</strong></td>
+<td>欧拉角在 pitch→90° 梯度爆到 ~10（<strong>≈200× 于 exp-map</strong>），exp-map 始终 ≤0.05</td>
+<td><strong>定量复现&quot;欧拉角积分致梯度爆炸&quot;的踩坑，确认 exp-map 是正确选择</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="73-结论实验">7.3 结论〔实验〕</h3>
+<ul>
+<li>floating-base 单刚体动力学的<strong>坐标系、惯量、四元数表示与积分、外力/力矩 frame、可微性</strong>已全部钉死并交叉验证。</li>
+<li>C3 是最有判别力的检验：世界系角动量/能量有界漂移直接证明 frame 与符号正确——这是接触层之前必须先拿到的&quot;干净地基&quot;。</li>
+<li>C5 用 Go2 复合惯量定量复现了用户预警的欧拉角梯度爆炸，并证明 exp-map 指数映射积分免疫该病理。</li>
+<li>半隐式 Euler 的一阶漂移（C1 的 0.5·a·t·dt、C3 的 ~1e-3）是已知且有界的；若 E3D-3+ 长视野需要更紧守恒，可换 RK2/midpoint（接口不变）。</li>
+</ul>
+<h2 id="8-e3d-23d-足端接触平滑法向--摩擦锥frame-钉死实验">8. E3D-2：3D 足端接触（平滑法向 + 摩擦锥，frame 钉死）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/contact_3d.py"><code>dynamics/contact_3d.py</code></a>、<a href="../scripts/e3d2_contact_checks.py"><code>scripts/e3d2_contact_checks.py</code></a>、<a href="../notebooks/go2_02_smooth_contact_3d.ipynb"><code>notebooks/go2_02_smooth_contact_3d.ipynb</code></a>。把 2D 的 E1/F1 接触梯度结论迁到 3D 平地足端。</p>
+</blockquote>
+<h3 id="81-设计按项目踩坑清单的优先级推导代码">8.1 设计（按项目踩坑清单的优先级）〔推导/代码〕</h3>
+<ol>
+<li><strong>frame 全部 WORLD</strong>：足端位置/速度入、接触力出，地面法向 <code>n=+Z</code>。<strong>绝不</strong>混用 body 足速与 world 法向（会翻转摩擦方向）。world↔body 只在 <a href="../dynamics/floating_base_srbd.py"><code>contact_to_body_wrench</code></a> 一处发生。</li>
+<li><strong>可微近似不硬投影</strong>：<code>pen=ε·softplus(−gap/ε)</code>；<code>f_n=k_n·pen+k_d·gate·srelu(−vn)</code>（<code>gate=sigmoid(−gap/ε)</code>，<code>srelu(x)=x·sigmoid(x/v_d)</code> 在 <code>vn=0</code> 恰为 0，<strong>无静止伪力</strong>）；<code>v_t=v_foot−vn·n</code>；<code>f_t=−μf_n·tanh(‖v_t‖/v_ε)·v_t/‖v_t‖</code>，故 <strong>‖f_t‖≤μf_n 结构成立</strong>、梯度处处有界（无 sign/硬 clamp）。</li>
+<li>摩擦<strong>对抗</strong>切向速度（耗散）。</li>
+</ol>
+<h3 id="82-六项验证含-srbd-落地积分实验">8.2 六项验证（含 SRBD 落地积分）〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d2_contact_checks.png" alt="e3d2"></p>
+<table>
+<thead>
+<tr>
+<th>检验</th>
+<th>结果</th>
+<th>对应 2D</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>K1 法向力 vs 穿深</strong></td>
+<td>平滑梯度连续有界（~k_n=1e4）；硬接触起始处梯度不连续（阶跃）</td>
+<td>E1</td>
+</tr>
+<tr>
+<td><strong>K2 摩擦 vs 切向速度</strong></td>
+<td>平滑库仑梯度<strong>有界且有信息</strong>（峰 544）；硬库仑梯度<strong>恒 0</strong>（无信息）</td>
+<td>F1</td>
+</tr>
+<tr>
+<td><strong>K3 摩擦锥</strong></td>
+<td><code>max‖f_t‖/(μf_n)=1.0000</code>，违反率 <strong>0%</strong>（结构成立）</td>
+<td>新</td>
+</tr>
+<tr>
+<td><strong>K4 摩擦方向</strong></td>
+<td><code>f_t·v_t≤0</code> 恒成立，非耗散率 <strong>0%</strong></td>
+<td>frame 踩坑检查</td>
+</tr>
+<tr>
+<td><strong>K6 落地积分</strong></td>
+<td>Go2 SRBD+4 足落地稳定 settle 到 COM z≈<strong>0.243 m</strong>，静止 <strong>Σf_n=m·g（误差 0%）</strong></td>
+<td>新（接触→SRBD 回路）</td>
+</tr>
+</tbody>
+</table>
+<p>全程可微、3080 GPU 运行（CPU/GPU 数值一致）。</p>
+<h3 id="83-结论实验">8.3 结论〔实验〕</h3>
+<ul>
+<li>2D 的&quot;平滑接触给可用梯度、硬接触梯度无信息&quot;在 3D 足端<strong>复现</strong>（K1/K2）：摩擦的平滑库仑切向梯度有界有信息，硬库仑恒 0——这是 3D 可训练性的同一分水岭。</li>
+<li>摩擦锥用 <strong>tanh 饱和</strong>实现&quot;可微近似&quot;，<code>‖f_t‖≤μf_n</code> 结构成立、零违反，<strong>避免了硬投影</strong>（呼应用户踩坑 #3）。</li>
+<li>K4 是 frame 踩坑的判别检验：world 足速 × world 法向 → 摩擦严格耗散，证明方向没反（呼应踩坑 #2）。</li>
+<li>K6 把 contact_3d 经 §7.1 的 <code>contact_to_body_wrench</code> 接入 E3D-1 的 SRBD，落地稳定且静力平衡精确——<strong>接触层与动力学层的接口闭合</strong>。</li>
+<li>待办：body-frame 优化版接触换算（确认无误后）；接触门控的 softplus 尾巴（离地微小残力）已被 gate 压制但非严格 0，必要时可加更陡门控；E3D-3 将引入策略闭环。</li>
+</ul>
+<h2 id="9-e3d-33d-srbd-原地站立闭环最小可微训练2d-f3-的-3d-版实验">9. E3D-3：3D SRBD 原地站立闭环最小可微训练（2D-F3 的 3D 版）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/srbd_standing.py"><code>dynamics/srbd_standing.py</code></a>、<a href="../scripts/e3d3_static_audit.py"><code>scripts/e3d3_static_audit.py</code></a>、<a href="../scripts/e3d3_standing_train.py"><code>scripts/e3d3_standing_train.py</code></a>、<a href="../notebooks/go2_03_srbd_standing.ipynb"><code>notebooks/go2_03_srbd_standing.ipynb</code></a>、<code>results/e3d3_standing.json</code>。分两阶段：先静力审计，后闭环训练。</p>
+</blockquote>
+<h3 id="91-动作空间与任务明确控制器输出推导代码">9.1 动作空间与任务（明确控制器输出）〔推导/代码〕</h3>
+<ul>
+<li><strong>动作 <code>a∈R⁴</code>=四腿竖直伸长</strong>（tanh 限幅 ±0.10 m），足端体系高度=nominal−a；<strong>接触力由接触模型从穿深产生，不直接命令力</strong>——保持接触梯度问题居中、策略贡献可量化（对应 2D-F3 的腿伸长动作）。</li>
+<li>足端接触速度只取<strong>刚体部分</strong> <code>v_com+ω×r</code>（不做位置差分，规避 2D-F4 的 1/dt 摩擦梯度爆炸）。姿态损失用<strong>无奇异</strong> <code>1−R[2,2]</code>（体 z 对世界 z），<strong>不用欧拉角</strong>。</li>
+<li>任务：从随机扰动（roll/pitch ±0.08 rad、高度 rest±0.03）regulate 到<strong>目标高度 z*=rest+0.04 m</strong>（高于被动平衡，故<strong>需策略</strong>）+ 水平 + 速度收敛。</li>
+</ul>
+<h3 id="92-stage-a-静力审计站立前必查对应踩坑-127实验">9.2 Stage A 静力审计（站立前必查，对应踩坑 #1/#2/#7）〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d3_static_audit.png" alt="audit"></p>
+<table>
+<thead>
+<tr>
+<th>检验</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>足端命名/符号</td>
+<td>FL(+x,+y)/FR(+x,−y)/RL(−x,+y)/RR(−x,−y) 全部正确</td>
+</tr>
+<tr>
+<td>平衡（<strong>不止竖直力</strong>）</td>
+<td>净力 <code>[0,0,147.34]=[0,0,mg]</code>、<strong>净力矩 <code>[0,0,0]</code></strong>、roll/pitch≈0</td>
+</tr>
+<tr>
+<td>静止高度来自几何</td>
+<td>settle 0.2426 vs 解析 <code>−foot_z_rel_com−mg/(4k_n)</code>=0.2423（差 0.34mm）</td>
+</tr>
+<tr>
+<td>负载分配</td>
+<td>前 73.0N/后 74.4N，比值 0.981=力臂比 0.1916/0.1952（恰好令净俯仰力矩=0）</td>
+</tr>
+<tr>
+<td>落足重分配（命名验证）</td>
+<td>pitch 扰动→纯<strong>前后</strong>载荷差（+439N，左右=0）；roll→纯<strong>左右</strong>（−332N，前后=0）——错配则会串扰，这里不串</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>关键：<code>Σf_n=mg</code> 不够，<strong>净力矩=0</strong> 才是站立。审计同时确认了踩坑 #6——<strong>被动接触能把对称四足站到水平</strong>（故任务用高于被动平衡的目标高度逼出策略贡献）。</p>
+</blockquote>
+<h3 id="93-stage-b-闭环训练实验">9.3 Stage B 闭环训练〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d3_standing_train.png" alt="train"></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>训练损失</th>
+<th>梯度范数(中位,裁剪前)</th>
+<th>长 rollout(5×=1.5s) 终态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>smooth+noGDecay</strong></td>
+<td>0.020→<strong>0.004</strong></td>
+<td>5.5e-3</td>
+<td>z 差 <strong>6.5mm</strong>、tilt 0.20° ✓最佳</td>
+</tr>
+<tr>
+<td>smooth+GDecay</td>
+<td>0.020→0.006</td>
+<td>2.4e-2</td>
+<td>z 差 30.5mm、tilt 0.20°</td>
+</tr>
+<tr>
+<td>smooth+shortH</td>
+<td>0.021→0.011</td>
+<td>1.2e-2</td>
+<td>z 差 34mm、<strong>tilt 6.45°(漂)</strong></td>
+</tr>
+<tr>
+<td><strong>hard+GDecay</strong></td>
+<td>0.028→<strong>0.71(发散)</strong></td>
+<td><strong>2.1e9</strong></td>
+<td>z 差 162mm、<strong>tilt 115°(倒)</strong></td>
+</tr>
+<tr>
+<td>passive(无策略)</td>
+<td>—</td>
+<td>—</td>
+<td>z 差 39.7mm、tilt 0.003°</td>
+</tr>
+</tbody>
+</table>
+<p>训练前梯度自检（踩坑 #4）：BPTT 梯度范数 smooth=<strong>0.15</strong> vs hard=<strong>2.6×10¹⁰</strong>。</p>
+<h3 id="94-结论实验">9.4 结论〔实验〕</h3>
+<ul>
+<li><strong>梯度分水岭 3D 复刻 2D-F3/E5</strong>：硬接触浮动基 BPTT 梯度爆到 <strong>10⁹–10¹⁰</strong>（2D &quot;&gt;10⁶&quot; 的放大版）；<strong>smooth 训得动、hard 训不动</strong>，同配方同裁剪——裁剪封幅不纠偏（2D-E4），故 hard 发散倒地。<strong>失败是梯度性的（#9 非稻草人）</strong>。</li>
+<li><strong>策略必要性（#6）</strong>：被动站到水平但够不到目标高度（差 39.7mm）；smooth+noGDecay 闭到 6.5mm——策略贡献可量化。</li>
+<li><strong>GDecay 边际（诚实边界）</strong>：平滑接触已梯度有界，GDecay 反略伤跟踪（30.5 vs 6.5mm）——价值域在刚性/长视野，与 2D-F3 附注一致。</li>
+<li><strong>短视野漂移（#8）</strong>：smooth+shortH 训练损失尚可，5× 长 rollout 暴露姿态慢漂 6.45°（全视野 0.2°）——<strong>只看训练视野内 loss 会被骗，必须长 rollout 验证</strong>。</li>
+<li><strong>摩擦锥占用（#3）</strong>：max cone=1.0 出现在起始 settle 暂态（刚性足随机身翻正而横扫滑动），稳态 cone→0；暂态饱和未阻碍 standing 收敛——锥饱和弱梯度对**持续蹬地的 locomotion（E3D-4）**更关键。建模注记：足端刚连机身、无落足锚定。</li>
+</ul>
+<h2 id="10-e3d-6双通道残差误差通道匹配与双头自动路由2d-r3r8r11-的-3d-版实验">10. E3D-6：双通道残差——误差通道匹配与双头自动路由（2D R3/R8–R11 的 3D 版）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/residual_3d.py"><code>dynamics/residual_3d.py</code></a>、<a href="../scripts/e3d6_channel_matching.py"><code>scripts/e3d6_channel_matching.py</code></a>、<a href="../scripts/e3d6_dualhead_routing.py"><code>scripts/e3d6_dualhead_routing.py</code></a>、<code>results/e3d6_*.json</code>。
+出处说明：本实验的先行版本曾在一条（已清理的）全身 ABA 平行实现上得到一致结论；本节为正史 SRBD 栈上的可复现版。E3D-4/5 顺延（E3D-6 提前是因为它是整个迁移研究的核心论点落点，由用户指定优先）。</p>
+</blockquote>
+<h3 id="101-设计推导代码">10.1 设计〔推导/代码〕</h3>
+<p>把 2D 阶段的核心论点搬到 3D SRBD 站立环境验证：&quot;残差 <code>a = a_phys + r_φ</code> 必须放在<strong>误差实际发生的通道</strong>——力误差→接触力残差，几何误差→落足残差；放错通道即使前向能拟合，梯度也会坏。&quot;</p>
+<ul>
+<li><strong>双通道 hook</strong>（<code>residual_3d.py</code>，同一 hook 既当已知失配又当残差输出，frame 纪律沿用 §7/§8）：
+force = 世界系额外足端力 (B,4,3)，与接触力同点进同一 <code>r×f</code> 力矩求和（wrench 自洽）；
+kin = 体系足偏移 (B,4,3)：<code>foot_w += R·δ</code>，杠杆与刚体足速同步用偏移后的 r。</li>
+<li><strong>已知失配</strong>（真实系统 = SRBD + 失配，ground truth 在手）：
+<code>M_force = −κ·f_n·x̂</code>（κ=0.4，载荷比例固定向切向力——kin 偏移造不出固定方向切向力，纯力通道）；
+<code>M_kin = δ=[0.02, 0, −0.012] m</code>（体系足端几何偏移，纯运动学通道）。</li>
+<li><strong>判据 = 前向一步加速度 MSE + 梯度保真</strong>：<code>∂(a_lin,a_ang)/∂leg_ext</code> 雅可比相对误差 vs 真实系统——这正是闭环 BPTT 实际消费的策略梯度通道。</li>
+<li><strong>协议避坑</strong>：状态采<strong>标称</strong> settle 早中期快照 ×1024（失配 rollout 会发散；回归只需一步加速度）；动作 leg_ext 独立随机 ±0.05；float64/CPU（梯度实验精度优先）；<strong>2000 迭代收敛预算</strong>（M_force 目标是接触状态的陡峭函数（k_n=1e4），拟合值≠拟合导数：400 迭代时匹配力头梯度误差 0.26，2000 迭代到 0.13；M_kin 目标是常数不受影响）；头输入 33 维含 gap+<strong>vn</strong>（<code>f_n</code> 的速度阻尼项需要 vn，缺它力头表示不全）；头输入全部由标称几何算出，不依赖头自身输出（无不动点回路）。</li>
+</ul>
+<h3 id="102-e3d-6a通道匹配-22实验">10.2 E3D-6a：通道匹配 2×2〔实验〕</h3>
+<table>
+<thead>
+<tr>
+<th>失配 × 残差头</th>
+<th>前向 MSE（标称基线）</th>
+<th>∂a/∂leg_ext 梯度相对误差（标称基线）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>M_force × <strong>R_force</strong> ✓匹配</td>
+<td><strong>77.6</strong> (3217)</td>
+<td><strong>0.133</strong> (0.297)</td>
+</tr>
+<tr>
+<td>M_force × R_kin ✗错通道</td>
+<td>603</td>
+<td>0.346 — <strong>差于不加残差</strong></td>
+</tr>
+<tr>
+<td>M_kin × R_force ✗错通道</td>
+<td>691 (13350，<strong>前向好 19×</strong>)</td>
+<td>0.441 — <strong>差于不加残差</strong></td>
+</tr>
+<tr>
+<td>M_kin × <strong>R_kin</strong> ✓匹配</td>
+<td><strong>0.0088</strong></td>
+<td><strong>0.001</strong></td>
+</tr>
+</tbody>
+</table>
+<p>匹配通道平均梯度误差 <strong>0.067</strong> vs 错通道 <strong>0.393</strong>（5.9×）。两个关键观察：</p>
+<ol>
+<li><strong>两个错通道项的梯度都低于&quot;什么都不加&quot;的标称基线</strong>——错通道残差不仅没用，还<strong>主动污染</strong>策略梯度。</li>
+<li>最锋利的一刀仍是 <code>M_kin × R_force</code>：表达力强的力头把前向拟到比标称好 19×，梯度反而更坏——<strong>前向拟合是糟糕的残差选型判据，梯度保真才是判别器</strong>（与 2D R9 一致）。</li>
+</ol>
+<h3 id="103-e3d-6b双头自动路由实验">10.3 E3D-6b：双头自动路由〔实验〕</h3>
+<p>两头同挂、联合前向回归 + 正则，验证&quot;网络自己会放对&quot;。预注册避坑：①N vs m 单位不可通约→正则统一折算<strong>等效牛顿</strong> <code>λ·(‖f‖² + ‖k_n·Δx‖²)</code>（两头同一物理汇率付费）；②kin 头经 k_n 放大权限→&quot;主导&quot;判定用<strong>加速度空间消融归因</strong> <code>C_i = E‖a(双头) − a(去头 i)‖</code> 不看输出范数；③退化簇→正则杀零空间，λ 扫 3 量级 + λ=0 对照；④要求双头 fit ≈ 匹配单头水平才算收敛；⑤主 λ 下 3 seeds。</p>
+<table>
+<thead>
+<tr>
+<th>失配</th>
+<th>λ=0</th>
+<th>λ=1e-5</th>
+<th>λ=1e-4 (seed 0/1/2)</th>
+<th>λ=1e-3</th>
+<th>主配置 fit / 梯度误差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>M_force ρ(正确头)</td>
+<td>0.730</td>
+<td>0.738</td>
+<td><strong>0.783 / 0.783 / 0.792</strong></td>
+<td>0.858</td>
+<td>20.3 / <strong>0.107</strong></td>
+</tr>
+<tr>
+<td>M_kin ρ(正确头)</td>
+<td>1.000</td>
+<td>0.999</td>
+<td><strong>0.995 / 0.995 / 0.995</strong></td>
+<td>0.965</td>
+<td>0.062 / <strong>0.002</strong></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>判定：全部 λ&gt;0/seed 的 ρ(正确头) 最小值 0.738 &gt; 0.7 ✅ 自动路由成立</strong>，方向对 λ 三个量级与 3 seeds 稳定。</li>
+<li><strong>λ=0 对照</strong>：路由主体由<strong>拟合差距</strong>驱动（M_kin 在零正则下已 ρ=1.000；M_force 0.730）；正则的作用是<strong>单调提纯</strong>力通道（0.730→0.858）而不改方向——路由不是正则 artifact。</li>
+<li><strong>梯度保真闭环</strong>：双头模型的雅可比误差 M_force <strong>0.107</strong>（甚至优于匹配单头 0.133——kin 头分担的份额未污染梯度）、M_kin <strong>0.002</strong>（=匹配单头）。<strong>双头自动达到了匹配单头的梯度质量，无需人工选通道</strong>——这就是 auto-routing 的全部价值。</li>
+</ul>
+<h3 id="104-结论与诚实边界实验">10.4 结论与诚实边界〔实验〕</h3>
+<ol>
+<li><strong>误差通道匹配在 3D SRBD 上成立</strong>（梯度判据 5.9×分离，错通道差于零残差基线）。</li>
+<li><strong>双头 + 前向回归自动路由成立</strong>（min ρ=0.738，λ/seed 稳健），等效牛顿正则单调提纯。</li>
+<li>边界：M_force 的路由是<strong>部分的</strong>（0.73–0.86 非 ≈1）——kin 头能经法向/杠杆通道表达力失配的一部分，正则汇率决定提纯程度；失配强度/形态会影响锐度。一步加速度回归 ≠ 闭环验证——&quot;残差修正后的孪生训出的策略迁到真实系统更好&quot;（梯度保真的最终兑现）留待 E3D-7。</li>
+</ol>
+<h2 id="11-e3d-7残差修正闭环梯度保真的兑现与边界实验">11. E3D-7：残差修正闭环——梯度保真的兑现与边界〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../scripts/e3d7_common.py"><code>scripts/e3d7_common.py</code></a>（动态跟踪任务）、<a href="../scripts/e3d7_mismatch_audit.py"><code>e3d7_mismatch_audit.py</code></a>（Stage 0 闸门）、<a href="../scripts/e3d7_fit_residual.py"><code>e3d7_fit_residual.py</code></a>（Stage 1）、<a href="../scripts/e3d7_grad_fidelity.py"><code>e3d7_grad_fidelity.py</code></a>（Stage 2 主指标）、<a href="../scripts/e3d7_transfer.py"><code>e3d7_transfer.py</code></a>（Stage 3 闭环）；<code>results/e3d7_*.json</code>、<code>figures/e3d7_*.png</code>、<code>results/e3d7_models/</code>。
+问题：用 E3D-6 的双头残差修正孪生后，<strong>它给策略的训练信号是否更接近真实系统</strong>？三师对照：nominal（标称孪生）/ corrected（标称+冻结双头残差）/ oracle（真实系统，上界）。预注册坑：①失配对任务不敏感→Stage 0 闸门；②反馈掩盖模型误差；③残差分布外失效→残差改在真实闭环数据上拟（sim2real 管线）；④残差进回路的梯度；⑤公平比较（同架构/超参/seeds/eval 批）；⑥三系统统一积分路径（<code>standing_step_hooked</code>，hooks=None 与 <code>standing_step</code> 逐位一致 0.00e+00）。</p>
+</blockquote>
+<h3 id="111-stage-0-审计反馈掩盖与任务校准两次拦截都是闸门的意义所在实验">11.1 Stage 0 审计：反馈掩盖与任务校准（两次拦截，都是闸门的意义所在）〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d7_mismatch_audit.png" alt="audit"></p>
+<ul>
+<li><strong>静态站立（E3D-3 任务）</strong>：被动下失配影响巨大（real_kin 被动倒地 tilt 41°、real_force 持续漂移）；但<strong>反馈策略几乎完全掩盖</strong>——基线策略在三系统 eval loss 仅差 1.2×，残留只有稳态小偏置（M_kin 高度偏置 +7mm；M_force 不可抗漂移 ~3cm/s，垂直腿无法产生持续水平力）。坑②应验：闭环收敛表现不是模型误差的灵敏读数。</li>
+<li><strong>动态跟踪任务 v1 的校准 bug（存档）</strong>：沿用 E3D-3 权重 w_h=4 时&quot;不跟踪&quot;才是损失最优（速度罚&gt;高度罚），基线 RMSE 38.7mm 比&quot;坐中点不动&quot;（17.7mm）还差——任务没在考模型。修正：w_h=20、T=0.6s、A=0.03（校准计算见 <code>e3d7_common.py</code> 注释）。</li>
+<li><strong>闸门指标修正</strong>：<code>baseline_real/baseline_nominal</code> 把&quot;任务难度变化&quot;与&quot;老师可分性&quot;混为一谈（real_kin 腿变长反而更接近目标，比值 0.66×）。正确的量 = <strong>L_real(标称策略)/L_real(oracle策略)</strong>。实测：M_kin 1.22×；<strong>M_force 的 oracle 自身发散</strong>（loss→6.4、倒至 111°——它试图用倾斜对抗不可控漂移）。结论：本任务闭环对比度有限，<strong>主结论改由确定性梯度指标承重</strong>（与 2D R8/R11 的处理一致）。</li>
+</ul>
+<h3 id="112-stage-1残差在真实闭环数据上重拟sim2real-管线实验">11.2 Stage 1：残差在真实闭环数据上重拟（sim2real 管线）〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d7_fit_residual.png" alt="fit"></p>
+<p>坑③的对策落地：标称基线策略+探索噪声在&quot;真实系统&quot;滚动态跟踪轨迹，采 (state, action) 4096+1024 held-out，重训双头（λ=1e-4 等效牛顿）。<strong>结果</strong>：闭环动作覆盖到 ±0.09（远超 E3D-6 的 ±0.05 训练域——坑③是真的）；fit M_force 401→5.8/6.4（train/held-out，<strong>62×</strong>）、M_kin 5494→0.30/0.31（<strong>18000×</strong>），held-out≈train 无过拟；<strong>自动路由在部署分布上保持</strong>：ρ(正确头)=0.818/0.990。</p>
+<h3 id="113-stage-2-主结果梯度保真--视野确定性指标实验">11.3 Stage 2 主结果：梯度保真 × 视野（确定性指标）〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d7_grad_fidelity.png" alt="gradfid"></p>
+<p><strong>一步雅可比（部署态全局 Frobenius ∂a/∂leg_ext 比，免逐态除零）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>nominal</th>
+<th>corrected</th>
+<th>改善</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>M_force</td>
+<td>0.187</td>
+<td><strong>0.058</strong></td>
+<td>−69%</td>
+</tr>
+<tr>
+<td>M_kin</td>
+<td>0.950</td>
+<td><strong>0.008</strong></td>
+<td>−99%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>策略梯度 ∇θL（6 策略点全局拼接 cos，对 oracle；H=BPTT 视野）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>H=75</th>
+<th>H=150</th>
+<th>H=300</th>
+<th>H=600</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>M_kin nominal</td>
+<td>0.78</td>
+<td>0.56</td>
+<td>0.37</td>
+<td>(0.94†)</td>
+</tr>
+<tr>
+<td>M_kin <strong>corrected</strong></td>
+<td><strong>0.81</strong></td>
+<td><strong>0.82</strong></td>
+<td>0.39</td>
+<td>(−0.71†)</td>
+</tr>
+<tr>
+<td>M_force nominal</td>
+<td>0.67</td>
+<td>0.70</td>
+<td>0.70</td>
+<td><strong>0.007</strong> (rel 6.9)</td>
+</tr>
+<tr>
+<td>M_force <strong>corrected</strong></td>
+<td>0.59</td>
+<td>0.50</td>
+<td>0.47</td>
+<td><strong>0.40</strong> (rel 0.92)</td>
+</tr>
+</tbody>
+</table>
+<p>†H=600 处 |g_oracle| 跨至 1.8e6（近混沌点支配，方向无信息）。</p>
+<p><strong>机制解读（本实验最重要的发现）——修正的收益集中在&quot;失配 × 任务可控/损失相关子空间&quot;的交集</strong>：</p>
+<ol>
+<li><strong>M_kin</strong>（失配直接打在可控的接触几何/高度通道）：corrected 在 TBPTT 工作区全面更优（H=150: 0.82 vs 0.56；逐点 5/6 胜，已训策略点 1.00 vs −0.43）。</li>
+<li><strong>M_force</strong>（失配主要在弱可控漂移通道）：短视野 nominal 不受影响（其竖直动力学本就近似正确 cos≈0.7），corrected 略付&quot;残差拟合噪声税&quot;（≈0.5）；<strong>长视野（H=600）未建模漂移积分进损失后 nominal 梯度崩塌（cos=0.007、rel=6.9）而 corrected 保持（0.40、0.92）</strong>。</li>
+<li><strong>长视野 BPTT 梯度方向对两个孪生都被轨迹发散淹没</strong>（H=600 近混沌支配）——一步雅可比近乎完美（−99%）也救不了长视野方向，<strong>与 E3D-3 的视野教训、TBPTT 的有效区间同机制</strong>：可微孪生的梯度要在短窗口里用。</li>
+</ol>
+<h3 id="114-stage-3闭环迁移确认仅-m_kin两种协议下均不可判定如实报实验">11.4 Stage 3：闭环迁移确认（仅 M_kin）——两种协议下均不可判定，如实报〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d7_transfer.png" alt="transfer"></p>
+<p>（M_force 的 oracle 因不可控漂移发散，闭环对比无意义，如实跳过；以下仅 M_kin。）</p>
+<p><strong>全程 BPTT（H=600，存档 <code>e3d7_transfer_fullbptt.json</code>）</strong>：训练收敛率本身随系统难度分化——
+nominal 3/3 收敛（0.009–0.017）、corrected 1/3 发散（0.014/3.55/0.044）、<strong>oracle（真实系统
+本身）2/3 发散（0.010/10.5/NaN）</strong>。real_kin 的不对称几何更难训：随机初始化策略早期把系统
+推进跌倒/颤振区，正是 Stage 2 实测的 |g|→1.8e6 混沌区。<strong>修正孪生忠实带入了真实系统的训练
+难度；nominal 因&quot;错得更稳定&quot;反而 3/3 收敛</strong>——且其收敛策略靠反馈在真实系统照样
+0.0098±0.0019（坑②再现）。gap closure 因 oracle NaN 不可定义。</p>
+<p><strong>TBPTT-150（按 Stage 2 处方，<code>e3d7_transfer.json</code>）</strong>：训练稳定性未系统改善——nominal
+seed0 在自己孪生里都不收敛（~0.1 游走），三师 eval 全被 seed 方差支配
+（nominal 1.69±1.94 / corrected 0.44±0.60 / oracle 1.10±1.54），oracle 均值反不如 corrected。</p>
+<p><strong>Stage 3 结论：闭环训练-迁移对比在站立/跟踪类任务上不可判定</strong>——反馈掩盖（坑②）+ 训练
+稳定性 seed 噪声两座大山，两种 BPTT 协议都翻不过去。这是 2D R8/R11&quot;闭环 seed-noisy、
+确定性结论靠梯度指标&quot;教训带着完整证据链的 3D 重演；<strong>E3D-7 的承重结论在 §11.3 的确定性
+梯度指标</strong>。把闭环对比变可判的出路是任务（步态，E3D-4）而非协议调参。</p>
+<h3 id="115-结论分级实验">11.5 结论分级〔实验〕</h3>
+<p><strong>已验证</strong></p>
+<ol>
+<li>
+<p>双头残差在<strong>真实闭环数据</strong>（sim2real 管线）上拟合精确且自动路由保持（ρ 0.82/0.99）。</p>
+</li>
+<li>
+<p>修正孪生的<strong>一步训练信号</strong>决定性更接近真实系统（雅可比 −69%/−99%，确定性指标）。</p>
+</li>
+<li>
+<p>策略梯度保真在 <strong>TBPTT 工作区</strong>兑现：失配落在任务可控子空间时（M_kin）corrected 全面更优；失配在弱可控通道时（M_force），nominal 短视野无碍但<strong>长视野梯度崩塌，corrected 保持</strong>。</p>
+</li>
+<li>
+<p><strong>修正孪生忠实带入真实系统的训练难度</strong>（Stage 3 全程 BPTT：oracle 2/3 发散、corrected 1/3、nominal 0/3）——&quot;好训&quot;与&quot;模型对&quot;是两回事，错得稳定的模型可能更好训。</p>
+</li>
+</ol>
+<p><strong>诚实边界</strong></p>
+<ul>
+<li>闭环收敛<strong>表现</strong>被反馈大幅掩盖（坑②实测）：站立/跟踪类任务对模型误差的闭环灵敏度低，&quot;修正后训得更好&quot;的闭环效应量小——梯度指标才是灵敏读数；叠加训练稳定性 seed 噪声后，闭环训练-迁移对比在本任务<strong>不可判定</strong>（§11.4，两协议实测）。</li>
+<li>长视野（≥600 步）BPTT 梯度方向被轨迹发散淹没，<strong>与模型质量解耦</strong>——任何孪生（含 oracle 邻域）都如此；残差修正不改变这一点，TBPTT 仍是必需。</li>
+<li>corrected 在 M_force 短视野的轻微劣化（拟合噪声税）提示：<strong>残差只应在其证据所在的通道/幅度内使用</strong>——与 E3D-6 的通道匹配结论同源。</li>
+</ul>
+<h2 id="12-e3d-4a预定-trot-步态前向速度跟踪2d-f4-的-3d-版实验">12. E3D-4a：预定 trot 步态前向速度跟踪（2D-F4 的 3D 版）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/gait_3d.py"><code>dynamics/gait_3d.py</code></a>、<a href="../scripts/e3d4_gait_train.py"><code>scripts/e3d4_gait_train.py</code></a>、<code>results/e3d4_gait.json</code>、<code>figures/e3d4_gait_train.png</code>、<code>results/e3d4_models/</code>。
+用户拍板：①4a 先立步态、4b 随后迁残差；②预定 trot 相位 + 策略修正 a∈R⁸=每腿[ΔLx 落足/扫速（运动学通道）, Δext 支撑深度（力/高度通道）]——与双头残差通道结构天然对齐；③锚定=世界系锚点思想的涌现式实现（见下）。</p>
+</blockquote>
+<h3 id="121-设计与两个力学发现推导实验">12.1 设计与两个力学发现〔推导/实验〕</h3>
+<ol>
+<li><strong>推进 = 摩擦速度伺服</strong>：SRBD+运动学足模型中体上所有力来自接触 → 支撑足在体系内以 vx* 匀速后扫，足世界速度 ≈ v_body−vx*，正则库仑摩擦自动&quot;慢了推、快了拽&quot;；跟踪良好时足世界速度≈0 ⇒ <strong>锚定涌现</strong>（支撑滑移为诊断量），锥占用∝速度误差。相位闭式生成（支撑线性扫 + 摆动样条），无记忆、全程可微；足速解析合成 <code>v_f = v_com+ω×r+R·ṗ_b</code>（规避 2D-F4 的 1/dt 摩擦梯度爆炸）。</li>
+<li><strong>开环调试发现（已写入代码注释）</strong>：①duty=0.5 反而最优——duty&gt;0.5 的重叠支撑加剧俯仰泵振（0.6→19.8°、0.65→倒）；②<strong>零速着地制动</strong>——余弦摆动末端体系速率=0，足以体速前冲触地，每步制动脉冲（vx 卡 0.19、tilt 10.3°）；修复=<strong>着地回撤样条</strong>（f'(0)=f'(1) 与支撑扫速连续，三次样条自然给出 follow-through+回撤），tilt 10.3°→4.7°。</li>
+</ol>
+<h3 id="122-结果梯度分水岭在步态上复现实验">12.2 结果：梯度分水岭在步态上复现〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d4_gait_train.png" alt="gait"></p>
+<table>
+<thead>
+<tr>
+<th>run</th>
+<th>训练 loss</th>
+<th>梯度中位(裁剪前)</th>
+<th>eval（8 周期）：vx / RMSE / cone均 / 支撑滑移 / tilt</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>开环 a=0</td>
+<td>—</td>
+<td>—</td>
+<td>0.231 / 94mm/s / 0.63 / 103mm/s / 4.7°</td>
+</tr>
+<tr>
+<td><strong>smooth+TBPTT150 ×3 seeds</strong></td>
+<td>0.018–0.022</td>
+<td>~0.08</td>
+<td><strong>0.295–0.303 / 7–15mm/s</strong> / 0.23–0.33 / <strong>14–20mm/s</strong> / 1.3–5°</td>
+</tr>
+<tr>
+<td>smooth+全程BPTT</td>
+<td>0.012</td>
+<td>0.026</td>
+<td>0.298 / 7mm/s / 0.18 / 11mm/s / 0.75°</td>
+</tr>
+<tr>
+<td>hard+TBPTT150（同配方同裁剪）</td>
+<td>1.21 不收敛</td>
+<td><strong>1.15e9</strong></td>
+<td>0.033 / 摔倒 112.9° / 滑移 405mm/s</td>
+</tr>
+</tbody>
+</table>
+<ol>
+<li><strong>3D-F4 梯度分水岭</strong>：smooth 训得动（3/3 seeds，RMSE 7–15mm/s）；hard 梯度爆 9 个量级、倒地——失败是梯度性的。</li>
+<li><strong>伺服模型的预测全部兑现</strong>：锥占用 0.63→0.18–0.33（∝速度误差）；支撑滑移 103→11–20mm/s（<strong>锚定涌现</strong>）。</li>
+<li>诚实记录：标称步态 H=800 全程 BPTT 未爆（|g|=0.026 有界，甚至略优于 TBPTT）——混沌只在难系统/难状态区出现（对照 E3D-7 站立+失配的 1.8e6）；TBPTT 是安全默认而非处处必需。</li>
+<li>工程坑：滑移诊断最初漏加指令速度项 R·ṗ_b（测出 ~300mm/s 假高），接触模型内部速度是对的（锥占用正常）——诊断量与动力学量必须同源。</li>
+</ol>
+<h2 id="13-e3d-4b步态三师可判性兑现与残差头质量的边界实验">13. E3D-4b：步态×三师——可判性兑现与残差头质量的边界〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/residual_gait.py"><code>dynamics/residual_gait.py</code></a>、<a href="../scripts/e3d4b_residual_gait.py"><code>scripts/e3d4b_residual_gait.py</code></a>（--stage audit/fit/gradfid/transfer/structured，各自独立落盘）、<code>results/e3d4b_*.json</code>、<code>figures/e3d4b_transfer.png</code>。失配与 E3D-6/7 完全一致；nominal 老师复用 E3D-4a 的 3 seeds；TBPTT-150。</p>
+</blockquote>
+<h3 id="131-audit--fit实验">13.1 audit + fit〔实验〕</h3>
+<ul>
+<li><strong>闸门（L_real(标称策略) vs L_real(oracle 策略)）</strong>：M_force 复合 loss 0.90×&quot;不过&quot;，但<strong>任务主指标 vx RMSE 34 vs 14 mm/s（2.4×）——速度跟踪可判</strong>（复合 loss 被 oracle 对抗俯仰力矩的姿态/动作代价抹平）；M_kin 9 vs 12 mm/s 仍被反馈掩盖。<strong>E3D-7 的&quot;失配×任务可控子空间交集&quot;机制双向闭合</strong>：交集大（纵向力×速度跟踪）→ 可判；交集小（足端几何×速度跟踪、一切×站立）→ 掩盖。</li>
+<li><strong>fit（步态闭环数据，等效牛顿正则）</strong>：M_force 253→7.7/8.7（33×）ρ=0.740；M_kin 1455→0.54/0.56（2700×）ρ=0.962——自动路由在步态部署分布上保持。</li>
+</ul>
+<h3 id="132-梯度保真与闭环迁移完美互补的双向边界实验">13.2 梯度保真与闭环迁移：完美互补的双向边界〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d4b_transfer.png" alt="e3d4b"></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>一步 ∂accel/∂a 全局比</th>
+<th>∇θL 全局 cos（H=150 / 800）</th>
+<th>闭环 vx RMSE（真实系统，3 seeds）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>M_force</strong> nominal</td>
+<td>0.218</td>
+<td><strong>0.967</strong> / 0.689</td>
+<td>39 mm/s</td>
+</tr>
+<tr>
+<td><strong>M_force</strong> corrected(MLP)</td>
+<td><strong>0.105（52%↓）</strong></td>
+<td>0.820 / <strong>0.073（rel 79）</strong></td>
+<td><strong>68 mm/s（反而更差）</strong></td>
+</tr>
+<tr>
+<td><strong>M_force</strong> oracle</td>
+<td>—</td>
+<td>1</td>
+<td><strong>18 mm/s（可判！）</strong></td>
+</tr>
+<tr>
+<td><strong>M_kin</strong> nominal</td>
+<td>0.902</td>
+<td>0.942 / −0.475</td>
+<td>12 mm/s</td>
+</tr>
+<tr>
+<td><strong>M_kin</strong> corrected(MLP)</td>
+<td><strong>0.022（98%↓）</strong></td>
+<td><strong>0.999 / 0.980（完美）</strong></td>
+<td>17 mm/s</td>
+</tr>
+<tr>
+<td><strong>M_kin</strong> oracle</td>
+<td>—</td>
+<td>1</td>
+<td>16 mm/s（不可判）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>全研究最锋利的一组对照</strong>：</p>
+<ol>
+<li><strong>可判性兑现</strong>：M_force 步态上 oracle 18 ≪ nominal 39 mm/s——整个 3D 研究第一个可判的闭环三师对比（E3D-7 边界的出路被证实）。</li>
+<li><strong>但自由 MLP 残差头没接住</strong>：力头拟合质量（fit 7.7、ρ=0.74、26% 漏进 kin 头）的梯度噪声在 800 步 BPTT 中复利放大（rel=79、cos→0.07），corrected 策略训坏（68 mm/s，vx(t) 剧烈摆动见图）。一步雅可比更好（52%↓）但过程梯度更坏——<strong>&quot;一步保真≠过程保真&quot;的又一极端形式</strong>。</li>
+<li><strong>完美互补</strong>：哪里闭环可判（M_force），哪里 MLP 头不够好；哪里残差头完美（M_kin，∇θL cos=0.98@H800——nominal 同处 −0.475），哪里闭环不可判。残差修正的实际收益需要<strong>同时</strong>满足：(a) 失配落在任务可控通道（可判性），(b) 残差头在该通道的拟合/梯度质量足够高。</li>
+</ol>
+<h3 id="133-收官判别结构化参数残差κ̂--δ̂4-参数实验">13.3 收官判别：结构化参数残差（κ̂ + δ̂，4 参数）〔实验〕</h3>
+<p>若用正确结构的参数头（力头只学标量 κ̂、基底 −f_n·x̂；kin 头只学 δ̂∈R³）能兑现收益，则 13.2-2 的败因=头的质量而非修正概念——同时复刻 2D&quot;结构对了，4 参数胜过自由网络&quot;的边界。</p>
+<p><strong>结果（<code>e3d4b_structured.json</code>）——4 参数完整闭合 MLP 的失败</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>参数辨识</th>
+<th>fit</th>
+<th>M_force 闭环 vx RMSE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>结构化 M_force</td>
+<td><strong>κ̂=0.3981</strong>（真值 0.4，差 0.5%），δ̂≈0</td>
+<td>1.59（MLP 7.7 的 1/5）</td>
+<td><strong>18.6 mm/s ≈ oracle 18</strong>（loss 0.0287±0.0100 vs 0.0286±0.0091）</td>
+</tr>
+<tr>
+<td>结构化 M_kin</td>
+<td><strong>δ̂=[0.0200, 0.0000, −0.0120]</strong>（真值精确恢复），κ̂≈0</td>
+<td><strong>1e-25</strong></td>
+<td>—（该通道闭环不可判）</td>
+</tr>
+</tbody>
+</table>
+<ol>
+<li><strong>败因判别完成</strong>：同一数据、同一训练配方，把自由 MLP 头（68 mm/s）换成 4 参数结构头 → <strong>完全闭合到 oracle 水平</strong>。13.2 的失败是头的拟合/梯度质量，不是残差修正概念。</li>
+<li><strong>参数层面的自动路由</strong>：两头互相归零（κ̂ 拟合 M_kin 时 ≈1e-16；δ̂ 拟合 M_force 时 ≈2e-4）——等效牛顿正则下，结构正确的参数化把失配辨识成了<strong>可解释的物理量</strong>。</li>
+<li><strong>2D&quot;结构化 vs 神经残差&quot;边界的 3D 强化版</strong>：结构已知时 4 参数胜过自由网络；结构未知时 MLP 头是唯一选择但要付梯度噪声税（13.2）——工程序：能写出失配的物理形态就参数化，写不出再上神经头。</li>
+</ol>
+<h3 id="134-e3d-4b-结论整条残差研究线的收官三句实验">13.4 E3D-4b 结论：整条残差研究线的收官三句〔实验〕</h3>
+<blockquote>
+<p><strong>残差要放对通道</strong>（E3D-6：错通道前向能拟但梯度坏）；<strong>在对的分布上拟</strong>（E3D-7：sim2real 闭环数据，否则分布外失效）；<strong>用对的结构装</strong>（E3D-4b：结构对了 4 参数到 oracle，自由 MLP 在长视野 BPTT 里付梯度噪声税）。可判性由&quot;失配×任务可控子空间交集&quot;决定（站立双掩盖→步态 M_force 可判），梯度保真指标在闭环不可判处仍是灵敏读数。</p>
+</blockquote>
+<h2 id="14-e3d-4c收官结论的统计加固内部稳健性实验">14. E3D-4c：收官结论的统计加固（内部稳健性）〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../scripts/e3d4c_harden.py"><code>scripts/e3d4c_harden.py</code></a>（--stage fd/e3d6seeds/sweep/seeds/report，独立落盘可续）、<code>results/e3d4c_harden.json</code>、<code>figures/e3d4c_harden.png</code>、<a href="e3d4c_verification_report.html"><code>reports/e3d4c_verification_report.md</code></a>（非专家核验版）。用户在家用 3080 加固时遇手搓显卡坞 ASM2464 无外置风扇过热掉卡——这同时解释了本研究多次&quot;宿主机崩溃&quot;；加固改用稳定的内置 3060 续跑（崩溃可续设计逐格落盘，零返工）。</p>
+</blockquote>
+<p>四个<strong>确定性/多种子</strong>核验，把收官结论从&quot;单设置&quot;加固到&quot;内部稳健&quot;：</p>
+<ol>
+<li><strong>梯度算对了</strong>：BPTT 解析 ∇θL vs 有限差分（20 随机方向，float64）corr=<strong>1.000000</strong>、max 相对差 1.7e-9——所有梯度保真结论依赖的底层梯度无误。</li>
+<li><strong>通道匹配种子稳健</strong>（E3D-6 ×5 头训练种子）：匹配 0.067–0.077 vs 错通道 0.401–0.428，分离 <strong>5.2–6.4×，无一例外</strong>。</li>
+<li><strong>强度连续</strong>（κ 扫 0.2/0.4/0.6）：κ̂=0.2000/0.3997/0.5910 贴 y=x 对角线——κ=0.4 单点结论在强度轴上连续。</li>
+<li><strong>头条四臂 ×10 训练种子 ×3 评测批</strong>：见 <code>e3d4c_harden.json</code>；nominal/MLP/structured/oracle 的中位 RMSE 在分布层面保持 E3D-4b 的序（结构残差≈oracle、MLP 残差&gt;nominal）。工程观察：同一确定性极限环下 3 个评测批逐位相同（trot 收敛到唯一极限环，后半程 RMSE 与初态无关）——&quot;多评测批&quot;对该指标冗余，种子轴才是方差源（如实记入报告）。</li>
+</ol>
+<p><strong>边界（已写入报告）</strong>：以上全部以&quot;我们自己的孪生 + 已知注入失配&quot;为真值，加固的是<strong>自洽性</strong>；外部效度（真实未知失配是否成立）是 §15 的问题。</p>
+<h2 id="15-e3d-5mujoco-全身-go2-外部验证一步拟合--可迁移性实验">15. E3D-5：MuJoCo 全身 Go2 外部验证——一步拟合 ≠ 可迁移性〔实验〕</h2>
+<blockquote>
+<p>配套：<a href="../dynamics/mj_go2.py"><code>dynamics/mj_go2.py</code></a>（menagerie Go2 桥接 + 解析 IK + 关节 PD）、<a href="../scripts/e3d5_mujoco_check.py"><code>scripts/e3d5_mujoco_check.py</code></a>（--stage align/fit/transfer）、<code>results/e3d5_*.json</code>、<code>figures/e3d5_external.png</code>、<code>videos/e3d5_*.mp4</code>（5 段渲染）。<strong>这是给&quot;句号&quot;盖章的实验</strong>：把收官管线整套搬到一个<strong>外部、不可微、真实未知失配</strong>的系统上——失配不再是我们注入的 −κf_n·x̂ / δ，而是 <strong>SRBD 单刚体孪生 vs MuJoCo 全身 18-DoF 的真差距</strong>（腿惯量约占总质量 27%、PD 跟踪滞后、真接触求解、dt 2ms）。孪生与 MuJoCo 共享同一控制器栈（gait_3d 足端规划→解析 IK→PD），残差解释的就是动力学本体之差。</p>
+</blockquote>
+<h3 id="151-对齐与可走性实验">15.1 对齐与可走性〔实验〕</h3>
+<ul>
+<li>IK 往返验证（菜单足端 geom 在 calf 系 (−0.002,0,−0.213)→等效连杆+固定角 γ 修正）：50 随机姿态最大关节角误差 <strong>2.1e-15 rad</strong>。</li>
+<li>同一控制器栈直接上 MuJoCo（工作点 kp=300/kd=5，按开环跟踪 RMSE 选）：开环 vx 0.22、标称策略 vx 0.26（目标 0.30），<strong>0/3 摔倒</strong>——SRBD 上设计的步态结构性地迁到了全身 Go2（视频 <code>e3d5_nominal.mp4</code>）。</li>
+</ul>
+<h3 id="152-主结果一步加速度拟合越好策略迁移越差实验">15.2 主结果：一步加速度拟合越好，策略迁移越差〔实验〕</h3>
+<p><img src="file:////home/misaka/Diffable_Drone_Pytorch3D/research/quadruped_migration/go2_3d/figures/e3d5_external.png" alt="e3d5"></p>
+<p>把 nominal / 结构残差 / MLP 残差三种孪生各训出策略，<strong>全部部署到 MuJoCo 真机</strong>（无 oracle 臂——真实系统不可微，这正是 sim2real 的本质）：</p>
+<table>
+<thead>
+<tr>
+<th>孪生</th>
+<th>一步加速度拟合 MuJoCo（误差降幅）</th>
+<th>MuJoCo 真机 vx RMSE（3 seeds）</th>
+<th>末态 tilt</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>nominal（无残差）</strong></td>
+<td>0%（基线 gap MSE 789）</td>
+<td><strong>92±18 mm/s（最好）</strong></td>
+<td>2–6°</td>
+</tr>
+<tr>
+<td>结构残差（κ̂+δ̂）</td>
+<td>83%</td>
+<td>101±46 mm/s（≈nominal，一个坏种子 166）</td>
+<td>2–3°</td>
+</tr>
+<tr>
+<td><strong>MLP 残差（自由网络）</strong></td>
+<td><strong>97%（拟合最好）</strong></td>
+<td><strong>168±14 mm/s（最差，4σ 劣于 nominal）</strong></td>
+<td>9–11°</td>
+</tr>
+</tbody>
+</table>
+<p><strong>反单调关系</strong>（图 c）：<code>accel 拟合降幅 0/83/97% → 真机 RMSE 92/101/168 mm/s</code>。<strong>一步加速度拟合得越好的残差，训出的策略迁到真机越差。</strong></p>
+<h3 id="153-机制与诚实结论实验推导">15.3 机制与诚实结论〔实验/推导〕</h3>
+<ol>
+<li><strong>真实失配在残差的表达类之外</strong>：MuJoCo 的主失配是<strong>腿惯量与多体耦合</strong>，而我们的残差 hook 只有足端力 + 足端位置两个通道——它们<strong>结构上无法表示缺失的多体惯量</strong>。MLP 凭表达力把一步加速度的<strong>症状</strong>（Δv/dt）拟到 97%，靠的是制造状态依赖的虚假足端力；策略训练时学会利用这些<strong>不对应真实机制的伪动力学</strong>，迁到真机便失效（更慢更晃，tilt 9–11°）。结构残差受物理形态约束（一个真切向力 + 一个真几何偏移），制造的伪影少，<strong>失配出表达类时优雅退化到≈nominal</strong>；无残差则无可利用的伪影，最稳。</li>
+<li><strong>这是整条研究线主题的终极形式</strong>：E3D-6/7/4b 在残差<strong>表达类之内</strong>确立&quot;前向/一步拟合不是对的目标&quot;；E3D-5 在表达类<strong>之外</strong>证明它不仅无用、而且<strong>拟合越好越有害</strong>——且<strong>只有外部 oracle 能揭示</strong>（一步加速度 MSE 会一路说&quot;MLP 最好&quot;）。</li>
+<li><strong>结构残差的第二重价值</strong>：不止&quot;结构已知时 4 参数胜 MLP&quot;（E3D-4b），更是&quot;<strong>结构未知时失败得优雅</strong>&quot;（E3D-5，≈nominal 而非 MLP 的灾难）——受约束的假设类是 sim2real 的安全默认。</li>
+<li><strong>诚实边界</strong>：单任务（trot vx 跟踪）、单外部系统（MuJoCo）、单残差类（足端 hook）；换更大表达类（关节力矩/广义力通道）的残差或许能触及腿惯量失配——故结论是&quot;<strong>该残差类 vs 该真实失配</strong>&quot;，外推为&quot;<strong>残差只在其表达类内安全，判别只能靠外部留出系统</strong>&quot;。结构残差的高方差（一种子 166）说明它在此也非可靠优于 nominal——<strong>最诚实的陈述：在真实出类失配下，我们的足端残差未能改善闭环迁移，自由 MLP 反而显著有害</strong>。</li>
+</ol>
+<h3 id="154-整个-3d-迁移研究弧的收束实验">15.4 整个 3D 迁移研究弧的收束〔实验〕</h3>
+<blockquote>
+<p>残差<strong>放对通道</strong>（E3D-6）、<strong>在对的分布上拟</strong>（E3D-7）、<strong>用对的结构装</strong>（E3D-4b）——这三条在残差表达类<strong>之内</strong>成立；E3D-5 用外部 MuJoCo 划出表达类<strong>之外</strong>的边界：一步拟合是会骗人的代理，<strong>拟合越好可能越有害，判别可迁移性只能靠外部留出的真实系统</strong>。可微孪生 + 神经残差是强工具，但它的安全区由&quot;失配是否落在残差表达类 ∩ 任务可控子空间&quot;界定——这就是这条无人机→2D SRBM→3D Go2 研究弧给出的、边界清晰的句号。</p>
+</blockquote>
+<h2 id="16-下一步开放">16. 下一步（开放）</h2>
+<ol>
+<li>更大表达类残差（关节力矩/广义力通道）能否触及腿惯量失配——E3D-5 边界的直接延伸。</li>
+<li>body-frame 优化版接触换算；减面孪生（rendering LOD）支持批量短视野 BPTT。</li>
+<li>残差头质量工程（DAgger 迭代再采集、谱正则）+ 外部留出验证常态化。</li>
+</ol>
+
+            
+            
+        </body>
+        </html>

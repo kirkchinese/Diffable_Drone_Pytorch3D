@@ -32,6 +32,15 @@ python scripts/convert_dae_to_obj.py            # 一次性：dae→obj
 python scripts/emit_model_summary.py            # 参数摘要
 python scripts/render_standing_pose.py --device cuda:0   # 渲染 + 可微检验
 ```
+
+MuJoCo 外部闸门使用上游 `mujoco_menagerie` 的 Unitree Go2 模型。该第三方
+仓库不复制进本仓库；为复现当前结果，检出实验实际使用的固定版本：
+
+```bash
+git clone https://github.com/google-deepmind/mujoco_menagerie.git assets/mujoco_menagerie
+git -C assets/mujoco_menagerie checkout accb6df40a9a1d1e49eff88157f6818b63a49335
+```
+
 Notebook 执行需用 **env 的 ipykernel**（见下方"踩坑"）：
 ```bash
 jupyter nbconvert --to notebook --execute --inplace \
