@@ -74,6 +74,14 @@ def parse_args():
     parser.add_argument('--go2_gdecay', type=float, default=1.0,
                         help='Go2 跨控制步状态梯度衰减；1.0 保持原始梯度')
     parser.add_argument('--go2_grad_clip_norm', type=float, default=1.0)
+    go2_loss_defaults = {
+        'velocity': 3.0, 'yaw': 1.0, 'upright': 1.5, 'body_height': 0.8,
+        'joint_limit': 0.25, 'energy': 2e-4, 'action_rate': 0.08,
+        'foot_slip': 0.8, 'penetration': 8.0, 'nonfoot_contact': 1.5,
+        'foothold': 0.6,
+    }
+    for name, default in go2_loss_defaults.items():
+        parser.add_argument(f'--go2_loss_{name}', type=float, default=default)
     
     # 训练参数
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')

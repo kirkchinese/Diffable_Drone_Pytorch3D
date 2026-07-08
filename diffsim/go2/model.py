@@ -60,8 +60,8 @@ class CollisionGeometry:
     sample_is_foot: torch.Tensor
     sample_collision: torch.Tensor
     bounding_radius: torch.Tensor
-    self_pair_a: torch.Tensor
-    self_pair_b: torch.Tensor
+    self_sample: torch.Tensor
+    self_collision: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -216,8 +216,8 @@ def compile_go2_model(
         sample_is_foot=torch.empty(0, device=device, dtype=torch.bool),
         sample_collision=torch.empty(0, device=device, dtype=torch.long),
         bounding_radius=torch.empty(0, device=device, dtype=dtype),
-        self_pair_a=torch.empty(0, device=device, dtype=torch.long),
-        self_pair_b=torch.empty(0, device=device, dtype=torch.long),
+        self_sample=torch.empty(0, device=device, dtype=torch.long),
+        self_collision=torch.empty(0, device=device, dtype=torch.long),
     )
     sample_owner, sample_pos, sample_radius, sample_is_foot, sample_collision = [], [], [], [], []
     bounding_radius = []
@@ -247,18 +247,28 @@ def compile_go2_model(
             sample_is_foot.append(link_name.endswith("_foot"))
             sample_collision.append(collision_index)
         bounding_radius.append(bound)
+    # Directed sample-to-primitive tests cover every non-adjacent body pair.
+    # Testing both directions catches box corners against capsules without a
+    # coarse whole-link bounding sphere.
     pair_a, pair_b = [], []
+    samples_by_collision = [[] for _ in collision_owner]
+    for sample_index, collision_index in enumerate(sample_collision):
+        samples_by_collision[collision_index].append(sample_index)
     for first in range(len(collision_owner)):
         for second in range(first + 1, len(collision_owner)):
             owner_a, owner_b = collision_owner[first], collision_owner[second]
             if owner_a == owner_b:
                 continue
-            group_a = -1 if owner_a == 0 else (owner_a - 1) // 3
-            group_b = -1 if owner_b == 0 else (owner_b - 1) // 3
-            cross_leg = group_a >= 0 and group_b >= 0 and group_a != group_b
-            if cross_leg:
-                pair_a.append(first)
-                pair_b.append(second)
+            adjacent = (
+                (owner_a > 0 and parents[owner_a - 1] == owner_b)
+                or (owner_b > 0 and parents[owner_b - 1] == owner_a)
+            )
+            if adjacent:
+                continue
+            pair_a.extend(samples_by_collision[first])
+            pair_b.extend([second] * len(samples_by_collision[first]))
+            pair_a.extend(samples_by_collision[second])
+            pair_b.extend([first] * len(samples_by_collision[second]))
     collisions = CollisionGeometry(
         owner=collisions.owner,
         kind=collisions.kind,
@@ -272,8 +282,8 @@ def compile_go2_model(
         sample_is_foot=torch.as_tensor(sample_is_foot, device=device, dtype=torch.bool),
         sample_collision=tensor(sample_collision, long=True),
         bounding_radius=tensor(bounding_radius),
-        self_pair_a=tensor(pair_a, long=True),
-        self_pair_b=tensor(pair_b, long=True),
+        self_sample=tensor(pair_a, long=True),
+        self_collision=tensor(pair_b, long=True),
     )
     default = tensor(np.tile((0.0, 0.9, -1.8), 4))
     return Go2Model(

@@ -37,6 +37,12 @@ def _scale_state_gradient(state: Go2State, decay: float) -> Go2State:
 class Go2Trainer:
     def __init__(self, args):
         self.args = args
+        if args.go2_rollout_steps <= 0 or args.go2_tbptt_steps <= 0:
+            raise ValueError("Go2 rollout and TBPTT lengths must be positive")
+        if not 0.0 < args.go2_gdecay <= 1.0:
+            raise ValueError("go2_gdecay must lie in (0, 1]")
+        if args.go2_grad_clip_norm <= 0.0:
+            raise ValueError("go2_grad_clip_norm must be positive")
         self.device = torch.device(
             f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
         )
@@ -81,7 +87,7 @@ class Go2Trainer:
         self.writer = SummaryWriter(self.log_dir)
 
     def _load(self, path: str) -> None:
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
         if "optimizer_state_dict" in checkpoint and not self.args.reset_lr:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

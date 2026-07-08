@@ -98,12 +98,37 @@ def test_fixed_contact_gradient_matches_finite_difference():
     assert analytic.abs().item() > 1e-6
 
 
+def test_nonadjacent_self_contact_has_equal_opposite_force():
+    config = Go2EnvConfig(batch_size=1)
+    model = compile_go2_model(dtype=DTYPE)
+    state = initial_state(model, 1, base_height=2.0)
+    state.joint_pos[:] = torch.tensor(
+        [[
+            -0.19247669, 2.00703669, -0.94081855,
+            0.85189545, 0.09826255, -2.11648297,
+            -0.61497575, 4.51418161, -2.15443802,
+            -0.75189614, 1.85362518, -0.87318873,
+        ]],
+        dtype=DTYPE,
+    )
+    contact = contact_wrenches(model, state, flat_scene(config, "cpu", DTYPE), config)
+    assert contact.self_gap.amin() < -0.04
+    kinematics = forward_kinematics(model, state)
+    force_world = torch.einsum(
+        "bnij,bnj->bni", kinematics.body_rotation, contact.wrench_body[..., 3:]
+    )
+    residual = torch.linalg.norm(force_world.sum(1))
+    magnitude = torch.linalg.norm(force_world, dim=-1).sum(1).clamp_min(1.0)
+    assert residual < 1e-9 * magnitude
+
+
 def main():
     tests = [
         test_flat_scene_sdf_and_normal,
         test_contact_cone_dissipation_and_self_clearance,
         test_standing_penetration_bound,
         test_fixed_contact_gradient_matches_finite_difference,
+        test_nonadjacent_self_contact_has_equal_opposite_force,
     ]
     for test in tests:
         test()

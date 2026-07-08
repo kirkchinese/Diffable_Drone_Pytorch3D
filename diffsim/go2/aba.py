@@ -151,7 +151,11 @@ def forward_dynamics(
         )
         u_store[joint], d_store[joint], scalar_store[joint] = u_vec, d, scalar_u
 
-    root_acc = torch.linalg.solve(articulated[0], -bias_force[0].unsqueeze(-1)).squeeze(-1)
+    # solve() checks the CUDA ``info`` tensor on the host.  The articulated
+    # root inertia is SPD by construction, so use the non-synchronizing form.
+    root_acc = torch.linalg.solve_ex(
+        articulated[0], -bias_force[0].unsqueeze(-1), check_errors=False
+    )[0].squeeze(-1)
     accelerations: list[torch.Tensor] = [root_acc]
     joint_acc: list[torch.Tensor] = []
     for joint in range(model.n_joints):

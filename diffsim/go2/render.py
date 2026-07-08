@@ -45,6 +45,16 @@ class Go2DepthRenderer:
         self.sphere_faces = sphere.faces_packed()
         self.box_vertices = torch.tensor(_BOX_VERTICES, device=device, dtype=self.dtype)
         self.box_faces = torch.tensor(_BOX_FACES, device=device, dtype=torch.long)
+        angles = torch.linspace(0.0, 2.0 * torch.pi, 13, device=device, dtype=self.dtype)[:-1]
+        ring = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+        lower = torch.cat((ring, -torch.ones(12, 1, device=device, dtype=self.dtype)), dim=-1)
+        upper = torch.cat((ring, torch.ones(12, 1, device=device, dtype=self.dtype)), dim=-1)
+        self.cylinder_vertices = torch.cat((lower, upper), dim=0)
+        cylinder_faces = []
+        for index in range(12):
+            following = (index + 1) % 12
+            cylinder_faces.extend(((index, following, 12 + following), (index, 12 + following, 12 + index)))
+        self.cylinder_faces = torch.tensor(cylinder_faces, device=device, dtype=torch.long)
         self._scene_key = None
         self._mesh = None
 
@@ -86,7 +96,11 @@ class Go2DepthRenderer:
                     world = self.sphere_vertices * size[0] + position
                     _append_mesh(verts, faces, world, self.sphere_faces)
                 elif kind == SHAPE_CAPSULE:
-                    for z in (-size[1], 0.0, size[1]):
+                    cylinder_scale = torch.stack((size[0], size[0], size[1]))
+                    cylinder = self.cylinder_vertices * cylinder_scale
+                    cylinder = cylinder @ rotation.T + position
+                    _append_mesh(verts, faces, cylinder, self.cylinder_faces)
+                    for z in (-size[1], size[1]):
                         center = position + rotation[:, 2] * z
                         world = self.sphere_vertices * size[0] + center
                         _append_mesh(verts, faces, world, self.sphere_faces)
