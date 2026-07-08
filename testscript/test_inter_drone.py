@@ -12,7 +12,8 @@ def test_collision_detection():
         dt=0.02,
         mesh_path="data/sample/sample.obj",
         image_size=(48, 64),
-        init_p_range=0.0  # Put them near origin
+        init_p_range=0.0,  # Put them near origin
+        n_drones_per_group=2,  # 同组才互相参与 inter-drone 距离
     )
     
     # Manually place two drones exactly 0.5m apart, very high up to avoid static obstacles from sample.obj
@@ -23,22 +24,15 @@ def test_collision_detection():
     env.margin[0] = 0.3
     env.margin[1] = 0.3
     
-    # The effective distance between them should be:
-    # d_ij = 0.5
-    # eff_dist = d_ij - margin_j = 0.5 - 0.3 = 0.2
-    # So vec_to_obj norm should be 0.2 (if static obstacle is further)
-    
-    dists, vecs = env._knn_query()
-    print(f"Distances to closest object: {dists.tolist()}")
-    
-    vecs_subdiv = env.vec_to_obj_subdivided(n_subdiv=2)
-    dist_subdiv = torch.norm(vecs_subdiv[0], dim=-1)
-    print(f"Subdivided distances: {dist_subdiv.tolist()}")
-    
-    # They should be around 0.2
-    assert abs(dists[0].item() - 0.2) < 1e-4, f"Expected 0.2, got {dists[0].item()}"
-    assert abs(dists[1].item() - 0.2) < 1e-4, f"Expected 0.2, got {dists[1].item()}"
-    print("Collision detection test passed!")
+    # 椭球间距 sqrt(dx^2+dy^2+4dz^2) = 0.5 (同 z, 仅 y 相差 0.5);
+    # inter_drone_distances 减去双方 margin: 0.5 - 0.3 - 0.3 = -0.1 (重叠 = 碰撞)
+    dists, vecs = env.inter_drone_distances()
+    print(f"Inter-drone distances: {dists.tolist()}")
+
+    # They should be -0.1 (overlapping by 0.1m after subtracting both margins)
+    assert abs(dists[0].item() - (-0.1)) < 1e-4, f"Expected -0.1, got {dists[0].item()}"
+    assert abs(dists[1].item() - (-0.1)) < 1e-4, f"Expected -0.1, got {dists[1].item()}"
+    print("Inter-drone collision detection test passed!")
 
 def test_visual_scaling():
     print("Testing dynamic visual scaling...")

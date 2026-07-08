@@ -12,7 +12,7 @@
   7. randomize_dynamic_obstacles 全部使用 torch 随机数
   8. scene_generator 无残留 numpy 依赖
     9. scene_generator 不再依赖 Python random/math
- 10. train.py 支持统一 model_type 入口，train_adaptive.py 为兼容包装
+ 10. train.py 支持统一 model_type 入口
 
 用法:
   conda run -n pytorch python testscript/test_audit_fixes.py
@@ -187,14 +187,18 @@ def test_scene_generator_generate_smoke(device):
 
 
 def test_train_entrypoints_unified():
-    """验证 train.py 支持 model_type，train_adaptive.py 为兼容入口"""
+    """验证当前训练入口 train.py 支持统一 model_type"""
     train_src = open(PROJECT_ROOT / 'train.py').read()
-    adaptive_src = open(PROJECT_ROOT / 'train_adaptive.py').read()
+    train_entrypoints = sorted(
+        p for p in PROJECT_ROOT.glob('train*.py')
+        if p.name == 'train.py' or p.name.startswith('train_')
+    )
+    train_entrypoint_names = [p.name for p in train_entrypoints]
+    assert train_entrypoint_names == ['train.py'], \
+        f"当前训练入口应仅为 train.py, 得到 {train_entrypoint_names}"
     assert '--model_type' in train_src, "train.py 缺少 --model_type 统一入口"
     assert 'Model_adaptive' in train_src, "train.py 尚未接入 Model_adaptive"
-    assert ('model_type' in adaptive_src and 'adaptive' in adaptive_src), \
-        "train_adaptive.py 未默认委托 adaptive 模型"
-    print("[PASS] 统一训练入口与 adaptive 兼容入口验证通过")
+    print("[PASS] 统一训练入口 train.py 验证通过")
 
 
 def main():

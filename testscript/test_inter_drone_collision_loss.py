@@ -50,9 +50,9 @@ def test_inter_drone_collision_loss():
         inter_drone_dist_history=collide_dist,
     )
 
-    # 验证碰撞损失增大
-    assert float(metrics_collide['loss_collide']) > float(metrics_safe['loss_collide']), \
-        '发生无人机碰撞时 collision loss 未增大'
+    # 验证 inter-drone 碰撞损失增大（机间惩罚在 loss_drone_collide，非静态障碍的 loss_collide）
+    assert float(metrics_collide['loss_drone_collide']) > float(metrics_safe['loss_drone_collide']), \
+        '发生无人机碰撞时 inter-drone collision loss 未增大'
     print('[PASS] DroneLoss 正确注入 inter-drone collision penalty')
 
 

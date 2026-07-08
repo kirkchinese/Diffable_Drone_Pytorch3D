@@ -56,8 +56,8 @@ if __name__ == '__main__':
     config = 'configs/single_agent.args'
     
     if not os.path.exists(ckpt):
-        print(f"Checkpoint 不存在: {ckpt}")
-        sys.exit(1)
+        print(f"SKIP: checkpoint absent: {ckpt}")
+        sys.exit(0)
     
     print(f"=" * 60)
     print(f"对照实验: ground_ratio=0.3 (BUG) vs 0.6 (修复)")

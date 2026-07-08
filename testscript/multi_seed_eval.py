@@ -193,6 +193,8 @@ def aggregate_results(all_results):
 
 
 def main():
+    global CKPT_BASE, BASE_OUT
+
     parser = argparse.ArgumentParser(description='多种子批量评估')
     parser.add_argument('--gpu', type=int, default=0, help='GPU编号')
     parser.add_argument('--episodes', type=int, default=32, help='每个seed的episode数')
@@ -209,7 +211,6 @@ def main():
                              f'勿覆盖论文 5-seed 真值)')
     args = parser.parse_args()
 
-    global CKPT_BASE, BASE_OUT
     if args.ckpt_base:
         CKPT_BASE = args.ckpt_base
     if args.out_base:

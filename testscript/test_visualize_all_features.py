@@ -28,8 +28,8 @@ def run_visualize_with_features():
     output_dir = PROJECT_ROOT / "viz_results" / "test_all_features"
     
     if not checkpoint.exists():
-        print(f"[ERROR] Checkpoint not found: {checkpoint}")
-        return False
+        print(f"SKIP: checkpoint absent: {checkpoint}")
+        sys.exit(0)
     
     # 清理输出目录
     output_dir.mkdir(parents=True, exist_ok=True)
