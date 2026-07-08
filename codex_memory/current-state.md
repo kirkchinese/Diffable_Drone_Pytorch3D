@@ -1,15 +1,20 @@
 # Current project state
 
-Snapshot provenance: Claude sessions through 2026-07-07. Remote facts below are
-last-known and must be verified before use.
+Snapshot provenance: Claude sessions through 2026-07-07, then live repository
+and DGX verification on 2026-07-08 CST. Treat process state as time-sensitive.
 
 ## Local repository
 
-- Branch: `chore/track-quadruped-go2-research`.
-- Resume/campaign commit: `141fabc`, pushed to the branch of the same name.
-- The worktree contained many user-owned modified, deleted, and untracked files
-  when this memory was imported. Preserve them and inspect `git status` before
-  editing.
+- Active development branch: `refactor/diffsim-go2` at `6082af3`, pushed and
+  clean after the incremental simulation-boundary refactor.
+- Quadruped research branch: `chore/track-quadruped-go2-research` at `0612e3b`,
+  pushed with the previously untracked Go2 sources, evidence, small checkpoints,
+  and a pinned external `mujoco_menagerie` dependency.
+- Platform-audit/test branch: `chore/platform-audit-and-tests` at `658e616`,
+  pushed. Its CPU-oriented suite passed 14 tests with 6 expected skips and no
+  failures.
+- Resume/campaign baseline: `141fabc`, preserved by the annotated tag
+  `dgx-campaign-20260707`; this is the code actually running on DGX.
 - `DGX_MIGRATION.md` is the canonical 2x2x3 campaign guide.
 
 Commit `141fabc` fixed ordinary continuation so that:
@@ -69,25 +74,31 @@ unavailable. The safe recovery was to stop only project training, restart the
 MPS server, fix monitoring to derive RUN state from real processes rather than
 old logs, and return to MPS=4.
 
-Last verified remote state (2026-07-06 16:29 local session time): clean MPS
-restart, four seed-1001 jobs resumed from checkpoints under explicit MPS=4.
-The next user request, issued after roughly one day, was to check campaign
-progress and identify useful quadruped experiments for the DGX. That request
-was interrupted before it was performed. Therefore the live campaign state is
-unknown and must be checked before any new launch.
+Live state verified at 2026-07-08 10:02 CST:
+
+- all four seed-1001 runs are DONE at 5000/5000;
+- MPS is healthy and four seed-1002 jobs are active: baseline step 1825, goal
+  650, clip 850, and gcgl 825 according to flushed metrics;
+- recent aggregate throughput is about 0.1565 iter/s (effective serial 6.39
+  s/it), with GPU utilization around 96%;
+- approximately 35,850 training iterations remain including seed 1003, giving
+  a rough 64-hour campaign ETA if current throughput persists;
+- an unrelated root-owned GPU process is also present, so throughput and ETA
+  may change. Do not stop or modify it.
 
 Remote access was routed through an SSH alias named `spark-cpolar` with a
-reverse proxy. The public tunnel is transient. Inspect local SSH configuration
-for the current endpoint; do not store its password here.
+reverse proxy. The public tunnel is transient; inspect local SSH configuration
+for the current endpoint. Key authentication is installed and the local user
+service `spark-reverse-proxy.service` is enabled with linger. It forwards DGX
+`127.0.0.1:1080` to the local HTTP/SOCKS proxy at `127.0.0.1:7897`. The proxy was
+verified against GitHub with HTTP 200. Never store its password here.
 
 ## Immediate continuation checklist
 
-1. Verify the current SSH endpoint and connectivity without changing remote
-   state.
-2. Inspect actual PIDs, MPS server health, DONE markers, latest checkpoints,
+1. Inspect actual PIDs, MPS server health, DONE markers, latest checkpoints,
    per-run steps, recent errors, and aggregate throughput.
-3. Reconcile logs with processes; do not trust stale RUN labels.
-4. If the campaign is healthy, leave it alone and report ETA. If not, resume
+2. Reconcile logs with processes; do not trust stale RUN labels.
+3. If the campaign is healthy, leave it alone and report ETA. If not, resume
    only from validated checkpoints and quarantine post-checkpoint best files.
-5. Choose a quadruped DGX experiment only after accounting for capacity still
+4. Choose a quadruped DGX experiment only after accounting for capacity still
    needed by the paper campaign.
